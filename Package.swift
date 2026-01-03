@@ -10,10 +10,16 @@ let package = Package(
         .library(
             name: "BONJSON",
             targets: ["BONJSON"]),
+        .executable(
+            name: "bonjson-benchmark",
+            targets: ["BONJSONBenchmark"]),
     ],
     targets: [
         .target(
             name: "BONJSON"),
+        .executableTarget(
+            name: "BONJSONBenchmark",
+            dependencies: ["BONJSON"]),
         .testTarget(
             name: "BONJSONTests",
             dependencies: ["BONJSON"]),
