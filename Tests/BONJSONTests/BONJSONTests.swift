@@ -2477,4 +2477,392 @@ final class BONJSONLargeObjectSuperDecoderTests: XCTestCase {
         let decoded = try decoder.decode(Child.self, from: data)
         XCTAssertEqual(decoded, value)
     }
+
+    // Test superDecoder where the CHILD object has >12 fields (triggers dictionary cache in valueIndexForString)
+    func testSuperDecoderWithLargeChildObject() throws {
+        struct Parent: Codable, Equatable {
+            var parentValue: Int
+        }
+
+        struct LargeChild: Codable, Equatable {
+            // 13+ fields in the child to trigger dictionary cache
+            var a: Int, b: Int, c: Int, d: Int, e: Int
+            var f: Int, g: Int, h: Int, i: Int, j: Int
+            var k: Int, l: Int, m: Int
+            var parent: Parent
+
+            enum CodingKeys: String, CodingKey {
+                case a, b, c, d, e, f, g, h, i, j, k, l, m
+                case `super`
+            }
+
+            init(a: Int, b: Int, c: Int, d: Int, e: Int, f: Int, g: Int, h: Int, i: Int, j: Int, k: Int, l: Int, m: Int, parent: Parent) {
+                self.a = a; self.b = b; self.c = c; self.d = d; self.e = e
+                self.f = f; self.g = g; self.h = h; self.i = i; self.j = j
+                self.k = k; self.l = l; self.m = m; self.parent = parent
+            }
+
+            init(from decoder: Decoder) throws {
+                let container = try decoder.container(keyedBy: CodingKeys.self)
+                a = try container.decode(Int.self, forKey: .a)
+                b = try container.decode(Int.self, forKey: .b)
+                c = try container.decode(Int.self, forKey: .c)
+                d = try container.decode(Int.self, forKey: .d)
+                e = try container.decode(Int.self, forKey: .e)
+                f = try container.decode(Int.self, forKey: .f)
+                g = try container.decode(Int.self, forKey: .g)
+                h = try container.decode(Int.self, forKey: .h)
+                i = try container.decode(Int.self, forKey: .i)
+                j = try container.decode(Int.self, forKey: .j)
+                k = try container.decode(Int.self, forKey: .k)
+                l = try container.decode(Int.self, forKey: .l)
+                m = try container.decode(Int.self, forKey: .m)
+                // superDecoder on an object with >12 fields triggers dictionary cache path
+                let superDecoder = try container.superDecoder()
+                parent = try Parent(from: superDecoder)
+            }
+
+            func encode(to encoder: Encoder) throws {
+                var container = encoder.container(keyedBy: CodingKeys.self)
+                try container.encode(a, forKey: .a)
+                try container.encode(b, forKey: .b)
+                try container.encode(c, forKey: .c)
+                try container.encode(d, forKey: .d)
+                try container.encode(e, forKey: .e)
+                try container.encode(f, forKey: .f)
+                try container.encode(g, forKey: .g)
+                try container.encode(h, forKey: .h)
+                try container.encode(i, forKey: .i)
+                try container.encode(j, forKey: .j)
+                try container.encode(k, forKey: .k)
+                try container.encode(l, forKey: .l)
+                try container.encode(m, forKey: .m)
+                let superEncoder = container.superEncoder()
+                try parent.encode(to: superEncoder)
+            }
+        }
+
+        let encoder = BONJSONEncoder()
+        let decoder = BONJSONDecoder()
+
+        let parent = Parent(parentValue: 999)
+        let value = LargeChild(a: 1, b: 2, c: 3, d: 4, e: 5, f: 6, g: 7, h: 8, i: 9, j: 10, k: 11, l: 12, m: 13, parent: parent)
+        let data = try encoder.encode(value)
+        let decoded = try decoder.decode(LargeChild.self, from: data)
+        XCTAssertEqual(decoded, value)
+    }
+}
+
+// MARK: - Large Object Dictionary Cache Tests
+
+final class BONJSONLargeObjectDictionaryCacheTests: XCTestCase {
+
+    // Test dictionary cache lookup for large objects (>12 fields) with non-sequential access
+    func testDictionaryCacheWithNonSequentialAccess() throws {
+        // A struct with >12 fields where we access a late field first to trigger dictionary cache
+        struct LargeObject: Codable, Equatable {
+            var a: Int, b: Int, c: Int, d: Int, e: Int
+            var f: Int, g: Int, h: Int, i: Int, j: Int
+            var k: Int, l: Int, m: Int, n: Int, o: Int
+        }
+
+        struct LargeObjectKey: CodingKey {
+            var stringValue: String
+            var intValue: Int? { nil }
+            init(stringValue: String) { self.stringValue = stringValue }
+            init?(intValue: Int) { nil }
+        }
+
+        // Custom decoder that accesses fields in reverse order (triggers dictionary cache)
+        struct LargeObjectDecoder: Decodable {
+            var value: LargeObject
+
+            init(from decoder: Decoder) throws {
+                let container = try decoder.container(keyedBy: LargeObjectKey.self)
+                // Access fields in reverse order to trigger dictionary cache
+                let o = try container.decode(Int.self, forKey: LargeObjectKey(stringValue: "o"))
+                let n = try container.decode(Int.self, forKey: LargeObjectKey(stringValue: "n"))
+                let m = try container.decode(Int.self, forKey: LargeObjectKey(stringValue: "m"))
+                let l = try container.decode(Int.self, forKey: LargeObjectKey(stringValue: "l"))
+                let k = try container.decode(Int.self, forKey: LargeObjectKey(stringValue: "k"))
+                let j = try container.decode(Int.self, forKey: LargeObjectKey(stringValue: "j"))
+                let i = try container.decode(Int.self, forKey: LargeObjectKey(stringValue: "i"))
+                let h = try container.decode(Int.self, forKey: LargeObjectKey(stringValue: "h"))
+                let g = try container.decode(Int.self, forKey: LargeObjectKey(stringValue: "g"))
+                let f = try container.decode(Int.self, forKey: LargeObjectKey(stringValue: "f"))
+                let e = try container.decode(Int.self, forKey: LargeObjectKey(stringValue: "e"))
+                let d = try container.decode(Int.self, forKey: LargeObjectKey(stringValue: "d"))
+                let c = try container.decode(Int.self, forKey: LargeObjectKey(stringValue: "c"))
+                let b = try container.decode(Int.self, forKey: LargeObjectKey(stringValue: "b"))
+                let a = try container.decode(Int.self, forKey: LargeObjectKey(stringValue: "a"))
+                value = LargeObject(a: a, b: b, c: c, d: d, e: e, f: f, g: g, h: h, i: i, j: j, k: k, l: l, m: m, n: n, o: o)
+            }
+        }
+
+        let encoder = BONJSONEncoder()
+        let decoder = BONJSONDecoder()
+
+        let original = LargeObject(a: 1, b: 2, c: 3, d: 4, e: 5, f: 6, g: 7, h: 8, i: 9, j: 10, k: 11, l: 12, m: 13, n: 14, o: 15)
+        let data = try encoder.encode(original)
+        let decoded = try decoder.decode(LargeObjectDecoder.self, from: data)
+        XCTAssertEqual(decoded.value, original)
+    }
+}
+
+// MARK: - Unkeyed Container Manual Iteration Tests
+
+final class BONJSONUnkeyedManualIterationTests: XCTestCase {
+
+    // Test UINT to Int64 conversion in unkeyed container via manual iteration (not batch)
+    func testUIntToInt64ManualIteration() throws {
+        // Custom decoder that manually iterates through array elements
+        struct ManualArrayDecoder: Decodable {
+            var values: [Int64]
+
+            init(from decoder: Decoder) throws {
+                var container = try decoder.unkeyedContainer()
+                var result: [Int64] = []
+                while !container.isAtEnd {
+                    // This uses decodeInt64Value() which handles UINT to Int64 conversion
+                    let value = try container.decode(Int64.self)
+                    result.append(value)
+                }
+                values = result
+            }
+        }
+
+        let encoder = BONJSONEncoder()
+        let decoder = BONJSONDecoder()
+
+        // Encode UInt64 values (200 has MSB set, so it's encoded as UINT)
+        let original: [UInt64] = [200, 250, 255]
+        let data = try encoder.encode(original)
+
+        // Decode using manual iteration
+        let decoded = try decoder.decode(ManualArrayDecoder.self, from: data)
+        XCTAssertEqual(decoded.values, [200, 250, 255])
+    }
+
+    // Test Double decoding in unkeyed container with UINT value
+    func testUIntToDoubleManualIteration() throws {
+        struct ManualDoubleArrayDecoder: Decodable {
+            var values: [Double]
+
+            init(from decoder: Decoder) throws {
+                var container = try decoder.unkeyedContainer()
+                var result: [Double] = []
+                while !container.isAtEnd {
+                    let value = try container.decode(Double.self)
+                    result.append(value)
+                }
+                values = result
+            }
+        }
+
+        let encoder = BONJSONEncoder()
+        let decoder = BONJSONDecoder()
+
+        // Encode UInt64 values
+        let original: [UInt64] = [200, 250]
+        let data = try encoder.encode(original)
+
+        let decoded = try decoder.decode(ManualDoubleArrayDecoder.self, from: data)
+        XCTAssertEqual(decoded.values, [200.0, 250.0])
+    }
+}
+
+// MARK: - URL Single Value Container Tests
+
+final class BONJSONURLSingleValueTests: XCTestCase {
+
+    // Test URL decoding in single value container
+    func testURLInSingleValueContainer() throws {
+        // Wrapper that decodes URL via single value container
+        struct URLWrapper: Decodable {
+            var url: URL
+
+            init(from decoder: Decoder) throws {
+                let container = try decoder.singleValueContainer()
+                // This triggers the URL path in single value container's decode<T>
+                url = try container.decode(URL.self)
+            }
+        }
+
+        let encoder = BONJSONEncoder()
+        let decoder = BONJSONDecoder()
+
+        // Encode a URL
+        let original = URL(string: "https://example.com/path")!
+        let data = try encoder.encode(original)
+
+        // Decode via wrapper to hit single value container path
+        let decoded = try decoder.decode(URLWrapper.self, from: data)
+        XCTAssertEqual(decoded.url, original)
+    }
+}
+
+// MARK: - Type Mismatch Error Tests (covers describeType)
+
+final class BONJSONTypeMismatchTests: XCTestCase {
+
+    // Test type mismatch error in keyed container (covers describeType at line 1156)
+    func testTypeMismatchInKeyedContainer() throws {
+        struct StringHolder: Encodable {
+            var value: String
+        }
+
+        struct IntHolder: Decodable {
+            var value: Int
+        }
+
+        let encoder = BONJSONEncoder()
+        let decoder = BONJSONDecoder()
+
+        let original = StringHolder(value: "not an int")
+        let data = try encoder.encode(original)
+
+        XCTAssertThrowsError(try decoder.decode(IntHolder.self, from: data))
+    }
+
+    // Test type mismatch error in unkeyed container (covers describeType at line 1410)
+    func testTypeMismatchInUnkeyedContainer() throws {
+        struct ManualDecoder: Decodable {
+            init(from decoder: Decoder) throws {
+                var container = try decoder.unkeyedContainer()
+                // Try to decode string as int
+                _ = try container.decode(Int.self)
+            }
+        }
+
+        let encoder = BONJSONEncoder()
+        let decoder = BONJSONDecoder()
+
+        let original = ["not", "ints"]
+        let data = try encoder.encode(original)
+
+        XCTAssertThrowsError(try decoder.decode(ManualDecoder.self, from: data))
+    }
+}
+
+// MARK: - Big Number Decoding Tests
+
+final class BONJSONBigNumberTests: XCTestCase {
+
+    // Test big number decoding as Double in keyed container
+    func testBigNumberAsDoubleInKeyedContainer() throws {
+        // Create raw BONJSON: { "value": <big number 12345> }
+        // Object start (0x9a) + key "value" (0x85 + "value") + big number + end (0x9b)
+        //
+        // Big number format: TYPE_BIG_NUMBER (0x69) + header + significand
+        // Header: SSSSS EE N where SSSSS=significand length, EE=exponent length, N=sign
+        // For 12345: significand=12345 (2 bytes), exponent=0 (0 bytes), sign=positive
+        // Header = (2 << 3) | (0 << 1) | 0 = 0x10
+        // Significand: 12345 = 0x3039 in little-endian = [0x39, 0x30]
+
+        let bonjsonData = Data([
+            0x9a,                           // Object start
+            0x85, 0x76, 0x61, 0x6c, 0x75, 0x65, // Key "value" (short string, 5 bytes)
+            0x69,                           // Big number type
+            0x10,                           // Header: 2 bytes significand, 0 bytes exponent, positive
+            0x39, 0x30,                     // Significand: 12345 little-endian
+            0x9b                            // Object end
+        ])
+
+        struct DoubleHolder: Decodable {
+            var value: Double
+        }
+
+        let decoder = BONJSONDecoder()
+        let decoded = try decoder.decode(DoubleHolder.self, from: bonjsonData)
+        XCTAssertEqual(decoded.value, 12345.0)
+    }
+
+    // Test big number decoding as Double in unkeyed container
+    func testBigNumberAsDoubleInUnkeyedContainer() throws {
+        // Create raw BONJSON: [<big number 12345>]
+        let bonjsonData = Data([
+            0x99,                           // Array start
+            0x69,                           // Big number type
+            0x10,                           // Header: 2 bytes significand, 0 bytes exponent, positive
+            0x39, 0x30,                     // Significand: 12345 little-endian
+            0x9b                            // Array end
+        ])
+
+        struct ManualDecoder: Decodable {
+            var value: Double
+
+            init(from decoder: Decoder) throws {
+                var container = try decoder.unkeyedContainer()
+                value = try container.decode(Double.self)
+            }
+        }
+
+        let decoder = BONJSONDecoder()
+        let decoded = try decoder.decode(ManualDecoder.self, from: bonjsonData)
+        XCTAssertEqual(decoded.value, 12345.0)
+    }
+
+    // Test big number decoding as Double in single value container
+    func testBigNumberAsDoubleInSingleValueContainer() throws {
+        // Create raw BONJSON: <big number 12345>
+        let bonjsonData = Data([
+            0x69,                           // Big number type
+            0x10,                           // Header: 2 bytes significand, 0 bytes exponent, positive
+            0x39, 0x30                      // Significand: 12345 little-endian
+        ])
+
+        let decoder = BONJSONDecoder()
+        let decoded = try decoder.decode(Double.self, from: bonjsonData)
+        XCTAssertEqual(decoded, 12345.0)
+    }
+
+    // Test big number with negative sign
+    func testNegativeBigNumber() throws {
+        // Big number -12345: same as above but with sign bit set
+        // Header = (2 << 3) | (0 << 1) | 1 = 0x11
+        let bonjsonData = Data([
+            0x69,                           // Big number type
+            0x11,                           // Header: 2 bytes significand, 0 bytes exponent, negative
+            0x39, 0x30                      // Significand: 12345 little-endian
+        ])
+
+        let decoder = BONJSONDecoder()
+        let decoded = try decoder.decode(Double.self, from: bonjsonData)
+        XCTAssertEqual(decoded, -12345.0)
+    }
+
+    // Test big number with exponent (e.g., 123.45 = 12345 * 10^-2)
+    func testBigNumberWithExponent() throws {
+        // Big number 123.45 = 12345 * 10^-2
+        // Header: significand=2 bytes, exponent=1 byte, positive
+        // Header = (2 << 3) | (1 << 1) | 0 = 0x12
+        // Exponent: -2 as signed byte = 0xFE
+        let bonjsonData = Data([
+            0x69,                           // Big number type
+            0x12,                           // Header: 2 bytes significand, 1 byte exponent, positive
+            0xFE,                           // Exponent: -2 (signed)
+            0x39, 0x30                      // Significand: 12345 little-endian
+        ])
+
+        let decoder = BONJSONDecoder()
+        let decoded = try decoder.decode(Double.self, from: bonjsonData)
+        XCTAssertEqual(decoded, 123.45, accuracy: 0.001)
+    }
+
+    // Test big number as Date (goes through _MapDecoder.decodeDouble via decodeDate)
+    func testBigNumberAsDate() throws {
+        // Big number representing timestamp 1000000 seconds since 1970
+        // Header: significand needs 3 bytes for 1000000 = 0x0F4240
+        // Header = (3 << 3) | (0 << 1) | 0 = 0x18
+        let bonjsonData = Data([
+            0x69,                           // Big number type
+            0x18,                           // Header: 3 bytes significand, 0 bytes exponent, positive
+            0x40, 0x42, 0x0F                // Significand: 1000000 little-endian
+        ])
+
+        let decoder = BONJSONDecoder()
+        decoder.dateDecodingStrategy = .secondsSince1970
+        let decoded = try decoder.decode(Date.self, from: bonjsonData)
+        XCTAssertEqual(decoded.timeIntervalSince1970, 1000000.0)
+    }
 }
