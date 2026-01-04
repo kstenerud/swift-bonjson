@@ -1391,11 +1391,37 @@ struct _MapKeyedDecodingContainer<Key: CodingKey>: KeyedDecodingContainerProtoco
     }
 
     func superDecoder() throws -> Decoder {
-        return try superDecoder(forKey: Key(stringValue: "super")!)
+        let key = _StringKey(stringValue: "super")
+        let idx = try valueIndexForString("super")
+        return _MapDecoder(state: state, entryIndex: idx, lazyPath: lazyPath.appending(key))
     }
 
     func superDecoder(forKey key: Key) throws -> Decoder {
         return try decoder(forKey: key)
+    }
+
+    /// Look up value index by raw string key (for superDecoder which uses "super" as key).
+    private func valueIndexForString(_ keyString: String) throws -> size_t {
+        // For small objects, use linear search
+        if useLinearSearch {
+            if let valueIdx = linearFindValue(forOriginalKey: keyString) {
+                return valueIdx
+            }
+            throw DecodingError.keyNotFound(_StringKey(stringValue: keyString), DecodingError.Context(
+                codingPath: codingPath,
+                debugDescription: "Key '\(keyString)' not found"
+            ))
+        }
+
+        // For larger objects, use dictionary
+        ensureKeyCache()
+        guard let valueIdx = keyCacheHolder!.cache![keyString] else {
+            throw DecodingError.keyNotFound(_StringKey(stringValue: keyString), DecodingError.Context(
+                codingPath: codingPath,
+                debugDescription: "Key '\(keyString)' not found"
+            ))
+        }
+        return valueIdx
     }
 }
 

@@ -141,6 +141,17 @@ public enum BONJSONEncodingError: Error, CustomStringConvertible {
     }
 }
 
+/// Throws BONJSONEncodingError if the C encoding function returned a negative result.
+/// C encoding functions return positive values on success, negative on error.
+@inline(__always)
+func throwIfEncodingFailed(_ result: Int) throws {
+    if result < 0 {
+        let status = ksbonjson_encodeStatus(rawValue: UInt32(-result))
+        let message = ksbonjson_describeEncodeStatus(status).map { String(cString: $0) } ?? "Unknown error"
+        throw BONJSONEncodingError.encodingFailed(message)
+    }
+}
+
 // MARK: - Buffer-Based Encoder State
 
 /// Shared mutable state for the buffer-based encoder.
@@ -232,11 +243,7 @@ final class _BufferEncoderState {
         while currentDepth > targetDepth {
             ensureCapacity(Int(KSBONJSON_MAX_ENCODED_SIZE_CONTAINER_END))
             let result = ksbonjson_encodeToBuffer_endContainer(&context)
-            if result < 0 {
-                throw BONJSONEncodingError.encodingFailed(
-                    ksbonjson_describeEncodeStatus(ksbonjson_encodeStatus(rawValue: UInt32(-result))).map { String(cString: $0) } ?? "Unknown error"
-                )
-            }
+            try throwIfEncodingFailed(result)
         }
     }
 
@@ -245,18 +252,10 @@ final class _BufferEncoderState {
         // Close all open containers
         ensureCapacity(Int(KSBONJSON_MAX_ENCODED_SIZE_CONTAINER_END) * (currentDepth + 1))
         let closeResult = ksbonjson_encodeToBuffer_endAllContainers(&context)
-        if closeResult < 0 {
-            throw BONJSONEncodingError.encodingFailed(
-                ksbonjson_describeEncodeStatus(ksbonjson_encodeStatus(rawValue: UInt32(-closeResult))).map { String(cString: $0) } ?? "Unknown error"
-            )
-        }
+        try throwIfEncodingFailed(closeResult)
 
         let endResult = ksbonjson_encodeToBuffer_end(&context)
-        if endResult < 0 {
-            throw BONJSONEncodingError.encodingFailed(
-                ksbonjson_describeEncodeStatus(ksbonjson_encodeStatus(rawValue: UInt32(-endResult))).map { String(cString: $0) } ?? "Unknown error"
-            )
-        }
+        try throwIfEncodingFailed(endResult)
     }
 
     /// Batch encode an array of Int values.
@@ -268,11 +267,7 @@ final class _BufferEncoderState {
                 ksbonjson_encodeToBuffer_int64Array(&context, int64Ptr, values.count)
             }
         }
-        if result < 0 {
-            throw BONJSONEncodingError.encodingFailed(
-                ksbonjson_describeEncodeStatus(ksbonjson_encodeStatus(rawValue: UInt32(-result))).map { String(cString: $0) } ?? "Unknown error"
-            )
-        }
+        try throwIfEncodingFailed(result)
     }
 
     /// Batch encode an array of Int64 values.
@@ -281,11 +276,7 @@ final class _BufferEncoderState {
         let result = values.withUnsafeBufferPointer { ptr in
             ksbonjson_encodeToBuffer_int64Array(&context, ptr.baseAddress, values.count)
         }
-        if result < 0 {
-            throw BONJSONEncodingError.encodingFailed(
-                ksbonjson_describeEncodeStatus(ksbonjson_encodeStatus(rawValue: UInt32(-result))).map { String(cString: $0) } ?? "Unknown error"
-            )
-        }
+        try throwIfEncodingFailed(result)
     }
 
     /// Batch encode an array of Double values.
@@ -294,11 +285,7 @@ final class _BufferEncoderState {
         let result = values.withUnsafeBufferPointer { ptr in
             ksbonjson_encodeToBuffer_doubleArray(&context, ptr.baseAddress, values.count)
         }
-        if result < 0 {
-            throw BONJSONEncodingError.encodingFailed(
-                ksbonjson_describeEncodeStatus(ksbonjson_encodeStatus(rawValue: UInt32(-result))).map { String(cString: $0) } ?? "Unknown error"
-            )
-        }
+        try throwIfEncodingFailed(result)
     }
 
     /// Batch encode an array of String values.
@@ -351,11 +338,7 @@ final class _BufferEncoderState {
             }
         }
 
-        if result < 0 {
-            throw BONJSONEncodingError.encodingFailed(
-                ksbonjson_describeEncodeStatus(ksbonjson_encodeStatus(rawValue: UInt32(-result))).map { String(cString: $0) } ?? "Unknown error"
-            )
-        }
+        try throwIfEncodingFailed(result)
     }
 }
 
@@ -458,11 +441,7 @@ final class _BufferEncoder: Encoder {
         let result = value.withCString { cString in
             ksbonjson_encodeToBuffer_string(&state.context, cString, strlen(cString))
         }
-        if result < 0 {
-            throw BONJSONEncodingError.encodingFailed(
-                ksbonjson_describeEncodeStatus(ksbonjson_encodeStatus(rawValue: UInt32(-result))).map { String(cString: $0) } ?? "Unknown error"
-            )
-        }
+        try throwIfEncodingFailed(result)
     }
 
     @inline(__always)
@@ -471,11 +450,7 @@ final class _BufferEncoder: Encoder {
         if value.isFinite {
             state.ensureCapacity(Int(KSBONJSON_MAX_ENCODED_SIZE_FLOAT))
             let result = ksbonjson_encodeToBuffer_float(&state.context, value)
-            if result < 0 {
-                throw BONJSONEncodingError.encodingFailed(
-                    ksbonjson_describeEncodeStatus(ksbonjson_encodeStatus(rawValue: UInt32(-result))).map { String(cString: $0) } ?? "Unknown error"
-                )
-            }
+            try throwIfEncodingFailed(result)
             return
         }
 
@@ -541,11 +516,7 @@ struct _BufferKeyedEncodingContainer<Key: CodingKey>: KeyedEncodingContainerProt
         let result = keyString.withCString { cString in
             ksbonjson_encodeToBuffer_string(&state.context, cString, strlen(cString))
         }
-        if result < 0 {
-            throw BONJSONEncodingError.encodingFailed(
-                ksbonjson_describeEncodeStatus(ksbonjson_encodeStatus(rawValue: UInt32(-result))).map { String(cString: $0) } ?? "Unknown error"
-            )
-        }
+        try throwIfEncodingFailed(result)
     }
 
     func convertedKey(_ key: Key) -> String {
@@ -564,11 +535,7 @@ struct _BufferKeyedEncodingContainer<Key: CodingKey>: KeyedEncodingContainerProt
         try encodeKey(key)
         state.ensureCapacity(Int(KSBONJSON_MAX_ENCODED_SIZE_NULL))
         let result = ksbonjson_encodeToBuffer_null(&state.context)
-        if result < 0 {
-            throw BONJSONEncodingError.encodingFailed(
-                ksbonjson_describeEncodeStatus(ksbonjson_encodeStatus(rawValue: UInt32(-result))).map { String(cString: $0) } ?? "Unknown error"
-            )
-        }
+        try throwIfEncodingFailed(result)
     }
 
     mutating func encode(_ value: Bool, forKey key: Key) throws {
@@ -576,11 +543,7 @@ struct _BufferKeyedEncodingContainer<Key: CodingKey>: KeyedEncodingContainerProt
         try encodeKey(key)
         state.ensureCapacity(Int(KSBONJSON_MAX_ENCODED_SIZE_BOOL))
         let result = ksbonjson_encodeToBuffer_bool(&state.context, value)
-        if result < 0 {
-            throw BONJSONEncodingError.encodingFailed(
-                ksbonjson_describeEncodeStatus(ksbonjson_encodeStatus(rawValue: UInt32(-result))).map { String(cString: $0) } ?? "Unknown error"
-            )
-        }
+        try throwIfEncodingFailed(result)
     }
 
     mutating func encode(_ value: String, forKey key: Key) throws {
@@ -592,11 +555,7 @@ struct _BufferKeyedEncodingContainer<Key: CodingKey>: KeyedEncodingContainerProt
         let result = value.withCString { cString in
             ksbonjson_encodeToBuffer_string(&state.context, cString, strlen(cString))
         }
-        if result < 0 {
-            throw BONJSONEncodingError.encodingFailed(
-                ksbonjson_describeEncodeStatus(ksbonjson_encodeStatus(rawValue: UInt32(-result))).map { String(cString: $0) } ?? "Unknown error"
-            )
-        }
+        try throwIfEncodingFailed(result)
     }
 
     mutating func encode(_ value: Double, forKey key: Key) throws {
@@ -615,11 +574,7 @@ struct _BufferKeyedEncodingContainer<Key: CodingKey>: KeyedEncodingContainerProt
         try encodeKey(key)
         state.ensureCapacity(Int(KSBONJSON_MAX_ENCODED_SIZE_INT))
         let result = ksbonjson_encodeToBuffer_int(&state.context, Int64(value))
-        if result < 0 {
-            throw BONJSONEncodingError.encodingFailed(
-                ksbonjson_describeEncodeStatus(ksbonjson_encodeStatus(rawValue: UInt32(-result))).map { String(cString: $0) } ?? "Unknown error"
-            )
-        }
+        try throwIfEncodingFailed(result)
     }
 
     mutating func encode(_ value: Int8, forKey key: Key) throws {
@@ -627,11 +582,7 @@ struct _BufferKeyedEncodingContainer<Key: CodingKey>: KeyedEncodingContainerProt
         try encodeKey(key)
         state.ensureCapacity(Int(KSBONJSON_MAX_ENCODED_SIZE_INT))
         let result = ksbonjson_encodeToBuffer_int(&state.context, Int64(value))
-        if result < 0 {
-            throw BONJSONEncodingError.encodingFailed(
-                ksbonjson_describeEncodeStatus(ksbonjson_encodeStatus(rawValue: UInt32(-result))).map { String(cString: $0) } ?? "Unknown error"
-            )
-        }
+        try throwIfEncodingFailed(result)
     }
 
     mutating func encode(_ value: Int16, forKey key: Key) throws {
@@ -639,11 +590,7 @@ struct _BufferKeyedEncodingContainer<Key: CodingKey>: KeyedEncodingContainerProt
         try encodeKey(key)
         state.ensureCapacity(Int(KSBONJSON_MAX_ENCODED_SIZE_INT))
         let result = ksbonjson_encodeToBuffer_int(&state.context, Int64(value))
-        if result < 0 {
-            throw BONJSONEncodingError.encodingFailed(
-                ksbonjson_describeEncodeStatus(ksbonjson_encodeStatus(rawValue: UInt32(-result))).map { String(cString: $0) } ?? "Unknown error"
-            )
-        }
+        try throwIfEncodingFailed(result)
     }
 
     mutating func encode(_ value: Int32, forKey key: Key) throws {
@@ -651,11 +598,7 @@ struct _BufferKeyedEncodingContainer<Key: CodingKey>: KeyedEncodingContainerProt
         try encodeKey(key)
         state.ensureCapacity(Int(KSBONJSON_MAX_ENCODED_SIZE_INT))
         let result = ksbonjson_encodeToBuffer_int(&state.context, Int64(value))
-        if result < 0 {
-            throw BONJSONEncodingError.encodingFailed(
-                ksbonjson_describeEncodeStatus(ksbonjson_encodeStatus(rawValue: UInt32(-result))).map { String(cString: $0) } ?? "Unknown error"
-            )
-        }
+        try throwIfEncodingFailed(result)
     }
 
     mutating func encode(_ value: Int64, forKey key: Key) throws {
@@ -663,11 +606,7 @@ struct _BufferKeyedEncodingContainer<Key: CodingKey>: KeyedEncodingContainerProt
         try encodeKey(key)
         state.ensureCapacity(Int(KSBONJSON_MAX_ENCODED_SIZE_INT))
         let result = ksbonjson_encodeToBuffer_int(&state.context, value)
-        if result < 0 {
-            throw BONJSONEncodingError.encodingFailed(
-                ksbonjson_describeEncodeStatus(ksbonjson_encodeStatus(rawValue: UInt32(-result))).map { String(cString: $0) } ?? "Unknown error"
-            )
-        }
+        try throwIfEncodingFailed(result)
     }
 
     mutating func encode(_ value: UInt, forKey key: Key) throws {
@@ -675,11 +614,7 @@ struct _BufferKeyedEncodingContainer<Key: CodingKey>: KeyedEncodingContainerProt
         try encodeKey(key)
         state.ensureCapacity(Int(KSBONJSON_MAX_ENCODED_SIZE_INT))
         let result = ksbonjson_encodeToBuffer_uint(&state.context, UInt64(value))
-        if result < 0 {
-            throw BONJSONEncodingError.encodingFailed(
-                ksbonjson_describeEncodeStatus(ksbonjson_encodeStatus(rawValue: UInt32(-result))).map { String(cString: $0) } ?? "Unknown error"
-            )
-        }
+        try throwIfEncodingFailed(result)
     }
 
     mutating func encode(_ value: UInt8, forKey key: Key) throws {
@@ -687,11 +622,7 @@ struct _BufferKeyedEncodingContainer<Key: CodingKey>: KeyedEncodingContainerProt
         try encodeKey(key)
         state.ensureCapacity(Int(KSBONJSON_MAX_ENCODED_SIZE_INT))
         let result = ksbonjson_encodeToBuffer_uint(&state.context, UInt64(value))
-        if result < 0 {
-            throw BONJSONEncodingError.encodingFailed(
-                ksbonjson_describeEncodeStatus(ksbonjson_encodeStatus(rawValue: UInt32(-result))).map { String(cString: $0) } ?? "Unknown error"
-            )
-        }
+        try throwIfEncodingFailed(result)
     }
 
     mutating func encode(_ value: UInt16, forKey key: Key) throws {
@@ -699,11 +630,7 @@ struct _BufferKeyedEncodingContainer<Key: CodingKey>: KeyedEncodingContainerProt
         try encodeKey(key)
         state.ensureCapacity(Int(KSBONJSON_MAX_ENCODED_SIZE_INT))
         let result = ksbonjson_encodeToBuffer_uint(&state.context, UInt64(value))
-        if result < 0 {
-            throw BONJSONEncodingError.encodingFailed(
-                ksbonjson_describeEncodeStatus(ksbonjson_encodeStatus(rawValue: UInt32(-result))).map { String(cString: $0) } ?? "Unknown error"
-            )
-        }
+        try throwIfEncodingFailed(result)
     }
 
     mutating func encode(_ value: UInt32, forKey key: Key) throws {
@@ -711,11 +638,7 @@ struct _BufferKeyedEncodingContainer<Key: CodingKey>: KeyedEncodingContainerProt
         try encodeKey(key)
         state.ensureCapacity(Int(KSBONJSON_MAX_ENCODED_SIZE_INT))
         let result = ksbonjson_encodeToBuffer_uint(&state.context, UInt64(value))
-        if result < 0 {
-            throw BONJSONEncodingError.encodingFailed(
-                ksbonjson_describeEncodeStatus(ksbonjson_encodeStatus(rawValue: UInt32(-result))).map { String(cString: $0) } ?? "Unknown error"
-            )
-        }
+        try throwIfEncodingFailed(result)
     }
 
     mutating func encode(_ value: UInt64, forKey key: Key) throws {
@@ -723,11 +646,7 @@ struct _BufferKeyedEncodingContainer<Key: CodingKey>: KeyedEncodingContainerProt
         try encodeKey(key)
         state.ensureCapacity(Int(KSBONJSON_MAX_ENCODED_SIZE_INT))
         let result = ksbonjson_encodeToBuffer_uint(&state.context, value)
-        if result < 0 {
-            throw BONJSONEncodingError.encodingFailed(
-                ksbonjson_describeEncodeStatus(ksbonjson_encodeStatus(rawValue: UInt32(-result))).map { String(cString: $0) } ?? "Unknown error"
-            )
-        }
+        try throwIfEncodingFailed(result)
     }
 
     mutating func encode<T: Encodable>(_ value: T, forKey key: Key) throws {
@@ -770,7 +689,14 @@ struct _BufferKeyedEncodingContainer<Key: CodingKey>: KeyedEncodingContainerProt
     }
 
     mutating func superEncoder() -> Encoder {
-        return superEncoder(forKey: Key(stringValue: "super")!)
+        let key = _BONJSONStringKey(stringValue: "super")
+        do {
+            try prepareToEncode()
+            try encodeKeyString("super")
+        } catch {
+            assertionFailure("Failed to prepare super encoder: \(error)")
+        }
+        return _BufferEncoder(state: state, codingPath: codingPath + [key])
     }
 
     mutating func superEncoder(forKey key: Key) -> Encoder {
@@ -782,6 +708,17 @@ struct _BufferKeyedEncodingContainer<Key: CodingKey>: KeyedEncodingContainerProt
         }
 
         return _BufferEncoder(state: state, codingPath: codingPath + [key])
+    }
+
+    /// Encodes a raw string key (for superEncoder which uses "super" as key name).
+    private func encodeKeyString(_ keyString: String) throws {
+        let utf8Count = keyString.utf8.count
+        state.ensureCapacity(Int(ksbonjson_maxEncodedSize_string(utf8Count)))
+
+        let result = keyString.withCString { cString in
+            ksbonjson_encodeToBuffer_string(&state.context, cString, strlen(cString))
+        }
+        try throwIfEncodingFailed(result)
     }
 }
 
@@ -818,22 +755,14 @@ struct _BufferUnkeyedEncodingContainer: UnkeyedEncodingContainer {
         try prepareToEncode()
         state.ensureCapacity(Int(KSBONJSON_MAX_ENCODED_SIZE_NULL))
         let result = ksbonjson_encodeToBuffer_null(&state.context)
-        if result < 0 {
-            throw BONJSONEncodingError.encodingFailed(
-                ksbonjson_describeEncodeStatus(ksbonjson_encodeStatus(rawValue: UInt32(-result))).map { String(cString: $0) } ?? "Unknown error"
-            )
-        }
+        try throwIfEncodingFailed(result)
     }
 
     mutating func encode(_ value: Bool) throws {
         try prepareToEncode()
         state.ensureCapacity(Int(KSBONJSON_MAX_ENCODED_SIZE_BOOL))
         let result = ksbonjson_encodeToBuffer_bool(&state.context, value)
-        if result < 0 {
-            throw BONJSONEncodingError.encodingFailed(
-                ksbonjson_describeEncodeStatus(ksbonjson_encodeStatus(rawValue: UInt32(-result))).map { String(cString: $0) } ?? "Unknown error"
-            )
-        }
+        try throwIfEncodingFailed(result)
     }
 
     mutating func encode(_ value: String) throws {
@@ -844,11 +773,7 @@ struct _BufferUnkeyedEncodingContainer: UnkeyedEncodingContainer {
         let result = value.withCString { cString in
             ksbonjson_encodeToBuffer_string(&state.context, cString, strlen(cString))
         }
-        if result < 0 {
-            throw BONJSONEncodingError.encodingFailed(
-                ksbonjson_describeEncodeStatus(ksbonjson_encodeStatus(rawValue: UInt32(-result))).map { String(cString: $0) } ?? "Unknown error"
-            )
-        }
+        try throwIfEncodingFailed(result)
     }
 
     mutating func encode(_ value: Double) throws {
@@ -865,110 +790,70 @@ struct _BufferUnkeyedEncodingContainer: UnkeyedEncodingContainer {
         try prepareToEncode()
         state.ensureCapacity(Int(KSBONJSON_MAX_ENCODED_SIZE_INT))
         let result = ksbonjson_encodeToBuffer_int(&state.context, Int64(value))
-        if result < 0 {
-            throw BONJSONEncodingError.encodingFailed(
-                ksbonjson_describeEncodeStatus(ksbonjson_encodeStatus(rawValue: UInt32(-result))).map { String(cString: $0) } ?? "Unknown error"
-            )
-        }
+        try throwIfEncodingFailed(result)
     }
 
     mutating func encode(_ value: Int8) throws {
         try prepareToEncode()
         state.ensureCapacity(Int(KSBONJSON_MAX_ENCODED_SIZE_INT))
         let result = ksbonjson_encodeToBuffer_int(&state.context, Int64(value))
-        if result < 0 {
-            throw BONJSONEncodingError.encodingFailed(
-                ksbonjson_describeEncodeStatus(ksbonjson_encodeStatus(rawValue: UInt32(-result))).map { String(cString: $0) } ?? "Unknown error"
-            )
-        }
+        try throwIfEncodingFailed(result)
     }
 
     mutating func encode(_ value: Int16) throws {
         try prepareToEncode()
         state.ensureCapacity(Int(KSBONJSON_MAX_ENCODED_SIZE_INT))
         let result = ksbonjson_encodeToBuffer_int(&state.context, Int64(value))
-        if result < 0 {
-            throw BONJSONEncodingError.encodingFailed(
-                ksbonjson_describeEncodeStatus(ksbonjson_encodeStatus(rawValue: UInt32(-result))).map { String(cString: $0) } ?? "Unknown error"
-            )
-        }
+        try throwIfEncodingFailed(result)
     }
 
     mutating func encode(_ value: Int32) throws {
         try prepareToEncode()
         state.ensureCapacity(Int(KSBONJSON_MAX_ENCODED_SIZE_INT))
         let result = ksbonjson_encodeToBuffer_int(&state.context, Int64(value))
-        if result < 0 {
-            throw BONJSONEncodingError.encodingFailed(
-                ksbonjson_describeEncodeStatus(ksbonjson_encodeStatus(rawValue: UInt32(-result))).map { String(cString: $0) } ?? "Unknown error"
-            )
-        }
+        try throwIfEncodingFailed(result)
     }
 
     mutating func encode(_ value: Int64) throws {
         try prepareToEncode()
         state.ensureCapacity(Int(KSBONJSON_MAX_ENCODED_SIZE_INT))
         let result = ksbonjson_encodeToBuffer_int(&state.context, value)
-        if result < 0 {
-            throw BONJSONEncodingError.encodingFailed(
-                ksbonjson_describeEncodeStatus(ksbonjson_encodeStatus(rawValue: UInt32(-result))).map { String(cString: $0) } ?? "Unknown error"
-            )
-        }
+        try throwIfEncodingFailed(result)
     }
 
     mutating func encode(_ value: UInt) throws {
         try prepareToEncode()
         state.ensureCapacity(Int(KSBONJSON_MAX_ENCODED_SIZE_INT))
         let result = ksbonjson_encodeToBuffer_uint(&state.context, UInt64(value))
-        if result < 0 {
-            throw BONJSONEncodingError.encodingFailed(
-                ksbonjson_describeEncodeStatus(ksbonjson_encodeStatus(rawValue: UInt32(-result))).map { String(cString: $0) } ?? "Unknown error"
-            )
-        }
+        try throwIfEncodingFailed(result)
     }
 
     mutating func encode(_ value: UInt8) throws {
         try prepareToEncode()
         state.ensureCapacity(Int(KSBONJSON_MAX_ENCODED_SIZE_INT))
         let result = ksbonjson_encodeToBuffer_uint(&state.context, UInt64(value))
-        if result < 0 {
-            throw BONJSONEncodingError.encodingFailed(
-                ksbonjson_describeEncodeStatus(ksbonjson_encodeStatus(rawValue: UInt32(-result))).map { String(cString: $0) } ?? "Unknown error"
-            )
-        }
+        try throwIfEncodingFailed(result)
     }
 
     mutating func encode(_ value: UInt16) throws {
         try prepareToEncode()
         state.ensureCapacity(Int(KSBONJSON_MAX_ENCODED_SIZE_INT))
         let result = ksbonjson_encodeToBuffer_uint(&state.context, UInt64(value))
-        if result < 0 {
-            throw BONJSONEncodingError.encodingFailed(
-                ksbonjson_describeEncodeStatus(ksbonjson_encodeStatus(rawValue: UInt32(-result))).map { String(cString: $0) } ?? "Unknown error"
-            )
-        }
+        try throwIfEncodingFailed(result)
     }
 
     mutating func encode(_ value: UInt32) throws {
         try prepareToEncode()
         state.ensureCapacity(Int(KSBONJSON_MAX_ENCODED_SIZE_INT))
         let result = ksbonjson_encodeToBuffer_uint(&state.context, UInt64(value))
-        if result < 0 {
-            throw BONJSONEncodingError.encodingFailed(
-                ksbonjson_describeEncodeStatus(ksbonjson_encodeStatus(rawValue: UInt32(-result))).map { String(cString: $0) } ?? "Unknown error"
-            )
-        }
+        try throwIfEncodingFailed(result)
     }
 
     mutating func encode(_ value: UInt64) throws {
         try prepareToEncode()
         state.ensureCapacity(Int(KSBONJSON_MAX_ENCODED_SIZE_INT))
         let result = ksbonjson_encodeToBuffer_uint(&state.context, value)
-        if result < 0 {
-            throw BONJSONEncodingError.encodingFailed(
-                ksbonjson_describeEncodeStatus(ksbonjson_encodeStatus(rawValue: UInt32(-result))).map { String(cString: $0) } ?? "Unknown error"
-            )
-        }
+        try throwIfEncodingFailed(result)
     }
 
     mutating func encode<T: Encodable>(_ value: T) throws {
@@ -1031,21 +916,13 @@ struct _BufferSingleValueEncodingContainer: SingleValueEncodingContainer {
     mutating func encodeNil() throws {
         state.ensureCapacity(Int(KSBONJSON_MAX_ENCODED_SIZE_NULL))
         let result = ksbonjson_encodeToBuffer_null(&state.context)
-        if result < 0 {
-            throw BONJSONEncodingError.encodingFailed(
-                ksbonjson_describeEncodeStatus(ksbonjson_encodeStatus(rawValue: UInt32(-result))).map { String(cString: $0) } ?? "Unknown error"
-            )
-        }
+        try throwIfEncodingFailed(result)
     }
 
     mutating func encode(_ value: Bool) throws {
         state.ensureCapacity(Int(KSBONJSON_MAX_ENCODED_SIZE_BOOL))
         let result = ksbonjson_encodeToBuffer_bool(&state.context, value)
-        if result < 0 {
-            throw BONJSONEncodingError.encodingFailed(
-                ksbonjson_describeEncodeStatus(ksbonjson_encodeStatus(rawValue: UInt32(-result))).map { String(cString: $0) } ?? "Unknown error"
-            )
-        }
+        try throwIfEncodingFailed(result)
     }
 
     mutating func encode(_ value: String) throws {
@@ -1055,11 +932,7 @@ struct _BufferSingleValueEncodingContainer: SingleValueEncodingContainer {
         let result = value.withCString { cString in
             ksbonjson_encodeToBuffer_string(&state.context, cString, strlen(cString))
         }
-        if result < 0 {
-            throw BONJSONEncodingError.encodingFailed(
-                ksbonjson_describeEncodeStatus(ksbonjson_encodeStatus(rawValue: UInt32(-result))).map { String(cString: $0) } ?? "Unknown error"
-            )
-        }
+        try throwIfEncodingFailed(result)
     }
 
     mutating func encode(_ value: Double) throws {
@@ -1074,101 +947,61 @@ struct _BufferSingleValueEncodingContainer: SingleValueEncodingContainer {
     mutating func encode(_ value: Int) throws {
         state.ensureCapacity(Int(KSBONJSON_MAX_ENCODED_SIZE_INT))
         let result = ksbonjson_encodeToBuffer_int(&state.context, Int64(value))
-        if result < 0 {
-            throw BONJSONEncodingError.encodingFailed(
-                ksbonjson_describeEncodeStatus(ksbonjson_encodeStatus(rawValue: UInt32(-result))).map { String(cString: $0) } ?? "Unknown error"
-            )
-        }
+        try throwIfEncodingFailed(result)
     }
 
     mutating func encode(_ value: Int8) throws {
         state.ensureCapacity(Int(KSBONJSON_MAX_ENCODED_SIZE_INT))
         let result = ksbonjson_encodeToBuffer_int(&state.context, Int64(value))
-        if result < 0 {
-            throw BONJSONEncodingError.encodingFailed(
-                ksbonjson_describeEncodeStatus(ksbonjson_encodeStatus(rawValue: UInt32(-result))).map { String(cString: $0) } ?? "Unknown error"
-            )
-        }
+        try throwIfEncodingFailed(result)
     }
 
     mutating func encode(_ value: Int16) throws {
         state.ensureCapacity(Int(KSBONJSON_MAX_ENCODED_SIZE_INT))
         let result = ksbonjson_encodeToBuffer_int(&state.context, Int64(value))
-        if result < 0 {
-            throw BONJSONEncodingError.encodingFailed(
-                ksbonjson_describeEncodeStatus(ksbonjson_encodeStatus(rawValue: UInt32(-result))).map { String(cString: $0) } ?? "Unknown error"
-            )
-        }
+        try throwIfEncodingFailed(result)
     }
 
     mutating func encode(_ value: Int32) throws {
         state.ensureCapacity(Int(KSBONJSON_MAX_ENCODED_SIZE_INT))
         let result = ksbonjson_encodeToBuffer_int(&state.context, Int64(value))
-        if result < 0 {
-            throw BONJSONEncodingError.encodingFailed(
-                ksbonjson_describeEncodeStatus(ksbonjson_encodeStatus(rawValue: UInt32(-result))).map { String(cString: $0) } ?? "Unknown error"
-            )
-        }
+        try throwIfEncodingFailed(result)
     }
 
     mutating func encode(_ value: Int64) throws {
         state.ensureCapacity(Int(KSBONJSON_MAX_ENCODED_SIZE_INT))
         let result = ksbonjson_encodeToBuffer_int(&state.context, value)
-        if result < 0 {
-            throw BONJSONEncodingError.encodingFailed(
-                ksbonjson_describeEncodeStatus(ksbonjson_encodeStatus(rawValue: UInt32(-result))).map { String(cString: $0) } ?? "Unknown error"
-            )
-        }
+        try throwIfEncodingFailed(result)
     }
 
     mutating func encode(_ value: UInt) throws {
         state.ensureCapacity(Int(KSBONJSON_MAX_ENCODED_SIZE_INT))
         let result = ksbonjson_encodeToBuffer_uint(&state.context, UInt64(value))
-        if result < 0 {
-            throw BONJSONEncodingError.encodingFailed(
-                ksbonjson_describeEncodeStatus(ksbonjson_encodeStatus(rawValue: UInt32(-result))).map { String(cString: $0) } ?? "Unknown error"
-            )
-        }
+        try throwIfEncodingFailed(result)
     }
 
     mutating func encode(_ value: UInt8) throws {
         state.ensureCapacity(Int(KSBONJSON_MAX_ENCODED_SIZE_INT))
         let result = ksbonjson_encodeToBuffer_uint(&state.context, UInt64(value))
-        if result < 0 {
-            throw BONJSONEncodingError.encodingFailed(
-                ksbonjson_describeEncodeStatus(ksbonjson_encodeStatus(rawValue: UInt32(-result))).map { String(cString: $0) } ?? "Unknown error"
-            )
-        }
+        try throwIfEncodingFailed(result)
     }
 
     mutating func encode(_ value: UInt16) throws {
         state.ensureCapacity(Int(KSBONJSON_MAX_ENCODED_SIZE_INT))
         let result = ksbonjson_encodeToBuffer_uint(&state.context, UInt64(value))
-        if result < 0 {
-            throw BONJSONEncodingError.encodingFailed(
-                ksbonjson_describeEncodeStatus(ksbonjson_encodeStatus(rawValue: UInt32(-result))).map { String(cString: $0) } ?? "Unknown error"
-            )
-        }
+        try throwIfEncodingFailed(result)
     }
 
     mutating func encode(_ value: UInt32) throws {
         state.ensureCapacity(Int(KSBONJSON_MAX_ENCODED_SIZE_INT))
         let result = ksbonjson_encodeToBuffer_uint(&state.context, UInt64(value))
-        if result < 0 {
-            throw BONJSONEncodingError.encodingFailed(
-                ksbonjson_describeEncodeStatus(ksbonjson_encodeStatus(rawValue: UInt32(-result))).map { String(cString: $0) } ?? "Unknown error"
-            )
-        }
+        try throwIfEncodingFailed(result)
     }
 
     mutating func encode(_ value: UInt64) throws {
         state.ensureCapacity(Int(KSBONJSON_MAX_ENCODED_SIZE_INT))
         let result = ksbonjson_encodeToBuffer_uint(&state.context, value)
-        if result < 0 {
-            throw BONJSONEncodingError.encodingFailed(
-                ksbonjson_describeEncodeStatus(ksbonjson_encodeStatus(rawValue: UInt32(-result))).map { String(cString: $0) } ?? "Unknown error"
-            )
-        }
+        try throwIfEncodingFailed(result)
     }
 
     mutating func encode<T: Encodable>(_ value: T) throws {
@@ -1178,6 +1011,18 @@ struct _BufferSingleValueEncodingContainer: SingleValueEncodingContainer {
 }
 
 // MARK: - Helper Types
+
+/// A coding key for string-based keys (used for "super" encoder).
+struct _BONJSONStringKey: CodingKey {
+    var stringValue: String
+    var intValue: Int? { nil }
+
+    init(stringValue: String) {
+        self.stringValue = stringValue
+    }
+
+    init?(intValue: Int) { nil }
+}
 
 /// A coding key for array indices.
 struct _BONJSONIndexKey: CodingKey {

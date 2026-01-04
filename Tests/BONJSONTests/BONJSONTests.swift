@@ -1196,11 +1196,433 @@ final class BONJSONNilTests: XCTestCase {
         let decoded = try decoder.decode(Int?.self, from: data)
         XCTAssertNil(decoded)
     }
+
+    func testExplicitEncodeNilForKey() throws {
+        // This struct explicitly encodes nil values using encodeNil(forKey:)
+        struct ExplicitNil: Codable, Equatable {
+            var name: String
+            var value: Int?
+
+            enum CodingKeys: String, CodingKey {
+                case name, value
+            }
+
+            func encode(to encoder: Encoder) throws {
+                var container = encoder.container(keyedBy: CodingKeys.self)
+                try container.encode(name, forKey: .name)
+                if let value = value {
+                    try container.encode(value, forKey: .value)
+                } else {
+                    // Explicitly encode nil instead of skipping
+                    try container.encodeNil(forKey: .value)
+                }
+            }
+
+            init(name: String, value: Int?) {
+                self.name = name
+                self.value = value
+            }
+
+            init(from decoder: Decoder) throws {
+                let container = try decoder.container(keyedBy: CodingKeys.self)
+                name = try container.decode(String.self, forKey: .name)
+                // Check if value is nil or missing
+                if try container.decodeNil(forKey: .value) {
+                    value = nil
+                } else {
+                    value = try container.decode(Int.self, forKey: .value)
+                }
+            }
+        }
+
+        let encoder = BONJSONEncoder()
+        let decoder = BONJSONDecoder()
+
+        // Test with explicit nil
+        let withNil = ExplicitNil(name: "test", value: nil)
+        let nilData = try encoder.encode(withNil)
+        let decodedNil = try decoder.decode(ExplicitNil.self, from: nilData)
+        XCTAssertEqual(decodedNil, withNil)
+
+        // Test with value
+        let withValue = ExplicitNil(name: "test", value: 42)
+        let valueData = try encoder.encode(withValue)
+        let decodedValue = try decoder.decode(ExplicitNil.self, from: valueData)
+        XCTAssertEqual(decodedValue, withValue)
+    }
 }
 
-// Note: Super encoder tests are skipped because there's a known issue with
-// Key(stringValue: "super") returning nil for some CodingKey types.
-// This is an implementation bug that should be fixed separately.
+// MARK: - Manual Container Tests
+
+final class BONJSONManualContainerTests: XCTestCase {
+
+    // Test encoding UInt in keyed container (line 673)
+    func testEncodeUIntInKeyedContainer() throws {
+        struct WithUInt: Codable, Equatable {
+            var value: UInt
+
+            enum CodingKeys: String, CodingKey {
+                case value
+            }
+
+            func encode(to encoder: Encoder) throws {
+                var container = encoder.container(keyedBy: CodingKeys.self)
+                try container.encode(value, forKey: .value)  // Calls encode(_ value: UInt, forKey:)
+            }
+        }
+
+        let encoder = BONJSONEncoder()
+        let decoder = BONJSONDecoder()
+
+        let value = WithUInt(value: 12345)
+        let data = try encoder.encode(value)
+        let decoded = try decoder.decode(WithUInt.self, from: data)
+        XCTAssertEqual(decoded, value)
+    }
+
+    // Test nestedContainer(keyedBy:forKey:) (line 740)
+    func testNestedKeyedContainerInKeyedContainer() throws {
+        struct Outer: Codable, Equatable {
+            var name: String
+            var inner: Inner
+
+            struct Inner: Codable, Equatable {
+                var x: Int
+                var y: Int
+
+                enum CodingKeys: String, CodingKey {
+                    case x, y
+                }
+            }
+
+            enum CodingKeys: String, CodingKey {
+                case name, inner
+            }
+
+            func encode(to encoder: Encoder) throws {
+                var container = encoder.container(keyedBy: CodingKeys.self)
+                try container.encode(name, forKey: .name)
+
+                // Manually create nested keyed container
+                var nestedContainer = container.nestedContainer(keyedBy: Inner.CodingKeys.self, forKey: .inner)
+                try nestedContainer.encode(inner.x, forKey: .x)
+                try nestedContainer.encode(inner.y, forKey: .y)
+            }
+
+            init(name: String, inner: Inner) {
+                self.name = name
+                self.inner = inner
+            }
+
+            init(from decoder: Decoder) throws {
+                let container = try decoder.container(keyedBy: CodingKeys.self)
+                name = try container.decode(String.self, forKey: .name)
+                inner = try container.decode(Inner.self, forKey: .inner)
+            }
+        }
+
+        let encoder = BONJSONEncoder()
+        let decoder = BONJSONDecoder()
+
+        let value = Outer(name: "test", inner: Outer.Inner(x: 10, y: 20))
+        let data = try encoder.encode(value)
+        let decoded = try decoder.decode(Outer.self, from: data)
+        XCTAssertEqual(decoded, value)
+    }
+
+    // Test nestedUnkeyedContainer(forKey:) (line 758)
+    func testNestedUnkeyedContainerInKeyedContainer() throws {
+        struct WithArray: Codable, Equatable {
+            var name: String
+            var values: [Int]
+
+            enum CodingKeys: String, CodingKey {
+                case name, values
+            }
+
+            func encode(to encoder: Encoder) throws {
+                var container = encoder.container(keyedBy: CodingKeys.self)
+                try container.encode(name, forKey: .name)
+
+                // Manually create nested unkeyed container
+                var nestedContainer = container.nestedUnkeyedContainer(forKey: .values)
+                for value in values {
+                    try nestedContainer.encode(value)
+                }
+            }
+
+            init(name: String, values: [Int]) {
+                self.name = name
+                self.values = values
+            }
+
+            init(from decoder: Decoder) throws {
+                let container = try decoder.container(keyedBy: CodingKeys.self)
+                name = try container.decode(String.self, forKey: .name)
+                values = try container.decode([Int].self, forKey: .values)
+            }
+        }
+
+        let encoder = BONJSONEncoder()
+        let decoder = BONJSONDecoder()
+
+        let value = WithArray(name: "test", values: [1, 2, 3])
+        let data = try encoder.encode(value)
+        let decoded = try decoder.decode(WithArray.self, from: data)
+        XCTAssertEqual(decoded, value)
+    }
+
+    // Test encodeNil() in unkeyed container (line 817)
+    func testEncodeNilInUnkeyedContainer() throws {
+        struct ArrayWithNils: Codable, Equatable {
+            var values: [Int?]
+
+            func encode(to encoder: Encoder) throws {
+                var container = encoder.unkeyedContainer()
+                for value in values {
+                    if let v = value {
+                        try container.encode(v)
+                    } else {
+                        try container.encodeNil()  // Explicitly encode nil
+                    }
+                }
+            }
+
+            init(values: [Int?]) {
+                self.values = values
+            }
+
+            init(from decoder: Decoder) throws {
+                var container = try decoder.unkeyedContainer()
+                var values: [Int?] = []
+                while !container.isAtEnd {
+                    if try container.decodeNil() {
+                        values.append(nil)
+                    } else {
+                        values.append(try container.decode(Int.self))
+                    }
+                }
+                self.values = values
+            }
+        }
+
+        let encoder = BONJSONEncoder()
+        let decoder = BONJSONDecoder()
+
+        let value = ArrayWithNils(values: [1, nil, 3, nil, 5])
+        let data = try encoder.encode(value)
+        let decoded = try decoder.decode(ArrayWithNils.self, from: data)
+        XCTAssertEqual(decoded, value)
+    }
+
+    // Test superEncoder(forKey:) (line 776) with a custom key that works
+    func testSuperEncoderForKey() throws {
+        struct CustomCodingKey: CodingKey {
+            var stringValue: String
+            var intValue: Int? { nil }
+
+            init(stringValue: String) {
+                self.stringValue = stringValue
+            }
+
+            init?(intValue: Int) { nil }
+        }
+
+        struct Parent: Codable {
+            var parentValue: Int
+
+            init(parentValue: Int) {
+                self.parentValue = parentValue
+            }
+
+            enum CodingKeys: String, CodingKey {
+                case parentValue
+            }
+        }
+
+        struct Child: Codable, Equatable {
+            var childValue: String
+            var parentValue: Int
+
+            enum CodingKeys: String, CodingKey {
+                case childValue
+                case parentData  // Key for the super encoder
+            }
+
+            func encode(to encoder: Encoder) throws {
+                var container = encoder.container(keyedBy: CodingKeys.self)
+                try container.encode(childValue, forKey: .childValue)
+
+                // Use superEncoder with a specific key
+                let superEnc = container.superEncoder(forKey: .parentData)
+                var superContainer = superEnc.container(keyedBy: Parent.CodingKeys.self)
+                try superContainer.encode(parentValue, forKey: .parentValue)
+            }
+
+            init(childValue: String, parentValue: Int) {
+                self.childValue = childValue
+                self.parentValue = parentValue
+            }
+
+            init(from decoder: Decoder) throws {
+                let container = try decoder.container(keyedBy: CodingKeys.self)
+                childValue = try container.decode(String.self, forKey: .childValue)
+                let superDec = try container.superDecoder(forKey: .parentData)
+                let superContainer = try superDec.container(keyedBy: Parent.CodingKeys.self)
+                parentValue = try superContainer.decode(Int.self, forKey: .parentValue)
+            }
+        }
+
+        let encoder = BONJSONEncoder()
+        let decoder = BONJSONDecoder()
+
+        let value = Child(childValue: "test", parentValue: 42)
+        let data = try encoder.encode(value)
+        let decoded = try decoder.decode(Child.self, from: data)
+        XCTAssertEqual(decoded, value)
+    }
+
+    // Test nested containers in unkeyed container
+    func testNestedKeyedContainerInUnkeyedContainer() throws {
+        struct Item: Codable, Equatable {
+            var x: Int
+            var y: Int
+
+            enum CodingKeys: String, CodingKey {
+                case x, y
+            }
+        }
+
+        struct ItemList: Codable, Equatable {
+            var items: [Item]
+
+            func encode(to encoder: Encoder) throws {
+                var container = encoder.unkeyedContainer()
+                for item in items {
+                    // Create nested keyed container in unkeyed container
+                    var nestedContainer = container.nestedContainer(keyedBy: Item.CodingKeys.self)
+                    try nestedContainer.encode(item.x, forKey: .x)
+                    try nestedContainer.encode(item.y, forKey: .y)
+                }
+            }
+
+            init(items: [Item]) {
+                self.items = items
+            }
+
+            init(from decoder: Decoder) throws {
+                var container = try decoder.unkeyedContainer()
+                var items: [Item] = []
+                while !container.isAtEnd {
+                    items.append(try container.decode(Item.self))
+                }
+                self.items = items
+            }
+        }
+
+        let encoder = BONJSONEncoder()
+        let decoder = BONJSONDecoder()
+
+        let value = ItemList(items: [Item(x: 1, y: 2), Item(x: 3, y: 4)])
+        let data = try encoder.encode(value)
+        let decoded = try decoder.decode(ItemList.self, from: data)
+        XCTAssertEqual(decoded, value)
+    }
+
+    // Test nested unkeyed container in unkeyed container
+    func testNestedUnkeyedContainerInUnkeyedContainer() throws {
+        struct Matrix: Codable, Equatable {
+            var rows: [[Int]]
+
+            func encode(to encoder: Encoder) throws {
+                var container = encoder.unkeyedContainer()
+                for row in rows {
+                    var nestedContainer = container.nestedUnkeyedContainer()
+                    for value in row {
+                        try nestedContainer.encode(value)
+                    }
+                }
+            }
+
+            init(rows: [[Int]]) {
+                self.rows = rows
+            }
+
+            init(from decoder: Decoder) throws {
+                var container = try decoder.unkeyedContainer()
+                var rows: [[Int]] = []
+                while !container.isAtEnd {
+                    var row: [Int] = []
+                    var nestedContainer = try container.nestedUnkeyedContainer()
+                    while !nestedContainer.isAtEnd {
+                        row.append(try nestedContainer.decode(Int.self))
+                    }
+                    rows.append(row)
+                }
+                self.rows = rows
+            }
+        }
+
+        let encoder = BONJSONEncoder()
+        let decoder = BONJSONDecoder()
+
+        let value = Matrix(rows: [[1, 2], [3, 4, 5], [6]])
+        let data = try encoder.encode(value)
+        let decoded = try decoder.decode(Matrix.self, from: data)
+        XCTAssertEqual(decoded, value)
+    }
+
+    // Test superEncoder() no-argument version (line 772)
+    func testSuperEncoderNoArgument() throws {
+        class Parent: Codable {
+            var parentValue: Int
+
+            init(parentValue: Int) {
+                self.parentValue = parentValue
+            }
+
+            enum CodingKeys: String, CodingKey {
+                case parentValue
+            }
+        }
+
+        class Child: Parent {
+            var childValue: String
+
+            init(childValue: String, parentValue: Int) {
+                self.childValue = childValue
+                super.init(parentValue: parentValue)
+            }
+
+            enum ChildCodingKeys: String, CodingKey {
+                case childValue
+            }
+
+            required init(from decoder: Decoder) throws {
+                let container = try decoder.container(keyedBy: ChildCodingKeys.self)
+                childValue = try container.decode(String.self, forKey: .childValue)
+                // Use superDecoder() no-argument to decode parent
+                try super.init(from: try container.superDecoder())
+            }
+
+            override func encode(to encoder: Encoder) throws {
+                var container = encoder.container(keyedBy: ChildCodingKeys.self)
+                try container.encode(childValue, forKey: .childValue)
+                // Use superEncoder() no-argument (encodes to "super" key)
+                try super.encode(to: container.superEncoder())
+            }
+        }
+
+        let encoder = BONJSONEncoder()
+        let decoder = BONJSONDecoder()
+
+        let value = Child(childValue: "test", parentValue: 42)
+        let data = try encoder.encode(value)
+        let decoded = try decoder.decode(Child.self, from: data)
+        XCTAssertEqual(decoded.childValue, value.childValue)
+        XCTAssertEqual(decoded.parentValue, value.parentValue)
+    }
+}
 
 // MARK: - Unkeyed Container Nested Tests
 
