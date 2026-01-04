@@ -654,6 +654,71 @@ ssize_t ksbonjson_encodeToBuffer_doubleArray(
     return (ssize_t)totalBytes;
 }
 
+size_t ksbonjson_maxEncodedSize_stringArray(size_t count, size_t totalStringLength)
+{
+    // Array begin (1) + count * max string header (10 per string) + total string bytes + array end (1)
+    return 2 + count * 10 + totalStringLength;
+}
+
+// Internal: encode a single string without container state checks (for batch use)
+static inline size_t encodeStringFast(KSBONJSONBufferEncodeContext* ctx,
+                                      const char* value,
+                                      size_t length)
+{
+    if (length <= 15)
+    {
+        bufferWriteByte(ctx, (uint8_t)(TYPE_STRING0 + length));
+        bufferWriteBytes(ctx, (const uint8_t*)value, length);
+        return 1 + length;
+    }
+
+    // Long string: type + length field + string data
+    union num64_bits bits[2];
+    size_t lengthFieldBytes = encodeLengthField(length, 0, bits) + 1;
+    uint8_t* ptr = bits[0].b + bits[0].b[0] - 1;
+    *ptr = TYPE_STRING;
+
+    bufferWriteBytes(ctx, ptr, lengthFieldBytes);
+    bufferWriteBytes(ctx, (const uint8_t*)value, length);
+
+    return lengthFieldBytes + length;
+}
+
+ssize_t ksbonjson_encodeToBuffer_stringArray(
+    KSBONJSONBufferEncodeContext* ctx,
+    const char* const* strings,
+    const size_t* lengths,
+    size_t count)
+{
+    KSBONJSONContainerState* const container = getBufferContainer(ctx);
+    unlikely_if((container->isObject & container->isExpectingName) | container->isChunkingString)
+    {
+        return container->isChunkingString ? -KSBONJSON_ENCODE_CHUNKING_STRING : -KSBONJSON_ENCODE_EXPECTED_OBJECT_NAME;
+    }
+    container->isExpectingName = true;
+
+    size_t totalBytes = 0;
+
+    // Begin array
+    ctx->containerDepth++;
+    ctx->containers[ctx->containerDepth] = (KSBONJSONContainerState){0};
+    bufferWriteByte(ctx, TYPE_ARRAY);
+    totalBytes++;
+
+    // Encode all strings in tight loop (no per-element state checks)
+    for (size_t i = 0; i < count; i++)
+    {
+        totalBytes += encodeStringFast(ctx, strings[i], lengths[i]);
+    }
+
+    // End array
+    ctx->containerDepth--;
+    bufferWriteByte(ctx, TYPE_END);
+    totalBytes++;
+
+    return (ssize_t)totalBytes;
+}
+
 
 // ============================================================================
 // Callback-Based Encoder Implementation (Original API)

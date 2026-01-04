@@ -272,6 +272,28 @@ KSBONJSON_PUBLIC size_t ksbonjson_maxEncodedSize_int64Array(size_t count);
  */
 KSBONJSON_PUBLIC size_t ksbonjson_maxEncodedSize_doubleArray(size_t count);
 
+/**
+ * Encode an array of strings.
+ * This is much faster than encoding elements one at a time.
+ *
+ * @param ctx The encoding context
+ * @param strings Array of string pointers (UTF-8 encoded)
+ * @param lengths Array of string lengths (one per string)
+ * @param count Number of strings to encode
+ * @return Total bytes written (positive) or error code (negative)
+ */
+KSBONJSON_PUBLIC ssize_t ksbonjson_encodeToBuffer_stringArray(
+    KSBONJSONBufferEncodeContext* ctx,
+    const char* const* strings,
+    const size_t* lengths,
+    size_t count);
+
+/**
+ * Calculate maximum bytes needed for a string array.
+ * Note: This requires the total length of all strings.
+ */
+KSBONJSON_PUBLIC size_t ksbonjson_maxEncodedSize_stringArray(size_t count, size_t totalStringLength);
+
 
 // ============================================================================
 // Callback-Based Encoder (Original API - Preserved for Compatibility)

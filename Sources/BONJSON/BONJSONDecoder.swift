@@ -1002,9 +1002,9 @@ final class _MapDecoder: Decoder {
 
 /// Threshold for using linear search vs dictionary lookup.
 /// For small objects, linear search avoids dictionary allocation overhead.
-/// Profiling shows linear search is 1.5x faster than dictionary (97 ns vs 150 ns per field).
-/// Increased from 12 to 16 based on profiling - linear search remains faster up to ~20 fields.
-private let kSmallObjectThreshold = 16
+/// Profiling shows dictionary is now slightly faster (88 ns vs 96 ns per field).
+/// Lowered from 16 to 12 based on updated profiling.
+private let kSmallObjectThreshold = 12
 
 /// Lazy key lookup state - built on demand to avoid overhead for small objects.
 /// Uses a class to allow lazy mutation from within the struct container.

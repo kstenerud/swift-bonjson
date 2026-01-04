@@ -106,6 +106,8 @@ public final class BONJSONEncoder {
             try state.encodeBatchInt64Array(int64Array)
         } else if let doubleArray = value as? [Double] {
             try state.encodeBatchDoubleArray(doubleArray)
+        } else if let stringArray = value as? [String] {
+            try state.encodeBatchStringArray(stringArray)
         } else {
             // Default path through Codable
             let encoder = _BufferEncoder(state: state, codingPath: [])
@@ -291,6 +293,63 @@ final class _BufferEncoderState {
         let result = values.withUnsafeBufferPointer { ptr in
             ksbonjson_encodeToBuffer_doubleArray(&context, ptr.baseAddress, values.count)
         }
+        if result < 0 {
+            throw BONJSONEncodingError.encodingFailed(
+                ksbonjson_describeEncodeStatus(ksbonjson_encodeStatus(rawValue: UInt32(-result))).map { String(cString: $0) } ?? "Unknown error"
+            )
+        }
+    }
+
+    /// Batch encode an array of String values.
+    func encodeBatchStringArray(_ values: [String]) throws {
+        // Calculate total UTF-8 length for capacity estimation
+        var totalLength = 0
+        for str in values {
+            totalLength += str.utf8.count
+        }
+
+        ensureCapacity(Int(ksbonjson_maxEncodedSize_stringArray(values.count, totalLength)))
+
+        // Convert strings to contiguous UTF-8 data and track offsets
+        var utf8Data = [UInt8]()
+        utf8Data.reserveCapacity(totalLength)
+        var lengths = [Int]()
+        lengths.reserveCapacity(values.count)
+
+        for str in values {
+            let utf8 = Array(str.utf8)
+            lengths.append(utf8.count)
+            utf8Data.append(contentsOf: utf8)
+        }
+
+        // Build array of pointers into the contiguous buffer
+        let result = utf8Data.withUnsafeBufferPointer { dataPtr in
+            var stringPtrs = [UnsafePointer<CChar>?]()
+            stringPtrs.reserveCapacity(values.count)
+
+            var offset = 0
+            for length in lengths {
+                if length == 0 {
+                    // Empty string - use a valid empty pointer
+                    stringPtrs.append(UnsafePointer<CChar>(bitPattern: 1))
+                } else {
+                    stringPtrs.append(UnsafeRawPointer(dataPtr.baseAddress! + offset).assumingMemoryBound(to: CChar.self))
+                }
+                offset += length
+            }
+
+            return stringPtrs.withUnsafeBufferPointer { ptrsPtr in
+                lengths.withUnsafeBufferPointer { lengthsPtr in
+                    ksbonjson_encodeToBuffer_stringArray(
+                        &context,
+                        ptrsPtr.baseAddress,
+                        lengthsPtr.baseAddress,
+                        values.count
+                    )
+                }
+            }
+        }
+
         if result < 0 {
             throw BONJSONEncodingError.encodingFailed(
                 ksbonjson_describeEncodeStatus(ksbonjson_encodeStatus(rawValue: UInt32(-result))).map { String(cString: $0) } ?? "Unknown error"
