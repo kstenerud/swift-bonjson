@@ -1,5 +1,5 @@
 //
-//  KSBONJSONCodec.h
+//  KSBONJSONDecoder.h
 //
 //  Created by Karl Stenerud on 2024-07-07.
 //
@@ -38,20 +38,13 @@ extern "C" {
 
 
 // ============================================================================
-// Compile-time Configuration (synced with encoder)
+// Compile-time Configuration
 // ============================================================================
 
-/**
- * Maximum depth of objects / arrays before the library will abort processing.
- * This increases encoder and decoder memory usage by 1 byte per level.
- */
 #ifndef KSBONJSON_MAX_CONTAINER_DEPTH
 #   define KSBONJSON_MAX_CONTAINER_DEPTH 200
 #endif
 
-/**
- * The restrict modifier, if available, increases optimization opportunities.
- */
 #ifndef KSBONJSON_RESTRICT
 #   ifdef __cplusplus
 #       define KSBONJSON_RESTRICT __restrict__
@@ -60,9 +53,6 @@ extern "C" {
 #   endif
 #endif
 
-/**
- * If your compiler makes symbols private by default, you will need to define this.
- */
 #ifndef KSBONJSON_PUBLIC
 #   if defined _WIN32 || defined __CYGWIN__
 #       define KSBONJSON_PUBLIC __declspec(dllimport)
@@ -73,275 +63,235 @@ extern "C" {
 
 
 // ============================================================================
-// Common Types (synced with encoder)
+// Common Types
 // ============================================================================
 
 #ifndef TYPEDEF_KSBIGNUMBER
 #define TYPEDEF_KSBIGNUMBER
     typedef struct
     {
-        uint64_t significand;     // Unsigned 64-bit absolute value
-        int32_t exponent;         // Signed 24-bit (-0x800000 to 0x7fffff)
-        int32_t significandSign; // 1 or -1
+        uint64_t significand;
+        int32_t exponent;
+        int32_t significandSign;
     } KSBigNumber;
 
-    /**
-     * Create a new Big Number
-     * @param sign The significand's sign: 1 (positive) or -1 (negative)
-     * @param significandAbs The absolute value of the significand
-     * @param exponent The exponent (-0x800000 to 0x7fffff)
-     * @return A new Big Number
-     */
     static inline KSBigNumber ksbonjson_newBigNumber(int sign, uint64_t significandAbs, int32_t exponent)
     {
-        KSBigNumber v =
-                {
-                    .significand = significandAbs,
-                    .exponent = exponent,
-                    .significandSign = (int32_t)sign,
-                };
+        KSBigNumber v = {
+            .significand = significandAbs,
+            .exponent = exponent,
+            .significandSign = (int32_t)sign,
+        };
         return v;
     }
-#endif // TYPEDEF_KSBIGNUMBER
+#endif
 
 
 // ============================================================================
-// Decoder Types
+// Decoder Status Codes
 // ============================================================================
 
 typedef enum
 {
-    /**
-     * Everything completed without error
-     */
     KSBONJSON_DECODE_OK = 0,
-    
-    /**
-     * Source data appears to be truncated.
-     */
     KSBONJSON_DECODE_INCOMPLETE = 1,
-
-    /**
-     * Not all containers have been closed yet (likely the document has been truncated).
-     */
     KSBONJSON_DECODE_UNCLOSED_CONTAINERS = 2,
-
-    /**
-     * Tried to close too many containers.
-     */
     KSBONJSON_DECODE_UNBALANCED_CONTAINERS = 3,
-
-    /**
-     * The document had too much container depth.
-     */
     KSBONJSON_DECODE_CONTAINER_DEPTH_EXCEEDED = 4,
-
-    /**
-     * Expected to find a string for an object element name.
-     */
     KSBONJSON_DECODE_EXPECTED_OBJECT_NAME = 5,
-
-    /**
-     * Got an end container while expecting an object element value.
-     */
     KSBONJSON_DECODE_EXPECTED_OBJECT_VALUE = 6,
-
-    /**
-     * An element was successfully decoded, but contained invalid data.
-     */
     KSBONJSON_DECODE_INVALID_DATA = 7,
-
-    /**
-     * This name already exists in the current object.
-     */
     KSBONJSON_DECODE_DUPLICATE_OBJECT_NAME = 8,
-
-    /**
-     * The value is out of range and cannot be stored without data loss.
-     */
     KSBONJSON_DECODE_VALUE_OUT_OF_RANGE = 9,
-
-    /**
-     * A string value contained a NUL character.
-     */
     KSBONJSON_DECODE_NUL_CHARACTER = 10,
-
-    /**
-     * Generic error code that can be returned from a callback.
-     *
-     * More specific error codes (> 100) may also be defined by the user if needed.
-     */
+    KSBONJSON_DECODE_MAP_FULL = 11,
     KSBONJSON_DECODE_COULD_NOT_PROCESS_DATA = 100,
 } ksbonjson_decodeStatus;
 
+
+// ============================================================================
+// Position Map Types (NEW - High Performance API)
+// ============================================================================
+
 /**
- * Callbacks called during a BONJSON decode process.
- * All function pointers must point to valid functions.
+ * Value types stored in the position map.
  */
+typedef enum {
+    KSBONJSON_TYPE_NULL = 0,
+    KSBONJSON_TYPE_FALSE,
+    KSBONJSON_TYPE_TRUE,
+    KSBONJSON_TYPE_INT,        // Stored as int64 (small int or multi-byte signed)
+    KSBONJSON_TYPE_UINT,       // Stored as uint64 (multi-byte unsigned)
+    KSBONJSON_TYPE_FLOAT,      // Stored as double
+    KSBONJSON_TYPE_BIGNUMBER,  // Big number (requires special handling)
+    KSBONJSON_TYPE_STRING,     // String with offset and length
+    KSBONJSON_TYPE_ARRAY,      // Array container
+    KSBONJSON_TYPE_OBJECT,     // Object container
+} KSBONJSONValueType;
+
+/**
+ * A decoded value in the position map.
+ *
+ * This union holds the decoded value directly for primitives,
+ * or offset/length for strings and containers.
+ */
+typedef struct {
+    KSBONJSONValueType type;
+    union {
+        int64_t intValue;       // For INT type
+        uint64_t uintValue;     // For UINT type
+        double floatValue;      // For FLOAT type
+        struct {
+            uint32_t offset;    // Byte offset in input buffer
+            uint32_t length;    // Length in bytes
+        } string;
+        struct {
+            uint32_t firstChild; // Index of first child in map
+            uint32_t count;      // Number of children
+        } container;
+        struct {
+            uint64_t significand;
+            int32_t exponent;
+            int32_t sign;
+        } bigNumber;
+    } data;
+} KSBONJSONMapEntry;
+
+/**
+ * Position map decode context.
+ *
+ * This builds a map of all values during scanning, allowing
+ * random access without re-parsing.
+ */
+typedef struct {
+    // Input buffer (not owned - caller must keep alive)
+    const uint8_t* input;
+    size_t inputLength;
+
+    // Map entries (caller-provided buffer)
+    KSBONJSONMapEntry* entries;
+    size_t entriesCapacity;
+    size_t entriesCount;
+
+    // Root entry index (usually 0)
+    size_t rootIndex;
+
+    // Parsing position
+    size_t position;
+
+    // Container stack for parsing
+    int containerDepth;
+    size_t containerStack[KSBONJSON_MAX_CONTAINER_DEPTH];
+} KSBONJSONMapContext;
+
+/**
+ * Initialize position map decoding.
+ *
+ * @param ctx The context to initialize
+ * @param input The BONJSON input buffer (must remain valid)
+ * @param inputLength Length of input in bytes
+ * @param entries Caller-provided entry buffer
+ * @param entriesCapacity Size of entry buffer
+ */
+KSBONJSON_PUBLIC void ksbonjson_map_begin(
+    KSBONJSONMapContext* ctx,
+    const uint8_t* input,
+    size_t inputLength,
+    KSBONJSONMapEntry* entries,
+    size_t entriesCapacity);
+
+/**
+ * Scan the input and build the position map.
+ * Returns KSBONJSON_DECODE_OK on success, error code on failure.
+ */
+KSBONJSON_PUBLIC ksbonjson_decodeStatus ksbonjson_map_scan(KSBONJSONMapContext* ctx);
+
+/**
+ * Get the root entry index.
+ */
+KSBONJSON_PUBLIC size_t ksbonjson_map_root(KSBONJSONMapContext* ctx);
+
+/**
+ * Get an entry by index.
+ */
+KSBONJSON_PUBLIC const KSBONJSONMapEntry* ksbonjson_map_get(KSBONJSONMapContext* ctx, size_t index);
+
+/**
+ * Get the number of entries in the map.
+ */
+KSBONJSON_PUBLIC size_t ksbonjson_map_count(KSBONJSONMapContext* ctx);
+
+/**
+ * Get a string value's data pointer and length.
+ * Returns NULL if not a string type.
+ */
+KSBONJSON_PUBLIC const char* ksbonjson_map_getString(
+    KSBONJSONMapContext* ctx,
+    size_t index,
+    size_t* outLength);
+
+/**
+ * Get the child at a given position in a container.
+ * For arrays: childIndex is the array index (0-based)
+ * For objects: childIndex is the key-value pair index * 2 (key) or *2+1 (value)
+ * Returns the entry index, or SIZE_MAX if out of bounds.
+ */
+KSBONJSON_PUBLIC size_t ksbonjson_map_getChild(
+    KSBONJSONMapContext* ctx,
+    size_t containerIndex,
+    size_t childIndex);
+
+/**
+ * Find a key in an object and return the value's entry index.
+ * Returns SIZE_MAX if not found.
+ */
+KSBONJSON_PUBLIC size_t ksbonjson_map_findKey(
+    KSBONJSONMapContext* ctx,
+    size_t objectIndex,
+    const char* key,
+    size_t keyLength);
+
+/**
+ * Estimate the number of entries needed to decode the input.
+ * This provides a reasonable upper bound for buffer sizing.
+ */
+KSBONJSON_PUBLIC size_t ksbonjson_map_estimateEntries(size_t inputLength);
+
+
+// ============================================================================
+// Callback-Based Decoder (Original API - Preserved for Compatibility)
+// ============================================================================
+
 typedef struct KSBONJSONDecodeCallbacks
 {
-    /**
-     * Called when a boolean element value is decoded.
-     *
-     * @param value The element's value.
-     * @param userData Data that was specified when calling ksbonjson_decode().
-     * @return KSBONJSON_DECODE_OK if decoding should continue.
-     */
     ksbonjson_decodeStatus (*onBoolean)(bool value, void* userData);
-
-    /**
-     * Called when an unsigned integer element value is decoded.
-     *
-     * @param value The element's value.
-     * @param userData Data that was specified when calling ksbonjson_decode().
-     * @return KSBONJSON_DECODE_OK if decoding should continue.
-     */
     ksbonjson_decodeStatus (*onUnsignedInteger)(uint64_t value, void* userData);
-
-    /**
-     * Called when a signed integer element value is decoded.
-     *
-     * @param value The element's value.
-     * @param userData Data that was specified when calling ksbonjson_decode().
-     * @return KSBONJSON_DECODE_OK if decoding should continue.
-     */
     ksbonjson_decodeStatus (*onSignedInteger)(int64_t value, void* userData);
-
-    /**
-     * Called when a floating point element value is decoded.
-     *
-     * @param value The element's value.
-     * @param userData Data that was specified when calling ksbonjson_decode().
-     * @return KSBONJSON_DECODE_OK if decoding should continue.
-     */
     ksbonjson_decodeStatus (*onFloat)(double value, void* userData);
-
-    /**
-     * Called when a Big Number element value is decoded.
-     *
-     * @param value The element's value.
-     * @param userData Data that was specified when calling ksbonjson_decode().
-     * @return KSBONJSON_DECODE_OK if decoding should continue.
-     */
     ksbonjson_decodeStatus (*onBigNumber)(KSBigNumber value, void* userData);
-
-    /**
-     * Called when a null element value is decoded.
-     *
-     * @param userData Data that was specified when calling ksbonjson_decode().
-     * @return KSBONJSON_DECODE_OK if decoding should continue.
-     */
     ksbonjson_decodeStatus (*onNull)(void* userData);
-
-    /**
-     * Called when a string element value is decoded.
-     *
-     * The string data has NOT been validated against UTF-8!
-     *
-     * Even after validation, the string data could in theory contain NUL
-     * characters (which are valid in JSON).
-     *
-     * @param value The element's value.
-     * @param length The value's length.
-     * @param userData Data that was specified when calling ksbonjson_decode().
-     * @return KSBONJSON_DECODE_OK if decoding should continue.
-     */
     ksbonjson_decodeStatus (*onString)(const char* KSBONJSON_RESTRICT value,
                                        size_t length,
                                        void* KSBONJSON_RESTRICT userData);
-
-    /**
-     * Called when a string chunk is decoded.
-     *
-     * The BONSJON spec requires at least one chunking security policy.
-     * As this library is a low-level building block, it's on the user of this library
-     * to add such a policy.
-     *
-     * The string data has NOT been validated against UTF-8!
-     *
-     * Even after validation, the string data could in theory contain NUL
-     * characters (which are valid in JSON).
-     *
-     * @param value The chunk's value.
-     * @param length The chunk's length in bytes.
-     * @param isLastChunk If true, this is the last chunk, and the string is done.
-     * @param userData Data that was specified when calling ksbonjson_decode().
-     * @return KSBONJSON_DECODE_OK if decoding should continue.
-     */
     ksbonjson_decodeStatus (*onStringChunk)(const char* KSBONJSON_RESTRICT value,
-        size_t length,
-        bool isLastChunk,
-        void* KSBONJSON_RESTRICT userData);
-
-    /**
-     * Called when a new object is encountered.
-     *
-     * @param userData Data that was specified when calling ksbonjson_decode().
-     * @return KSBONJSON_DECODE_OK if decoding should continue.
-     */
+                                            size_t length,
+                                            bool isLastChunk,
+                                            void* KSBONJSON_RESTRICT userData);
     ksbonjson_decodeStatus (*onBeginObject)(void* userData);
-
-    /**
-     * Called when a new array is encountered.
-     *
-     * @param userData Data that was specified when calling ksbonjson_decode().
-     * @return KSBONJSON_DECODE_OK if decoding should continue.
-     */
     ksbonjson_decodeStatus (*onBeginArray)(void* userData);
-
-    /**
-     * Called when leaving the current container and returning to the next
-     * higher level container.
-     *
-     * @param userData Data that was specified when calling ksbonjson_decode().
-     * @return KSBONJSON_DECODE_OK if decoding should continue.
-     */
     ksbonjson_decodeStatus (*onEndContainer)(void* userData);
-
-    /**
-     * Called when the end of the document is reached.
-     *
-     * @param userData Data that was specified when calling ksbonjson_decode().
-     * @return KSBONJSON_DECODE_OK if decoding should continue.
-     */
     ksbonjson_decodeStatus (*onEndData)(void* userData);
-
 } KSBONJSONDecodeCallbacks;
 
+KSBONJSON_PUBLIC ksbonjson_decodeStatus ksbonjson_decode(
+    const uint8_t* KSBONJSON_RESTRICT document,
+    size_t documentLength,
+    const KSBONJSONDecodeCallbacks* KSBONJSON_RESTRICT callbacks,
+    void* KSBONJSON_RESTRICT userData,
+    size_t* KSBONJSON_RESTRICT decodedOffset);
 
-// ============================================================================
-// Decoder API
-// ============================================================================
-
-/**
- * Decode a BONJSON document.
- *
- * @param document The document to decode.
- * @param documentLength The length of the document.
- * @param callbacks The callbacks to call with events as the document is decoded.
- * @param userData Any user-defined data you want passed to the callbacks.
- * @param decodedOffset Pointer to a variable that will hold the offset to where decoding stopped.
- * @return KSBONJSON_DECODE_OK on success.
- */
-KSBONJSON_PUBLIC ksbonjson_decodeStatus ksbonjson_decode(const uint8_t* KSBONJSON_RESTRICT document,
-                                                         size_t documentLength,
-                                                         const KSBONJSONDecodeCallbacks* KSBONJSON_RESTRICT callbacks,
-                                                         void* KSBONJSON_RESTRICT userData,
-                                                         size_t* KSBONJSON_RESTRICT decodedOffset);
-
-/**
- * Get a description for a decoding status code.
- *
- * @param status The status code.
- *
- * @return A statically allocated string describing the status.
- */
 KSBONJSON_PUBLIC const char* ksbonjson_describeDecodeStatus(ksbonjson_decodeStatus status) __attribute__((const));
 
-
-// ============================================================================
-// End
-// ============================================================================
 
 #ifdef __cplusplus
 }

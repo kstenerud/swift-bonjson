@@ -1,5 +1,5 @@
 // ABOUTME: Public BONJSONDecoder API matching Apple's JSONDecoder interface.
-// ABOUTME: Uses cursor-based streaming to decode without intermediate representation.
+// ABOUTME: Uses C position-map API for single-pass scanning and random access decoding.
 
 import Foundation
 import CKSBonjson
@@ -92,9 +92,11 @@ public final class BONJSONDecoder {
     /// - Returns: A value of the requested type.
     /// - Throws: An error if decoding fails.
     public func decode<T: Decodable>(_ type: T.Type, from data: Data) throws -> T {
-        let cursor = _DecodingCursor(data: data)
-        let state = _DecoderState(
-            cursor: cursor,
+        // Build the position map using C API
+        let map = try _PositionMap(data: data)
+
+        let state = _MapDecoderState(
+            map: map,
             userInfo: userInfo,
             dateDecodingStrategy: dateDecodingStrategy,
             dataDecodingStrategy: dataDecodingStrategy,
@@ -102,7 +104,8 @@ public final class BONJSONDecoder {
             keyDecodingStrategy: keyDecodingStrategy
         )
 
-        let decoder = _StreamingDecoder(state: state, codingPath: [])
+        let rootIndex = map.rootIndex
+        let decoder = _MapDecoder(state: state, entryIndex: rootIndex, codingPath: [])
 
         // Handle special types that need custom decoding
         if type == Date.self {
@@ -140,6 +143,8 @@ public enum BONJSONDecodingError: Error, CustomStringConvertible {
     case typeMismatch(expected: String, actual: String)
     case keyNotFound(String)
     case dataRemaining
+    case scanFailed(String)
+    case mapFull
 
     public var description: String {
         switch self {
@@ -165,233 +170,237 @@ public enum BONJSONDecodingError: Error, CustomStringConvertible {
             return "Key not found: \(key)"
         case .dataRemaining:
             return "Data remaining after decoding"
+        case .scanFailed(let message):
+            return "Failed to scan BONJSON data: \(message)"
+        case .mapFull:
+            return "Position map buffer is full"
         }
     }
 }
 
-// MARK: - Type Codes (matching BONJSON spec)
+// MARK: - Position Map Wrapper
 
-private enum TypeCode {
-    static let smallIntMin: Int8 = -100
-    static let smallIntMax: Int8 = 100
-    static let smallIntPositiveBase: UInt8 = 0x00
-    static let smallIntNegativeBase: UInt8 = 0x9c
+/// Wraps the C position map API for Swift use.
+final class _PositionMap {
+    /// The input data as a contiguous array - keeps pointer stable.
+    private let inputBytes: [UInt8]
 
-    static let stringLong: UInt8 = 0x68
-    static let bigNumber: UInt8 = 0x69
-    static let float16: UInt8 = 0x6a
-    static let float32: UInt8 = 0x6b
-    static let float64: UInt8 = 0x6c
-    static let null: UInt8 = 0x6d
-    static let `false`: UInt8 = 0x6e
-    static let `true`: UInt8 = 0x6f
+    /// The map context.
+    private var context: KSBONJSONMapContext
 
-    static let uint8: UInt8 = 0x70
-    static let uint64: UInt8 = 0x77
-    static let sint8: UInt8 = 0x78
-    static let sint64: UInt8 = 0x7f
+    /// The entry buffer.
+    private var entries: [KSBONJSONMapEntry]
 
-    static let stringShortBase: UInt8 = 0x80
-    static let stringShortMax: UInt8 = 0x8f
+    /// Precomputed subtree sizes for O(1) child access.
+    private var subtreeSizes: [Int]
 
-    static let arrayStart: UInt8 = 0x99
-    static let objectStart: UInt8 = 0x9a
-    static let containerEnd: UInt8 = 0x9b
-}
+    /// Precomputed next sibling index for each entry (index after subtree).
+    private var nextSibling: [Int]
 
-// MARK: - Decoding Cursor
+    /// Actual entry count after scanning.
+    private var entryCount: Int
 
-/// Cursor for reading binary BONJSON data.
-final class _DecodingCursor {
-    private let data: Data
-    private(set) var position: Int = 0
+    /// Root entry index.
+    private(set) var rootIndex: size_t
 
-    init(data: Data) {
-        self.data = data
-    }
+    init(data: Data) throws {
+        // Copy to contiguous array to ensure stable pointer
+        self.inputBytes = Array(data)
 
-    var isAtEnd: Bool { position >= data.count }
-    var remainingBytes: Int { data.count - position }
+        // Estimate entry count
+        let estimatedEntries = ksbonjson_map_estimateEntries(inputBytes.count)
+        self.entries = [KSBONJSONMapEntry](repeating: KSBONJSONMapEntry(), count: Int(estimatedEntries))
+        self.subtreeSizes = []  // Will be computed after scanning
+        self.nextSibling = []   // Will be computed after scanning
+        self.entryCount = 0
+        self.context = KSBONJSONMapContext()
+        self.rootIndex = 0  // Will be set after scanning
 
-    func peekByte() throws -> UInt8 {
-        guard position < data.count else {
-            throw BONJSONDecodingError.unexpectedEndOfData
-        }
-        return data[position]
-    }
+        // Initialize and scan using stable pointers
+        try inputBytes.withUnsafeBufferPointer { inputPtr in
+            try entries.withUnsafeMutableBufferPointer { entriesPtr in
+                ksbonjson_map_begin(
+                    &context,
+                    inputPtr.baseAddress,
+                    inputPtr.count,
+                    entriesPtr.baseAddress,
+                    entriesPtr.count
+                )
 
-    func readByte() throws -> UInt8 {
-        guard position < data.count else {
-            throw BONJSONDecodingError.unexpectedEndOfData
-        }
-        let byte = data[position]
-        position += 1
-        return byte
-    }
-
-    func readBytes(count: Int) throws -> Data {
-        guard position + count <= data.count else {
-            throw BONJSONDecodingError.unexpectedEndOfData
-        }
-        let result = data[position..<position + count]
-        position += count
-        return result
-    }
-
-    func readUInt16() throws -> UInt16 {
-        let bytes = try readBytes(count: 2)
-        return bytes.withUnsafeBytes { $0.loadUnaligned(as: UInt16.self) }
-    }
-
-    func readUInt32() throws -> UInt32 {
-        let bytes = try readBytes(count: 4)
-        return bytes.withUnsafeBytes { $0.loadUnaligned(as: UInt32.self) }
-    }
-
-    func readUInt64() throws -> UInt64 {
-        let bytes = try readBytes(count: 8)
-        return bytes.withUnsafeBytes { $0.loadUnaligned(as: UInt64.self) }
-    }
-
-    /// Saves current position for potential rollback.
-    func savePosition() -> Int {
-        return position
-    }
-
-    /// Restores to a previously saved position.
-    func restorePosition(_ pos: Int) {
-        position = pos
-    }
-
-    /// Skips a value at the current position.
-    func skipValue() throws {
-        let typeCode = try readByte()
-
-        // Small positive integers
-        if typeCode <= 0x64 {
-            return
+                let status = ksbonjson_map_scan(&context)
+                guard status == KSBONJSON_DECODE_OK else {
+                    let message = ksbonjson_describeDecodeStatus(status).map { String(cString: $0) } ?? "Unknown error"
+                    throw BONJSONDecodingError.scanFailed(message)
+                }
+            }
         }
 
-        // Small negative integers
-        if typeCode >= 0x9c {
-            return
+        self.rootIndex = ksbonjson_map_root(&context)
+        self.entryCount = Int(ksbonjson_map_count(&context))
+
+        // Precompute subtree sizes and next sibling indices for O(1) child access
+        self.subtreeSizes = computeSubtreeSizes()
+        self.nextSibling = subtreeSizes.enumerated().map { $0.offset + $0.element }
+    }
+
+    /// Compute subtree sizes for all entries in reverse order.
+    /// Each container's size = 1 + sum of child sizes.
+    /// Primitives have size 1.
+    private func computeSubtreeSizes() -> [Int] {
+        var sizes = [Int](repeating: 1, count: entryCount)
+
+        // Process in reverse order so children are computed before parents
+        for i in stride(from: entryCount - 1, through: 0, by: -1) {
+            let entry = entries[i]
+            if entry.type == KSBONJSON_TYPE_ARRAY || entry.type == KSBONJSON_TYPE_OBJECT {
+                var totalSize = 1  // Include self
+                var childPos = Int(entry.data.container.firstChild)
+                for _ in 0..<entry.data.container.count {
+                    if childPos < entryCount {
+                        totalSize += sizes[childPos]
+                        childPos += sizes[childPos]
+                    }
+                }
+                sizes[i] = totalSize
+            }
+            // Primitives already have size 1
         }
 
-        // Short strings
-        if typeCode >= TypeCode.stringShortBase && typeCode <= TypeCode.stringShortMax {
-            let length = Int(typeCode - TypeCode.stringShortBase)
-            position += length
-            return
+        return sizes
+    }
+
+    /// Get entry at index.
+    func getEntry(at index: size_t) -> KSBONJSONMapEntry? {
+        guard index >= 0 && index < entryCount else {
+            return nil
+        }
+        return entries[Int(index)]
+    }
+
+    /// Get string data - reads from stored input bytes using entry offset/length.
+    func getString(at index: size_t) -> String? {
+        guard index >= 0 && index < entryCount else {
+            return nil
         }
 
-        // Unsigned integers
-        if typeCode >= TypeCode.uint8 && typeCode <= TypeCode.uint64 {
-            let byteCount = Int(typeCode - TypeCode.uint8) + 1
-            position += byteCount
-            return
+        let entry = entries[Int(index)]
+        guard entry.type == KSBONJSON_TYPE_STRING else {
+            return nil
         }
 
-        // Signed integers
-        if typeCode >= TypeCode.sint8 && typeCode <= TypeCode.sint64 {
-            let byteCount = Int(typeCode - TypeCode.sint8) + 1
-            position += byteCount
-            return
+        let offset = Int(entry.data.string.offset)
+        let length = Int(entry.data.string.length)
+
+        guard offset >= 0 && offset + length <= inputBytes.count else {
+            return nil
         }
 
-        switch typeCode {
-        case TypeCode.null, TypeCode.false, TypeCode.true:
-            return
-        case TypeCode.float16:
-            position += 2
-        case TypeCode.float32:
-            position += 4
-        case TypeCode.float64:
-            position += 8
-        case TypeCode.stringLong:
-            try skipLongString()
-        case TypeCode.bigNumber:
-            try skipBigNumber()
-        case TypeCode.arrayStart:
-            try skipContainer()
-        case TypeCode.objectStart:
-            try skipContainer()
-        default:
-            throw BONJSONDecodingError.invalidTypeCode(typeCode)
+        // Create string directly from the input bytes
+        return inputBytes.withUnsafeBufferPointer { ptr in
+            let start = ptr.baseAddress! + offset
+            let buffer = UnsafeBufferPointer(start: start, count: length)
+            return String(decoding: buffer, as: UTF8.self)
         }
     }
 
-    private func skipLongString() throws {
-        while true {
-            let lengthField = try readLengthField()
-            position += lengthField.length
-            if !lengthField.isContinuation {
+    /// Sentinel value indicating "not found".
+    static let notFound: size_t = -1
+
+    /// Get cached subtree size at index.
+    @inline(__always)
+    private func subtreeSize(at index: Int) -> Int {
+        guard index >= 0 && index < subtreeSizes.count else {
+            return 1
+        }
+        return subtreeSizes[index]
+    }
+
+    /// Get child entry index.
+    func getChild(containerIndex: size_t, childIndex: size_t) -> size_t {
+        guard containerIndex >= 0 && containerIndex < entryCount else {
+            return Self.notFound
+        }
+
+        let entry = entries[Int(containerIndex)]
+        guard entry.type == KSBONJSON_TYPE_ARRAY || entry.type == KSBONJSON_TYPE_OBJECT else {
+            return Self.notFound
+        }
+
+        if childIndex >= entry.data.container.count {
+            return Self.notFound
+        }
+
+        // Walk from firstChild, using nextSibling for O(1) per step
+        var currentIndex = Int(entry.data.container.firstChild)
+        for _ in 0..<childIndex {
+            currentIndex = nextSibling[currentIndex]
+        }
+
+        return size_t(currentIndex)
+    }
+
+    /// Find key in object.
+    func findKey(objectIndex: size_t, key: String) -> size_t {
+        guard objectIndex >= 0 && objectIndex < entryCount else {
+            return Self.notFound
+        }
+
+        let objEntry = entries[Int(objectIndex)]
+        guard objEntry.type == KSBONJSON_TYPE_OBJECT else {
+            return Self.notFound
+        }
+
+        // Object children are stored as key, value, key, value, ...
+        let pairCount = Int(objEntry.data.container.count) / 2
+        var currentIndex = Int(objEntry.data.container.firstChild)
+
+        for _ in 0..<pairCount {
+            let keyIndex = currentIndex
+            guard keyIndex < entryCount else {
                 break
             }
-        }
-    }
 
-    private func skipBigNumber() throws {
-        // Big number format:
-        // - 1 header byte: SSSSS EE N
-        //   - N (bit 0): sign (0 = positive, 1 = negative)
-        //   - EE (bits 1-2): exponent length (0-3 bytes)
-        //   - SSSSS (bits 3-7): significand length (0-31 bytes)
-        // - exponent bytes (little-endian signed)
-        // - significand bytes (little-endian unsigned)
-        let header = try readByte()
-        let exponentLength = Int((header >> 1) & 0x03)
-        let significandLength = Int(header >> 3)
-        position += exponentLength + significandLength
-    }
+            let keyEntry = entries[keyIndex]
 
-    private func skipContainer() throws {
-        while true {
-            let nextByte = try peekByte()
-            if nextByte == TypeCode.containerEnd {
-                position += 1
-                return
+            // Advance past the key using nextSibling
+            let valueIndex = nextSibling[keyIndex]
+            // Advance past the value for next iteration
+            currentIndex = nextSibling[valueIndex]
+
+            guard keyEntry.type == KSBONJSON_TYPE_STRING else {
+                continue
             }
-            try skipValue()
+
+            let keyOffset = Int(keyEntry.data.string.offset)
+            let keyLength = Int(keyEntry.data.string.length)
+
+            // Compare key strings
+            if keyLength == key.utf8.count {
+                let keyMatches = inputBytes.withUnsafeBufferPointer { ptr in
+                    key.withCString { cString in
+                        memcmp(ptr.baseAddress! + keyOffset, cString, keyLength) == 0
+                    }
+                }
+                if keyMatches {
+                    return size_t(valueIndex)
+                }
+            }
         }
+
+        return Self.notFound
     }
 
-    /// Reads a length field used for string chunking.
-    /// Returns the length and whether more chunks follow.
-    func readLengthField() throws -> (length: Int, isContinuation: Bool) {
-        let firstByte = try readByte()
-
-        // Header of 0 means 9-byte encoding: 1 zero byte + 8 bytes of payload
-        if firstByte == 0 {
-            let payload = try readUInt64()
-            let isContinuation = (payload & 1) != 0
-            let length = Int(payload >> 1)
-            return (length, isContinuation)
-        }
-
-        // Count trailing zeros to determine total byte count
-        let trailingZeros = firstByte.trailingZeroBitCount
-        let byteCount = trailingZeros + 1
-
-        // Read all bytes into a little-endian value
-        var value = UInt64(firstByte)
-        for i in 1..<byteCount {
-            let nextByte = try readByte()
-            value |= UInt64(nextByte) << (i * 8)
-        }
-
-        // Right-shift by byteCount to remove the terminator bit and zero padding
-        let payload = value >> byteCount
-        let isContinuation = (payload & 1) != 0
-        let length = Int(payload >> 1)
-        return (length, isContinuation)
+    /// Get entry count.
+    var count: size_t {
+        return size_t(entries.count)
     }
 }
 
 // MARK: - Decoder State
 
-/// Shared state for the streaming decoder.
-final class _DecoderState {
-    let cursor: _DecodingCursor
+/// Shared state for the map-based decoder.
+final class _MapDecoderState {
+    let map: _PositionMap
     let userInfo: [CodingUserInfoKey: Any]
     let dateDecodingStrategy: BONJSONDecoder.DateDecodingStrategy
     let dataDecodingStrategy: BONJSONDecoder.DataDecodingStrategy
@@ -399,14 +408,14 @@ final class _DecoderState {
     let keyDecodingStrategy: BONJSONDecoder.KeyDecodingStrategy
 
     init(
-        cursor: _DecodingCursor,
+        map: _PositionMap,
         userInfo: [CodingUserInfoKey: Any],
         dateDecodingStrategy: BONJSONDecoder.DateDecodingStrategy,
         dataDecodingStrategy: BONJSONDecoder.DataDecodingStrategy,
         nonConformingFloatDecodingStrategy: BONJSONDecoder.NonConformingFloatDecodingStrategy,
         keyDecodingStrategy: BONJSONDecoder.KeyDecodingStrategy
     ) {
-        self.cursor = cursor
+        self.map = map
         self.userInfo = userInfo
         self.dateDecodingStrategy = dateDecodingStrategy
         self.dataDecodingStrategy = dataDecodingStrategy
@@ -415,50 +424,61 @@ final class _DecoderState {
     }
 }
 
-// MARK: - Streaming Decoder
+// MARK: - Map-Based Decoder
 
-/// Internal decoder that implements the Decoder protocol using cursor-based streaming.
-final class _StreamingDecoder: Decoder {
-    let state: _DecoderState
+/// Internal decoder that implements the Decoder protocol using the position map.
+final class _MapDecoder: Decoder {
+    let state: _MapDecoderState
+    let entryIndex: size_t
     let codingPath: [CodingKey]
 
     var userInfo: [CodingUserInfoKey: Any] { state.userInfo }
 
-    init(state: _DecoderState, codingPath: [CodingKey]) {
+    init(state: _MapDecoderState, entryIndex: size_t, codingPath: [CodingKey]) {
         self.state = state
+        self.entryIndex = entryIndex
         self.codingPath = codingPath
     }
 
     func container<Key: CodingKey>(keyedBy type: Key.Type) throws -> KeyedDecodingContainer<Key> {
-        // Expect object start
-        let typeCode = try state.cursor.readByte()
-        guard typeCode == TypeCode.objectStart else {
-            throw BONJSONDecodingError.typeMismatch(expected: "object", actual: describeTypeCode(typeCode))
+        guard let entry = state.map.getEntry(at: entryIndex) else {
+            throw BONJSONDecodingError.unexpectedEndOfData
         }
 
-        let container = try _StreamingKeyedDecodingContainer<Key>(
+        guard entry.type == KSBONJSON_TYPE_OBJECT else {
+            throw BONJSONDecodingError.typeMismatch(expected: "object", actual: describeType(entry.type))
+        }
+
+        let container = _MapKeyedDecodingContainer<Key>(
             state: state,
+            objectIndex: entryIndex,
+            entry: entry,
             codingPath: codingPath
         )
         return KeyedDecodingContainer(container)
     }
 
     func unkeyedContainer() throws -> UnkeyedDecodingContainer {
-        // Expect array start
-        let typeCode = try state.cursor.readByte()
-        guard typeCode == TypeCode.arrayStart else {
-            throw BONJSONDecodingError.typeMismatch(expected: "array", actual: describeTypeCode(typeCode))
+        guard let entry = state.map.getEntry(at: entryIndex) else {
+            throw BONJSONDecodingError.unexpectedEndOfData
         }
 
-        return _StreamingUnkeyedDecodingContainer(
+        guard entry.type == KSBONJSON_TYPE_ARRAY else {
+            throw BONJSONDecodingError.typeMismatch(expected: "array", actual: describeType(entry.type))
+        }
+
+        return _MapUnkeyedDecodingContainer(
             state: state,
+            arrayIndex: entryIndex,
+            entry: entry,
             codingPath: codingPath
         )
     }
 
     func singleValueContainer() throws -> SingleValueDecodingContainer {
-        return _StreamingSingleValueDecodingContainer(
+        return _MapSingleValueDecodingContainer(
             state: state,
+            entryIndex: entryIndex,
             codingPath: codingPath
         )
     }
@@ -466,175 +486,102 @@ final class _StreamingDecoder: Decoder {
     // MARK: - Value Reading
 
     func decodeString() throws -> String {
-        let typeCode = try state.cursor.readByte()
-
-        // Short string
-        if typeCode >= TypeCode.stringShortBase && typeCode <= TypeCode.stringShortMax {
-            let length = Int(typeCode - TypeCode.stringShortBase)
-            if length == 0 {
-                return ""
-            }
-            let bytes = try state.cursor.readBytes(count: length)
-            guard let string = String(data: bytes, encoding: .utf8) else {
-                throw BONJSONDecodingError.invalidUTF8String
-            }
-            return string
+        guard let entry = state.map.getEntry(at: entryIndex) else {
+            throw BONJSONDecodingError.unexpectedEndOfData
         }
 
-        // Long string
-        if typeCode == TypeCode.stringLong {
-            var result = Data()
-            while true {
-                let (length, isContinuation) = try state.cursor.readLengthField()
-                if length > 0 {
-                    let chunk = try state.cursor.readBytes(count: length)
-                    result.append(chunk)
-                }
-                if !isContinuation {
-                    break
-                }
-            }
-            guard let string = String(data: result, encoding: .utf8) else {
-                throw BONJSONDecodingError.invalidUTF8String
-            }
-            return string
+        guard entry.type == KSBONJSON_TYPE_STRING else {
+            throw BONJSONDecodingError.typeMismatch(expected: "string", actual: describeType(entry.type))
         }
 
-        throw BONJSONDecodingError.typeMismatch(expected: "string", actual: describeTypeCode(typeCode))
+        guard let string = state.map.getString(at: entryIndex) else {
+            throw BONJSONDecodingError.invalidUTF8String
+        }
+
+        return string
     }
 
     func decodeInt64() throws -> Int64 {
-        let typeCode = try state.cursor.readByte()
-
-        // Small positive integers
-        if typeCode <= 0x64 {
-            return Int64(typeCode)
+        guard let entry = state.map.getEntry(at: entryIndex) else {
+            throw BONJSONDecodingError.unexpectedEndOfData
         }
 
-        // Small negative integers
-        if typeCode >= 0x9c {
-            return Int64(Int8(bitPattern: typeCode))
-        }
-
-        // Signed integers
-        if typeCode >= TypeCode.sint8 && typeCode <= TypeCode.sint64 {
-            let byteCount = Int(typeCode - TypeCode.sint8) + 1
-            return try readSignedInt(byteCount: byteCount)
-        }
-
-        // Unsigned integers (if they fit)
-        if typeCode >= TypeCode.uint8 && typeCode <= TypeCode.uint64 {
-            let byteCount = Int(typeCode - TypeCode.uint8) + 1
-            let value = try readUnsignedInt(byteCount: byteCount)
+        switch entry.type {
+        case KSBONJSON_TYPE_INT:
+            return entry.data.intValue
+        case KSBONJSON_TYPE_UINT:
+            let value = entry.data.uintValue
             guard value <= UInt64(Int64.max) else {
                 throw BONJSONDecodingError.typeMismatch(expected: "Int64", actual: "UInt64 too large")
             }
             return Int64(value)
+        default:
+            throw BONJSONDecodingError.typeMismatch(expected: "integer", actual: describeType(entry.type))
         }
-
-        throw BONJSONDecodingError.typeMismatch(expected: "integer", actual: describeTypeCode(typeCode))
     }
 
     func decodeUInt64() throws -> UInt64 {
-        let typeCode = try state.cursor.readByte()
-
-        // Small positive integers
-        if typeCode <= 0x64 {
-            return UInt64(typeCode)
+        guard let entry = state.map.getEntry(at: entryIndex) else {
+            throw BONJSONDecodingError.unexpectedEndOfData
         }
 
-        // Unsigned integers
-        if typeCode >= TypeCode.uint8 && typeCode <= TypeCode.uint64 {
-            let byteCount = Int(typeCode - TypeCode.uint8) + 1
-            return try readUnsignedInt(byteCount: byteCount)
-        }
-
-        // Signed integers (if non-negative)
-        if typeCode >= TypeCode.sint8 && typeCode <= TypeCode.sint64 {
-            let byteCount = Int(typeCode - TypeCode.sint8) + 1
-            let value = try readSignedInt(byteCount: byteCount)
+        switch entry.type {
+        case KSBONJSON_TYPE_UINT:
+            return entry.data.uintValue
+        case KSBONJSON_TYPE_INT:
+            let value = entry.data.intValue
             guard value >= 0 else {
                 throw BONJSONDecodingError.typeMismatch(expected: "UInt64", actual: "negative integer")
             }
             return UInt64(value)
+        default:
+            throw BONJSONDecodingError.typeMismatch(expected: "unsigned integer", actual: describeType(entry.type))
         }
-
-        throw BONJSONDecodingError.typeMismatch(expected: "unsigned integer", actual: describeTypeCode(typeCode))
     }
 
     func decodeDouble() throws -> Double {
-        let typeCode = try state.cursor.readByte()
-
-        // Small positive integers
-        if typeCode <= 0x64 {
-            return Double(typeCode)
+        guard let entry = state.map.getEntry(at: entryIndex) else {
+            throw BONJSONDecodingError.unexpectedEndOfData
         }
 
-        // Small negative integers
-        if typeCode >= 0x9c {
-            return Double(Int8(bitPattern: typeCode))
-        }
-
-        switch typeCode {
-        case TypeCode.float16:
-            let bits = try state.cursor.readUInt16()
-            return bfloat16ToDouble(bits)
-
-        case TypeCode.float32:
-            let bits = try state.cursor.readUInt32()
-            return Double(Float(bitPattern: bits))
-
-        case TypeCode.float64:
-            let bits = try state.cursor.readUInt64()
-            return Double(bitPattern: bits)
-
+        switch entry.type {
+        case KSBONJSON_TYPE_FLOAT:
+            return entry.data.floatValue
+        case KSBONJSON_TYPE_INT:
+            return Double(entry.data.intValue)
+        case KSBONJSON_TYPE_UINT:
+            return Double(entry.data.uintValue)
+        case KSBONJSON_TYPE_BIGNUMBER:
+            // Convert big number to double
+            let bn = entry.data.bigNumber
+            let significand = Double(bn.significand)
+            let result = significand * pow(10.0, Double(bn.exponent))
+            return bn.sign < 0 ? -result : result
         default:
-            break
+            throw BONJSONDecodingError.typeMismatch(expected: "float", actual: describeType(entry.type))
         }
-
-        // Signed integers
-        if typeCode >= TypeCode.sint8 && typeCode <= TypeCode.sint64 {
-            let byteCount = Int(typeCode - TypeCode.sint8) + 1
-            return Double(try readSignedInt(byteCount: byteCount))
-        }
-
-        // Unsigned integers
-        if typeCode >= TypeCode.uint8 && typeCode <= TypeCode.uint64 {
-            let byteCount = Int(typeCode - TypeCode.uint8) + 1
-            return Double(try readUnsignedInt(byteCount: byteCount))
-        }
-
-        // Check for string representation of special floats
-        if typeCode >= TypeCode.stringShortBase && typeCode <= TypeCode.stringShortMax ||
-           typeCode == TypeCode.stringLong {
-            // Put back the type code and read string
-            state.cursor.restorePosition(state.cursor.savePosition() - 1)
-            // Actually we already consumed it, need to handle differently
-        }
-
-        throw BONJSONDecodingError.typeMismatch(expected: "float", actual: describeTypeCode(typeCode))
     }
 
     func decodeBool() throws -> Bool {
-        let typeCode = try state.cursor.readByte()
-        switch typeCode {
-        case TypeCode.false:
-            return false
-        case TypeCode.true:
+        guard let entry = state.map.getEntry(at: entryIndex) else {
+            throw BONJSONDecodingError.unexpectedEndOfData
+        }
+
+        switch entry.type {
+        case KSBONJSON_TYPE_TRUE:
             return true
+        case KSBONJSON_TYPE_FALSE:
+            return false
         default:
-            throw BONJSONDecodingError.typeMismatch(expected: "boolean", actual: describeTypeCode(typeCode))
+            throw BONJSONDecodingError.typeMismatch(expected: "boolean", actual: describeType(entry.type))
         }
     }
 
-    func decodeNil() throws -> Bool {
-        let saved = state.cursor.savePosition()
-        let typeCode = try state.cursor.readByte()
-        if typeCode == TypeCode.null {
-            return true
+    func decodeNil() -> Bool {
+        guard let entry = state.map.getEntry(at: entryIndex) else {
+            return false
         }
-        state.cursor.restorePosition(saved)
-        return false
+        return entry.type == KSBONJSON_TYPE_NULL
     }
 
     func decodeDate() throws -> Date {
@@ -688,163 +635,50 @@ final class _StreamingDecoder: Decoder {
         }
     }
 
-    // MARK: - Helper Methods
-
-    private func readSignedInt(byteCount: Int) throws -> Int64 {
-        var result: UInt64 = 0
-        for i in 0..<byteCount {
-            let byte = try state.cursor.readByte()
-            result |= UInt64(byte) << (i * 8)
-        }
-
-        // Sign extend if negative
-        if byteCount < 8 {
-            let signBit = result & (UInt64(1) << (byteCount * 8 - 1))
-            if signBit != 0 {
-                let mask = ~((UInt64(1) << (byteCount * 8)) - 1)
-                result |= mask
-            }
-        }
-
-        return Int64(bitPattern: result)
-    }
-
-    private func readUnsignedInt(byteCount: Int) throws -> UInt64 {
-        var result: UInt64 = 0
-        for i in 0..<byteCount {
-            let byte = try state.cursor.readByte()
-            result |= UInt64(byte) << (i * 8)
-        }
-        return result
-    }
-
-    private func bfloat16ToDouble(_ bits: UInt16) -> Double {
-        let sign = (bits >> 15) & 0x1
-        let exponent = (bits >> 7) & 0xFF
-        let mantissa = bits & 0x7F
-
-        // Convert to float32 representation
-        let float32Bits = UInt32(sign) << 31 | UInt32(exponent) << 23 | UInt32(mantissa) << 16
-        return Double(Float(bitPattern: float32Bits))
-    }
-
-    private func describeTypeCode(_ code: UInt8) -> String {
-        if code <= 0x64 {
-            return "small int \(code)"
-        }
-        if code >= 0x9c {
-            return "small int \(Int8(bitPattern: code))"
-        }
-        if code >= TypeCode.stringShortBase && code <= TypeCode.stringShortMax {
-            return "short string"
-        }
-        switch code {
-        case TypeCode.null: return "null"
-        case TypeCode.false: return "false"
-        case TypeCode.true: return "true"
-        case TypeCode.float16: return "float16"
-        case TypeCode.float32: return "float32"
-        case TypeCode.float64: return "float64"
-        case TypeCode.stringLong: return "long string"
-        case TypeCode.arrayStart: return "array"
-        case TypeCode.objectStart: return "object"
-        case TypeCode.containerEnd: return "end container"
-        default:
-            if code >= TypeCode.uint8 && code <= TypeCode.uint64 {
-                return "uint\((code - TypeCode.uint8 + 1) * 8)"
-            }
-            if code >= TypeCode.sint8 && code <= TypeCode.sint64 {
-                return "sint\((code - TypeCode.sint8 + 1) * 8)"
-            }
-            return "unknown (0x\(String(code, radix: 16)))"
+    private func describeType(_ type: KSBONJSONValueType) -> String {
+        switch type {
+        case KSBONJSON_TYPE_NULL: return "null"
+        case KSBONJSON_TYPE_TRUE: return "true"
+        case KSBONJSON_TYPE_FALSE: return "false"
+        case KSBONJSON_TYPE_INT: return "integer"
+        case KSBONJSON_TYPE_UINT: return "unsigned integer"
+        case KSBONJSON_TYPE_FLOAT: return "float"
+        case KSBONJSON_TYPE_BIGNUMBER: return "big number"
+        case KSBONJSON_TYPE_STRING: return "string"
+        case KSBONJSON_TYPE_ARRAY: return "array"
+        case KSBONJSON_TYPE_OBJECT: return "object"
+        default: return "unknown"
         }
     }
 }
 
 // MARK: - Keyed Decoding Container
 
-struct _StreamingKeyedDecodingContainer<Key: CodingKey>: KeyedDecodingContainerProtocol {
-    let state: _DecoderState
+struct _MapKeyedDecodingContainer<Key: CodingKey>: KeyedDecodingContainerProtocol {
+    let state: _MapDecoderState
+    let objectIndex: size_t
+    let entry: KSBONJSONMapEntry
     let codingPath: [CodingKey]
 
-    /// Cache of keys to their positions in the data.
-    private var keyPositions: [String: Int] = [:]
-
-    /// All keys found in this container.
+    /// All keys in this object.
     private(set) var allKeys: [Key] = []
 
-    /// Position after the container ends.
-    private var endPosition: Int = 0
-
-    init(state: _DecoderState, codingPath: [CodingKey]) throws {
+    init(state: _MapDecoderState, objectIndex: size_t, entry: KSBONJSONMapEntry, codingPath: [CodingKey]) {
         self.state = state
+        self.objectIndex = objectIndex
+        self.entry = entry
         self.codingPath = codingPath
 
-        // Scan the object to find all keys and their value positions
-        try scanObject()
-    }
-
-    private mutating func scanObject() throws {
-        while true {
-            let nextByte = try state.cursor.peekByte()
-            if nextByte == TypeCode.containerEnd {
-                _ = try state.cursor.readByte()
-                endPosition = state.cursor.position
-                return
-            }
-
-            // Read key (must be a string)
-            let typeCode = try state.cursor.readByte()
-
-            var keyString: String
-
-            // Short string key
-            if typeCode >= TypeCode.stringShortBase && typeCode <= TypeCode.stringShortMax {
-                let length = Int(typeCode - TypeCode.stringShortBase)
-                if length == 0 {
-                    keyString = ""
-                } else {
-                    let bytes = try state.cursor.readBytes(count: length)
-                    guard let string = String(data: bytes, encoding: .utf8) else {
-                        throw BONJSONDecodingError.invalidUTF8String
-                    }
-                    keyString = string
+        // Build allKeys
+        let pairCount = Int(entry.data.container.count) / 2
+        for i in 0..<pairCount {
+            let keyIndex = state.map.getChild(containerIndex: objectIndex, childIndex: size_t(i * 2))
+            if let keyString = state.map.getString(at: keyIndex) {
+                let convertedKey = convertKey(keyString)
+                if let key = Key(stringValue: convertedKey) {
+                    allKeys.append(key)
                 }
-            } else if typeCode == TypeCode.stringLong {
-                // Long string key
-                var result = Data()
-                while true {
-                    let (length, isContinuation) = try state.cursor.readLengthField()
-                    if length > 0 {
-                        let chunk = try state.cursor.readBytes(count: length)
-                        result.append(chunk)
-                    }
-                    if !isContinuation {
-                        break
-                    }
-                }
-                guard let string = String(data: result, encoding: .utf8) else {
-                    throw BONJSONDecodingError.invalidUTF8String
-                }
-                keyString = string
-            } else {
-                throw BONJSONDecodingError.expectedObjectKey
             }
-
-            // Apply key decoding strategy
-            keyString = convertKey(keyString)
-
-            // Store the position of the value
-            let valuePosition = state.cursor.position
-            keyPositions[keyString] = valuePosition
-
-            // Add to allKeys if it can be converted
-            if let key = Key(stringValue: keyString) {
-                allKeys.append(key)
-            }
-
-            // Skip the value
-            try state.cursor.skipValue()
         }
     }
 
@@ -859,125 +693,138 @@ struct _StreamingKeyedDecodingContainer<Key: CodingKey>: KeyedDecodingContainerP
         }
     }
 
-    func contains(_ key: Key) -> Bool {
-        return keyPositions[key.stringValue] != nil
+    /// Find the original key string that matches the given key after conversion.
+    private func findOriginalKey(_ key: Key) -> String {
+        let pairCount = Int(entry.data.container.count) / 2
+        for i in 0..<pairCount {
+            let keyIndex = state.map.getChild(containerIndex: objectIndex, childIndex: size_t(i * 2))
+            if let keyString = state.map.getString(at: keyIndex) {
+                let convertedKey = convertKey(keyString)
+                if convertedKey == key.stringValue {
+                    return keyString
+                }
+            }
+        }
+        return key.stringValue
     }
 
-    private func valueDecoder(forKey key: Key) throws -> _StreamingDecoder {
-        guard let position = keyPositions[key.stringValue] else {
+    func contains(_ key: Key) -> Bool {
+        let originalKey = findOriginalKey(key)
+        let valueIndex = state.map.findKey(objectIndex: objectIndex, key: originalKey)
+        return valueIndex != _PositionMap.notFound
+    }
+
+    private func valueIndex(forKey key: Key) throws -> size_t {
+        let originalKey = findOriginalKey(key)
+        let valueIdx = state.map.findKey(objectIndex: objectIndex, key: originalKey)
+        guard valueIdx != _PositionMap.notFound else {
             throw DecodingError.keyNotFound(key, DecodingError.Context(
                 codingPath: codingPath,
                 debugDescription: "Key '\(key.stringValue)' not found"
             ))
         }
-        state.cursor.restorePosition(position)
-        return _StreamingDecoder(state: state, codingPath: codingPath + [key])
+        return valueIdx
+    }
+
+    private func decoder(forKey key: Key) throws -> _MapDecoder {
+        let idx = try valueIndex(forKey: key)
+        return _MapDecoder(state: state, entryIndex: idx, codingPath: codingPath + [key])
     }
 
     func decodeNil(forKey key: Key) throws -> Bool {
-        guard let position = keyPositions[key.stringValue] else {
-            throw DecodingError.keyNotFound(key, DecodingError.Context(
-                codingPath: codingPath,
-                debugDescription: "Key '\(key.stringValue)' not found"
-            ))
+        let idx = try valueIndex(forKey: key)
+        guard let entry = state.map.getEntry(at: idx) else {
+            return false
         }
-        state.cursor.restorePosition(position)
-        let typeCode = try state.cursor.peekByte()
-        if typeCode == TypeCode.null {
-            _ = try state.cursor.readByte()
-            return true
-        }
-        return false
+        return entry.type == KSBONJSON_TYPE_NULL
     }
 
     func decode(_ type: Bool.Type, forKey key: Key) throws -> Bool {
-        return try valueDecoder(forKey: key).decodeBool()
+        return try decoder(forKey: key).decodeBool()
     }
 
     func decode(_ type: String.Type, forKey key: Key) throws -> String {
-        return try valueDecoder(forKey: key).decodeString()
+        return try decoder(forKey: key).decodeString()
     }
 
     func decode(_ type: Double.Type, forKey key: Key) throws -> Double {
-        return try valueDecoder(forKey: key).decodeDouble()
+        return try decoder(forKey: key).decodeDouble()
     }
 
     func decode(_ type: Float.Type, forKey key: Key) throws -> Float {
-        return Float(try valueDecoder(forKey: key).decodeDouble())
+        return Float(try decoder(forKey: key).decodeDouble())
     }
 
     func decode(_ type: Int.Type, forKey key: Key) throws -> Int {
-        return Int(try valueDecoder(forKey: key).decodeInt64())
+        return Int(try decoder(forKey: key).decodeInt64())
     }
 
     func decode(_ type: Int8.Type, forKey key: Key) throws -> Int8 {
-        return Int8(try valueDecoder(forKey: key).decodeInt64())
+        return Int8(try decoder(forKey: key).decodeInt64())
     }
 
     func decode(_ type: Int16.Type, forKey key: Key) throws -> Int16 {
-        return Int16(try valueDecoder(forKey: key).decodeInt64())
+        return Int16(try decoder(forKey: key).decodeInt64())
     }
 
     func decode(_ type: Int32.Type, forKey key: Key) throws -> Int32 {
-        return Int32(try valueDecoder(forKey: key).decodeInt64())
+        return Int32(try decoder(forKey: key).decodeInt64())
     }
 
     func decode(_ type: Int64.Type, forKey key: Key) throws -> Int64 {
-        return try valueDecoder(forKey: key).decodeInt64()
+        return try decoder(forKey: key).decodeInt64()
     }
 
     func decode(_ type: UInt.Type, forKey key: Key) throws -> UInt {
-        return UInt(try valueDecoder(forKey: key).decodeUInt64())
+        return UInt(try decoder(forKey: key).decodeUInt64())
     }
 
     func decode(_ type: UInt8.Type, forKey key: Key) throws -> UInt8 {
-        return UInt8(try valueDecoder(forKey: key).decodeUInt64())
+        return UInt8(try decoder(forKey: key).decodeUInt64())
     }
 
     func decode(_ type: UInt16.Type, forKey key: Key) throws -> UInt16 {
-        return UInt16(try valueDecoder(forKey: key).decodeUInt64())
+        return UInt16(try decoder(forKey: key).decodeUInt64())
     }
 
     func decode(_ type: UInt32.Type, forKey key: Key) throws -> UInt32 {
-        return UInt32(try valueDecoder(forKey: key).decodeUInt64())
+        return UInt32(try decoder(forKey: key).decodeUInt64())
     }
 
     func decode(_ type: UInt64.Type, forKey key: Key) throws -> UInt64 {
-        return try valueDecoder(forKey: key).decodeUInt64()
+        return try decoder(forKey: key).decodeUInt64()
     }
 
     func decode<T: Decodable>(_ type: T.Type, forKey key: Key) throws -> T {
-        let decoder = try valueDecoder(forKey: key)
+        let dec = try decoder(forKey: key)
 
         // Handle special types
         if type == Date.self {
-            return try decoder.decodeDate() as! T
+            return try dec.decodeDate() as! T
         }
         if type == Data.self {
-            return try decoder.decodeData() as! T
+            return try dec.decodeData() as! T
         }
         if type == URL.self {
-            let string = try decoder.decodeString()
+            let string = try dec.decodeString()
             guard let url = URL(string: string) else {
                 throw BONJSONDecodingError.invalidURL(string)
             }
             return url as! T
         }
 
-        return try T(from: decoder)
+        return try T(from: dec)
     }
 
     func nestedContainer<NestedKey: CodingKey>(
         keyedBy type: NestedKey.Type,
         forKey key: Key
     ) throws -> KeyedDecodingContainer<NestedKey> {
-        let decoder = try valueDecoder(forKey: key)
-        return try decoder.container(keyedBy: type)
+        return try decoder(forKey: key).container(keyedBy: type)
     }
 
     func nestedUnkeyedContainer(forKey key: Key) throws -> UnkeyedDecodingContainer {
-        let decoder = try valueDecoder(forKey: key)
-        return try decoder.unkeyedContainer()
+        return try decoder(forKey: key).unkeyedContainer()
     }
 
     func superDecoder() throws -> Decoder {
@@ -985,74 +832,45 @@ struct _StreamingKeyedDecodingContainer<Key: CodingKey>: KeyedDecodingContainerP
     }
 
     func superDecoder(forKey key: Key) throws -> Decoder {
-        return try valueDecoder(forKey: key)
+        return try decoder(forKey: key)
     }
 }
 
 // MARK: - Unkeyed Decoding Container
 
-struct _StreamingUnkeyedDecodingContainer: UnkeyedDecodingContainer {
-    let state: _DecoderState
+struct _MapUnkeyedDecodingContainer: UnkeyedDecodingContainer {
+    let state: _MapDecoderState
+    let arrayIndex: size_t
+    let entry: KSBONJSONMapEntry
     let codingPath: [CodingKey]
 
-    private(set) var count: Int?
     private(set) var currentIndex: Int = 0
 
-    /// Positions of each element in the array.
-    private var elementPositions: [Int] = []
-
-    /// Position after the container ends.
-    private var endPosition: Int = 0
+    var count: Int? { Int(entry.data.container.count) }
 
     var isAtEnd: Bool {
-        if let count = count {
-            return currentIndex >= count
-        }
-        return currentIndex >= elementPositions.count
+        return currentIndex >= Int(entry.data.container.count)
     }
 
-    init(state: _DecoderState, codingPath: [CodingKey]) {
+    init(state: _MapDecoderState, arrayIndex: size_t, entry: KSBONJSONMapEntry, codingPath: [CodingKey]) {
         self.state = state
+        self.arrayIndex = arrayIndex
+        self.entry = entry
         self.codingPath = codingPath
-
-        // Scan array to find element positions
-        do {
-            try scanArray()
-        } catch {
-            // If scanning fails, we'll get errors during decoding
-        }
     }
 
-    private mutating func scanArray() throws {
-        while true {
-            let nextByte = try state.cursor.peekByte()
-            if nextByte == TypeCode.containerEnd {
-                _ = try state.cursor.readByte()
-                endPosition = state.cursor.position
-                count = elementPositions.count
-                // Reset to first element
-                if !elementPositions.isEmpty {
-                    state.cursor.restorePosition(elementPositions[0])
-                }
-                return
-            }
-
-            elementPositions.append(state.cursor.position)
-            try state.cursor.skipValue()
-        }
-    }
-
-    private mutating func nextDecoder() throws -> _StreamingDecoder {
-        guard currentIndex < elementPositions.count else {
+    private mutating func nextDecoder() throws -> _MapDecoder {
+        guard !isAtEnd else {
             throw DecodingError.valueNotFound(Any.self, DecodingError.Context(
                 codingPath: codingPath,
                 debugDescription: "Unkeyed container is at end"
             ))
         }
 
-        state.cursor.restorePosition(elementPositions[currentIndex])
-        let decoder = _StreamingDecoder(
+        let childIndex = state.map.getChild(containerIndex: arrayIndex, childIndex: size_t(currentIndex))
+        let decoder = _MapDecoder(
             state: state,
+            entryIndex: childIndex,
             codingPath: codingPath + [_BONJSONIndexKey(index: currentIndex)]
         )
         currentIndex += 1
@@ -1060,13 +878,12 @@ struct _StreamingUnkeyedDecodingContainer: UnkeyedDecodingContainer {
     }
 
     mutating func decodeNil() throws -> Bool {
-        guard currentIndex < elementPositions.count else {
+        guard !isAtEnd else { return false }
+        let childIndex = state.map.getChild(containerIndex: arrayIndex, childIndex: size_t(currentIndex))
+        guard let entry = state.map.getEntry(at: childIndex) else {
             return false
         }
-        state.cursor.restorePosition(elementPositions[currentIndex])
-        let typeCode = try state.cursor.peekByte()
-        if typeCode == TypeCode.null {
-            _ = try state.cursor.readByte()
+        if entry.type == KSBONJSON_TYPE_NULL {
             currentIndex += 1
             return true
         }
@@ -1152,13 +969,11 @@ struct _StreamingUnkeyedDecodingContainer: UnkeyedDecodingContainer {
     mutating func nestedContainer<NestedKey: CodingKey>(
         keyedBy type: NestedKey.Type
     ) throws -> KeyedDecodingContainer<NestedKey> {
-        let decoder = try nextDecoder()
-        return try decoder.container(keyedBy: type)
+        return try nextDecoder().container(keyedBy: type)
     }
 
     mutating func nestedUnkeyedContainer() throws -> UnkeyedDecodingContainer {
-        let decoder = try nextDecoder()
-        return try decoder.unkeyedContainer()
+        return try nextDecoder().unkeyedContainer()
     }
 
     mutating func superDecoder() throws -> Decoder {
@@ -1168,25 +983,23 @@ struct _StreamingUnkeyedDecodingContainer: UnkeyedDecodingContainer {
 
 // MARK: - Single Value Decoding Container
 
-struct _StreamingSingleValueDecodingContainer: SingleValueDecodingContainer {
-    let state: _DecoderState
+struct _MapSingleValueDecodingContainer: SingleValueDecodingContainer {
+    let state: _MapDecoderState
+    let entryIndex: size_t
     let codingPath: [CodingKey]
 
-    init(state: _DecoderState, codingPath: [CodingKey]) {
+    init(state: _MapDecoderState, entryIndex: size_t, codingPath: [CodingKey]) {
         self.state = state
+        self.entryIndex = entryIndex
         self.codingPath = codingPath
     }
 
-    private func makeDecoder() -> _StreamingDecoder {
-        return _StreamingDecoder(state: state, codingPath: codingPath)
+    private func makeDecoder() -> _MapDecoder {
+        return _MapDecoder(state: state, entryIndex: entryIndex, codingPath: codingPath)
     }
 
     func decodeNil() -> Bool {
-        do {
-            return try makeDecoder().decodeNil()
-        } catch {
-            return false
-        }
+        return makeDecoder().decodeNil()
     }
 
     func decode(_ type: Bool.Type) throws -> Bool {
@@ -1275,6 +1088,8 @@ struct _StringKey: CodingKey {
     init(stringValue: String) { self.stringValue = stringValue }
     init?(intValue: Int) { nil }
 }
+
+// _BONJSONIndexKey is defined in BONJSONEncoder.swift
 
 // MARK: - String Extensions
 

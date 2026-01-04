@@ -8,48 +8,60 @@ BONJSON is a binary format offering 1:1 JSON compatibility with faster processin
 
 ## Architecture
 
-This library uses a streaming architecture that avoids intermediate representations:
-- **Encoding**: Calls the C ksbonjson library directly during encoding, streaming bytes to output
-- **Decoding**: Uses cursor-based parsing, reading binary data directly without building a tree
+This library uses two different approaches optimized for their respective tasks:
+
+- **Encoding**: Uses C buffer-based API for direct memory writes, with Swift managing buffer growth
+- **Decoding**: Uses C position-map API for single-pass scanning, building a map of all values for random access
 
 ### Source Files
 
-- **Sources/CKSBonjson/**: C library providing low-level BONJSON encoding functions
-  - `KSBONJSONEncoder.c/h`: C encoder API
-  - `KSBONJSONDecoder.c/h`: C decoder API (used for reference, not directly called)
+- **Sources/CKSBonjson/**: C library providing low-level BONJSON encoding/decoding
+  - `KSBONJSONEncoder.c/h`: Dual API - buffer-based (new) and callback-based (legacy)
+  - `KSBONJSONDecoder.c/h`: Dual API - position-map (new) and callback-based (legacy)
   - `KSBONJSONCommon.h`: Type codes and shared constants
   - `include/CKSBonjson.h`: Umbrella header for Swift import
 
 - **Sources/BONJSON/BONJSONEncoder.swift**: Public encoder API matching `JSONEncoder` interface
-  - Implements Swift's `Encoder` protocol with keyed, unkeyed, and single-value containers
-  - Uses `_EncoderState` class to hold C context and output buffer
-  - Tracks container depth for automatic container closing
-  - Streams directly to C library functions (`ksbonjson_addString`, `ksbonjson_beginObject`, etc.)
+  - Uses `_BufferEncoderState` with `KSBONJSONBufferEncodeContext` for direct buffer writes
+  - Swift manages buffer growth, C writes directly to buffer
+  - Container finalization happens when new sibling starts (due to Encoder protocol design)
 
 - **Sources/BONJSON/BONJSONDecoder.swift**: Public decoder API matching `JSONDecoder` interface
-  - Uses `_DecodingCursor` for position-based binary parsing
-  - Keyed containers scan object once, cache key positions for random access
-  - Unkeyed containers scan array once, cache element positions
-  - No intermediate `BONJSONValue` representation - decodes directly from bytes
+  - Uses `_PositionMap` wrapping `KSBONJSONMapContext` for single-pass scanning
+  - Builds map of all values with pre-decoded primitives (int/float stored directly)
+  - Uses precomputed subtree sizes and next-sibling indices for O(1) per-step child access
+  - Strings stored as offset/length pairs, created on demand
 
 ### Encoding Flow
 
 1. User calls `encoder.encode(value)`
-2. `_EncoderState` initializes C encoding context with a callback that appends to buffer
+2. `_BufferEncoderState` creates a Swift buffer and C context pointing to it
 3. Value's `Encodable.encode(to:)` calls container methods
-4. Container methods call C library functions directly (e.g., `ksbonjson_addString`)
-5. Container depth tracking ensures proper closing of nested containers
-6. `ksbonjson_endEncode` finalizes the output
+4. Container methods call C buffer functions (`ksbonjson_encodeToBuffer_*`)
+5. Swift checks capacity before each write, grows buffer if needed via `ksbonjson_encodeToBuffer_setBuffer`
+6. Container finalization is deferred until next sibling or parent completion
 
 ### Decoding Flow
 
 1. User calls `decoder.decode(Type.self, from: data)`
-2. `_DecodingCursor` wraps the data for position-based reading
-3. Type's `Decodable.init(from:)` requests containers
-4. Containers scan their contents once, caching positions:
-   - Keyed containers build `[String: Int]` mapping keys to value positions
-   - Unkeyed containers build `[Int]` array of element positions
-5. Subsequent access uses cached positions for direct reads
+2. `_PositionMap` copies data to stable storage, allocates entry buffer
+3. Single C scan (`ksbonjson_map_scan`) builds map of all entries
+4. Swift computes subtree sizes and next-sibling indices for fast child access
+5. Decoder containers use the map for random access:
+   - Primitives: read pre-decoded value directly from entry
+   - Strings: create String from offset/length in original data
+   - Containers: navigate via precomputed indices
+
+### Position Map Entry Types
+
+The C `KSBONJSONMapEntry` stores decoded values inline:
+- `KSBONJSON_TYPE_NULL`, `_FALSE`, `_TRUE`: No data needed
+- `KSBONJSON_TYPE_INT`: `int64_t` value stored directly
+- `KSBONJSON_TYPE_UINT`: `uint64_t` value stored directly
+- `KSBONJSON_TYPE_FLOAT`: `double` value stored directly
+- `KSBONJSON_TYPE_BIGNUMBER`: significand/exponent/sign stored
+- `KSBONJSON_TYPE_STRING`: offset and length into original input
+- `KSBONJSON_TYPE_ARRAY`, `_OBJECT`: firstChild index and count
 
 ## Type Codes
 
@@ -171,18 +183,39 @@ swift build -c release  # Build optimized release version
 
 Run benchmarks with:
 ```bash
-swift run bonjson-benchmark
+swift test --filter Benchmark
 ```
 
-Current performance vs Apple's JSON:
-- BONJSON produces 24-82% smaller output depending on data type
-- Booleans: 5.4x smaller
-- Small integers: 2.9x smaller
-- Large integers: 2x smaller
-- Strings: 1.3x smaller
-- Objects: 1.3x smaller
+### Size Comparison (BONJSON vs JSON)
+- Booleans: 5.4x smaller (82% savings)
+- Small integers (0-99): 2.9x smaller (65% savings)
+- Large integers: 2x smaller (50% savings)
+- Doubles: 1.3x smaller (24% savings)
+- Strings: 1.3x smaller (25% savings)
+- Objects: 1.3x smaller (24% savings)
 
-Speed is currently slower than Apple's JSON due to:
-- C library callback overhead for each encoded value
-- Container scanning overhead in decoder for position caching
-- Swift/C bridge overhead
+### Speed Comparison
+BONJSON is currently slower than Apple's JSON:
+- Encode: ~6-10x slower
+- Decode: ~20-60x slower
+
+### Performance Limitations
+
+The current architecture trades speed for correctness and simplicity:
+
+1. **Position map overhead**: Building the map scans all data upfront, even if only part is needed
+2. **Child access is O(n)**: Accessing the n-th child requires iterating through n-1 siblings
+3. **Swift Codable overhead**: Protocol machinery creates many intermediate objects
+4. **String allocation**: Each string decode creates a new String object
+
+Apple's JSONDecoder uses highly optimized C++ with custom Swift bridging. Matching that performance would require:
+- Lazy parsing without upfront scanning
+- Direct struct creation bypassing Codable
+- Unsafe memory operations
+
+### Future Optimization Opportunities
+
+1. **Lazy position map**: Only scan what's needed during decode
+2. **Streaming decoder**: Avoid position map entirely for sequential access
+3. **Specialized decoders**: Skip Codable overhead for known types
+4. **String interning**: Reuse String objects for repeated keys

@@ -6,6 +6,8 @@
 2. [Apple's JSONEncoder/JSONDecoder Implementation](#2-apples-jsonencoderjsondecoder-implementation)
 3. [Language Choice Analysis for Codec Implementation](#3-language-choice-analysis-for-codec-implementation)
 4. [Proposed BONJSON Architecture](#4-proposed-bonjson-architecture)
+5. [Deep Dive: How Apple Achieves JSON Performance](#5-deep-dive-how-apple-achieves-json-performance)
+6. [Exceeding Apple's Performance: Architectural Options](#6-exceeding-apples-performance-architectural-options)
 
 ---
 
@@ -874,11 +876,473 @@ The current implementation's main problem is trying to use the C library as a bl
 
 ---
 
+## 5. Deep Dive: How Apple Achieves JSON Performance
+
+### 5.1 Core Performance Techniques
+
+Apple's swift-foundation JSON implementation uses a layered set of optimizations:
+
+#### 5.1.1 Aggressive Inlining
+
+```swift
+@inline(__always)
+func checkNotNull<T>(_ value: JSONMap.Value, expectedType: T.Type, ...) throws
+
+@inline(__always)
+private func decodeFixedWidthInteger<T: FixedWidthInteger>() throws -> T
+```
+
+The `@inline(__always)` attribute forces the compiler to inline small, frequently-called methods, eliminating function call overhead in hot paths. Apple uses this extensively on:
+- Validation methods
+- Type conversion methods
+- Buffer access methods
+
+#### 5.1.2 Branch Prediction Hints
+
+```swift
+guard byte != ._backslash && _fastPath(byte & 0xe0 != 0) else { break }
+```
+
+The undocumented `_fastPath()` and `_slowPath()` compiler hints tell the optimizer which branch is likely. This improves instruction cache utilization and reduces pipeline stalls.
+
+#### 5.1.3 Unchecked Buffer Access
+
+```swift
+let byte0 = (length > 0) ? bytes[uncheckedOffset: 0] : nil
+let ascii = bytes[unchecked: readIndex]
+```
+
+Using `[unchecked:]` subscripts eliminates bounds-checking in release builds. Apple validates bounds once at the scan level, then uses unchecked access for individual bytes.
+
+#### 5.1.4 BufferView: Zero-Cost Safe Abstraction
+
+Apple developed [BufferView](https://gist.github.com/atrick/4fab6886518f756295f77445e4bf0788) specifically for this use case:
+
+```swift
+struct BufferView<Element> {
+    let start: UnsafePointer<Element>
+    let count: Int
+    // Bounds-checked in debug, unchecked in release
+}
+```
+
+Key properties:
+- **No reference counting**: Unlike Array slices, doesn't retain parent
+- **Compile-time lifetime safety**: Uses Swift's non-escaping types
+- **Stack allocation**: Temporary views allocate on stack, not heap
+- **Cross-module efficiency**: Concrete representation without generics bloat
+
+#### 5.1.5 SIMD-Style Packed Comparisons
+
+```swift
+static func noByteMatches(_ asciiByte: UInt8, in hexString: UInt32) -> Bool {
+    let t0 = UInt32(0x01010101) &* UInt32(asciiByte)
+    let t1 = ((hexString ^ t0) & 0x7f7f7f7f) &+ 0x7f7f7f7f
+    let t2 = ((hexString | t1) & 0x80808080) ^ 0x80808080
+    return t2 == 0
+}
+```
+
+This technique processes 4 bytes simultaneously using arithmetic operations instead of loops, achieving SIMD-like parallelism without explicit SIMD instructions.
+
+#### 5.1.6 Bitwise Character Classification
+
+```swift
+static var whitespaceBitmap: UInt64 {
+    1 << UInt8._space | 1 << UInt8._return | 1 << UInt8._newline | 1 << UInt8._tab
+}
+
+if Self.whitespaceBitmap & (1 << ascii) != 0 { ... }
+```
+
+Replaces multiple comparisons with a single bitwise operation for constant-time character set checking.
+
+#### 5.1.7 Manual Loop Unrolling
+
+```swift
+while remainingBuffer.count >= 4 {
+    if let res = check(0) { return res }
+    if let res = check(1) { return res }
+    if let res = check(2) { return res }
+    if let res = check(3) { return res }
+    remainingBuffer = remainingBuffer.dropFirst(4)
+}
+```
+
+Processing 4 elements per loop iteration reduces loop overhead and improves instruction pipelining.
+
+### 5.2 Architectural Design: The JSONMap System
+
+Apple's key insight: **Don't parse what you don't need.**
+
+```
+┌─────────────────────────────────────────────────────────────────┐
+│                      Input: JSON Bytes                           │
+│  {"name": "Alice", "age": 30, "addresses": [...]}               │
+└─────────────────────────────────────────────────────────────────┘
+                              │
+                              ▼
+┌─────────────────────────────────────────────────────────────────┐
+│                   Stage 1: Structural Scan                       │
+│  Single pass: find all structural characters, validate UTF-8     │
+│  Output: JSONMap (integer array of offsets and types)           │
+│  - NO string parsing (just note offset and length)              │
+│  - NO number parsing (just note offset)                         │
+│  - NO memory allocation for values                              │
+└─────────────────────────────────────────────────────────────────┘
+                              │
+                              ▼
+┌─────────────────────────────────────────────────────────────────┐
+│                   Stage 2: Lazy Value Access                     │
+│  Parse values ON DEMAND when Codable requests them              │
+│  - String requested? Parse from offset now                      │
+│  - Number requested? Parse from offset now                      │
+│  - Object field unused? Never parsed at all                     │
+└─────────────────────────────────────────────────────────────────┘
+```
+
+The JSONMap is a flat integer array storing:
+- Value types
+- Byte offsets into original input
+- Container counts
+- Flags (has escapes, has exponent, etc.)
+
+**Benefits:**
+1. **Cache locality**: All metadata in contiguous memory
+2. **Minimal allocation**: One integer array, not thousands of objects
+3. **Skip optimization**: Unused values cost nothing
+4. **Random access**: Jump to any key without sequential scan
+
+### 5.3 Why Apple Switched to Pure Swift
+
+Apple rewrote their JSON codec from Objective-C/CoreFoundation to pure Swift for:
+
+1. **Cross-platform**: Swift on Linux/Windows lacks ObjC runtime
+2. **No bridging overhead**: ObjC→Swift bridging is expensive
+3. **Type safety**: Eliminates NSObject boxing/unboxing
+4. **Compiler optimization**: Swift optimizer can inline and specialize
+5. **Unified codebase**: One language, one optimization target
+
+The pure Swift version matches or exceeds ObjC performance on Apple platforms while also working on Linux.
+
+---
+
+## 6. Exceeding Apple's Performance: Architectural Options
+
+### 6.1 The Fundamental Challenge
+
+BONJSON has a potential advantage over JSON: binary format with simpler parsing rules. However, this advantage is currently negated by:
+
+1. **Codable protocol overhead**: Every value access goes through protocol dispatch
+2. **Position map construction**: Single-pass scan still allocates and fills arrays
+3. **Child access O(n)**: Navigating to the n-th child requires iteration
+4. **String allocation**: Every string decode creates a new String object
+
+To exceed Apple's ~50 MB/s JSON decode, we need to eliminate these bottlenecks.
+
+### 6.2 Option A: Pure Swift with Extreme Optimization
+
+**Approach**: Rewrite entirely in Swift, applying Apple's techniques.
+
+```swift
+// Example: BufferView-style access
+@usableFromInline
+struct BONJSONBufferView {
+    @usableFromInline let start: UnsafeRawPointer
+    @usableFromInline let count: Int
+
+    @inline(__always) @usableFromInline
+    subscript(unchecked offset: Int) -> UInt8 {
+        start.load(fromByteOffset: offset, as: UInt8.self)
+    }
+}
+
+// Example: Inline fast paths
+@inline(__always)
+private func decodeSmallInt(at offset: Int) -> Int8 {
+    let byte = buffer[unchecked: offset]
+    return Int8(bitPattern: byte)  // Type code IS the value for -100...100
+}
+```
+
+**Pros:**
+- Single language, easier maintenance
+- Swift optimizer can see everything
+- Access to Swift SIMD types (SIMD8, SIMD16, etc.)
+- Natural Codable integration
+
+**Cons:**
+- Requires deep Swift optimization expertise
+- Limited control over memory layout
+- Harder to share with non-Swift platforms
+
+**Expected speedup**: 5-10x (approach Apple's level)
+
+### 6.3 Option B: C Core with Minimal Swift Wrapper
+
+**Approach**: Move ALL parsing and serialization to C, Swift only handles Codable protocol routing.
+
+```
+┌─────────────────────────────────────────────────────────────────┐
+│  Swift: Protocol Routing Only (< 100 lines)                     │
+│  - Receives encode/decode calls                                  │
+│  - Routes to C by type code                                      │
+│  - Returns C results to caller                                   │
+└─────────────────────────────────────────────────────────────────┘
+                              │ Direct C calls
+                              ▼
+┌─────────────────────────────────────────────────────────────────┐
+│  C: Complete Codec Engine                                        │
+│  - Scan and build position map                                   │
+│  - Decode values directly to caller-provided memory              │
+│  - Encode values directly to buffer                              │
+│  - All hot paths in C                                            │
+└─────────────────────────────────────────────────────────────────┘
+```
+
+**Key C API design:**
+```c
+// Decode directly to caller's memory
+void bonjson_decode_string_direct(
+    BONJSONContext* ctx,
+    size_t entryIndex,
+    char* outBuffer,       // Caller provides buffer
+    size_t* outLength      // Actual length returned
+);
+
+// Batch decode for arrays
+void bonjson_decode_int_array(
+    BONJSONContext* ctx,
+    size_t arrayIndex,
+    int64_t* outArray,     // Caller provides buffer
+    size_t count
+);
+```
+
+**Pros:**
+- Maximum control over memory and performance
+- Predictable performance, no GC
+- SIMD intrinsics available
+- Shareable with C/C++ projects
+
+**Cons:**
+- Manual memory management
+- Harder Swift integration
+- Two languages to maintain
+
+**Expected speedup**: 10-20x (can exceed Apple)
+
+### 6.4 Option C: C++ Template-Based Type Specialization
+
+**Approach**: Use C++ templates to generate specialized encode/decode code per type.
+
+```cpp
+template<typename T>
+struct BONJSONDecoder;
+
+template<>
+struct BONJSONDecoder<int64_t> {
+    static inline int64_t decode(const uint8_t* data, size_t offset) {
+        uint8_t typeCode = data[offset];
+        if (typeCode >= 0x00 && typeCode <= 0x64) {
+            return static_cast<int64_t>(typeCode);  // Small int
+        }
+        // Handle other cases...
+    }
+};
+
+template<>
+struct BONJSONDecoder<std::string_view> {
+    static inline std::string_view decode(const uint8_t* data, size_t offset) {
+        // Zero-copy string view into original buffer
+    }
+};
+```
+
+**Pros:**
+- Compile-time type specialization
+- Zero virtual dispatch overhead
+- Can use std::string_view for zero-copy strings
+- move semantics for efficient value transfer
+
+**Cons:**
+- C++ complexity
+- Harder Swift interop (need C bridge)
+- Template bloat can hurt instruction cache
+
+**Expected speedup**: 15-25x (likely fastest option)
+
+### 6.5 Option D: Code Generation at Build Time
+
+**Approach**: Generate specialized Swift code for known types.
+
+```swift
+// User writes:
+@BONJSONOptimized
+struct Person: Codable {
+    var name: String
+    var age: Int
+}
+
+// Build plugin generates:
+extension Person {
+    @inline(__always)
+    static func _bonjson_decode(from buffer: UnsafeRawBufferPointer, at offset: inout Int) -> Person {
+        // Direct field-by-field decode, no protocol overhead
+        let name = _decodeString(buffer, &offset)
+        let age = _decodeInt(buffer, &offset)
+        return Person(name: name, age: age)
+    }
+}
+```
+
+**Pros:**
+- Zero runtime protocol overhead
+- Type-specific optimizations
+- Still pure Swift
+- Works with Swift macros (5.9+)
+
+**Cons:**
+- Requires build tooling
+- Generated code maintenance
+- Only works for known types
+
+**Expected speedup**: 10-20x for optimized types
+
+### 6.6 Option E: SIMD-Accelerated Parser (simdjson-style)
+
+**Approach**: Apply [simdjson](https://github.com/simdjson/simdjson)'s techniques to BONJSON.
+
+```
+Stage 1: Vectorized Structure Discovery
+┌─────────────────────────────────────────────────────────────────┐
+│  Load 64 bytes at a time using SIMD                             │
+│  Find all type codes in parallel                                 │
+│  Build structural index with one pass                            │
+│  Validate UTF-8 in strings using SIMD                           │
+└─────────────────────────────────────────────────────────────────┘
+
+Stage 2: On-Demand Value Extraction
+┌─────────────────────────────────────────────────────────────────┐
+│  Jump directly to value using index                              │
+│  Vectorized number parsing (multiple digits at once)             │
+│  Vectorized string copying                                       │
+└─────────────────────────────────────────────────────────────────┘
+```
+
+**SIMD opportunities in BONJSON:**
+- Finding container end markers (0x9b) in bulk
+- Validating UTF-8 in string data
+- Parsing multi-byte integers
+- Bulk copying string data
+
+**Pros:**
+- 2-10x speedup from SIMD alone (per simdjson benchmarks)
+- BONJSON simpler to parse than JSON (no escapes, known lengths)
+- Can achieve GB/s throughput
+
+**Cons:**
+- Architecture-specific code (AVX2, NEON, etc.)
+- Significant complexity
+- May not help small documents
+
+**Expected speedup**: 20-50x (GB/s range)
+
+### 6.7 Option F: Hybrid Architecture
+
+**Approach**: Combine best elements from multiple options.
+
+```
+┌─────────────────────────────────────────────────────────────────┐
+│  Layer 1: Swift Public API                                       │
+│  - BONJSONEncoder/Decoder matching Apple's interface             │
+│  - Strategy handling (dates, keys, etc.)                         │
+└─────────────────────────────────────────────────────────────────┘
+                              │
+                              ▼
+┌─────────────────────────────────────────────────────────────────┐
+│  Layer 2: Swift Fast Path                                        │
+│  - Code-generated decoders for common types                      │
+│  - Inline BufferView access                                      │
+│  - Direct struct construction for @BONJSONOptimized types        │
+└─────────────────────────────────────────────────────────────────┘
+                              │
+                              ▼
+┌─────────────────────────────────────────────────────────────────┐
+│  Layer 3: C/C++ SIMD Core                                        │
+│  - SIMD structure discovery                                      │
+│  - Vectorized UTF-8 validation                                   │
+│  - Position map construction                                     │
+│  - Batch value extraction                                        │
+└─────────────────────────────────────────────────────────────────┘
+                              │
+                              ▼
+┌─────────────────────────────────────────────────────────────────┐
+│  Layer 4: Shared Buffer                                          │
+│  - Memory-mapped or pre-allocated                                │
+│  - Zero-copy between layers                                      │
+│  - Reference counted for cleanup                                 │
+└─────────────────────────────────────────────────────────────────┘
+```
+
+**Recommended hybrid approach:**
+
+1. **C for SIMD scanning**: Vectorized structure discovery
+2. **C for position map**: Direct memory, no Swift overhead
+3. **Swift for protocol routing**: Clean Codable implementation
+4. **Code generation for hot types**: Bypass Codable for known structs
+5. **BufferView-style access**: Zero-copy throughout
+
+**Expected speedup**: 30-100x (exceeds Apple significantly)
+
+### 6.8 Comparison Matrix
+
+| Option | Expected Speedup | Complexity | Maintainability | Platform Support |
+|--------|-----------------|------------|-----------------|------------------|
+| A: Pure Swift | 5-10x | Medium | High | All Swift platforms |
+| B: C Core | 10-20x | Medium | Medium | Excellent |
+| C: C++ Templates | 15-25x | High | Low | Good |
+| D: Code Generation | 10-20x | High | Medium | Swift 5.9+ |
+| E: SIMD Parser | 20-50x | Very High | Low | x86-64, ARM64 |
+| F: Hybrid | 30-100x | Very High | Medium | Excellent |
+
+### 6.9 Recommended Path Forward
+
+**Phase 1: Low-Hanging Fruit (2-5x improvement)**
+1. Apply Apple's inlining patterns (`@inline(__always)`)
+2. Use unchecked buffer access in release builds
+3. Precompute all navigation indices (child offsets)
+4. Eliminate per-decode allocations
+
+**Phase 2: Architectural Improvements (5-10x total)**
+1. Implement BufferView-style zero-copy access
+2. Move position map construction entirely to C
+3. Add batch decode APIs for arrays of primitives
+4. Cache String objects for repeated keys
+
+**Phase 3: Advanced Optimizations (10-50x total)**
+1. Add SIMD scanning for structure discovery
+2. Vectorized UTF-8 validation
+3. Code generation for common struct patterns
+4. Memory-mapped I/O for large documents
+
+**Phase 4: Exceed Apple (50-100x total)**
+1. Full simdjson-style two-stage parsing
+2. Architecture-specific SIMD kernels (AVX2, NEON)
+3. Zero-copy string_view equivalents
+4. Thread-parallel scanning for very large documents
+
+---
+
 ## References
 
 - [Swift Foundation JSON Implementation](https://github.com/swiftlang/swift-foundation/tree/main/Sources/FoundationEssentials/JSON)
 - [Swift CoreLibs Foundation](https://github.com/swiftlang/swift-corelibs-foundation)
 - [Daniel Lemire: Swift Calling C Performance](https://lemire.me/blog/2016/09/29/can-swift-code-call-c-code-without-overhead/)
+- [BufferView Roadmap](https://gist.github.com/atrick/4fab6886518f756295f77445e4bf0788)
+- [simdjson: Parsing Gigabytes of JSON per Second](https://github.com/simdjson/simdjson)
+- [simdjson Paper](https://arxiv.org/pdf/1902.08318)
+- [Swift SIMD Evolution Proposal](https://github.com/swiftlang/swift-evolution/blob/main/proposals/0229-simd.md)
 - [Flight School Codable DIY Kit](https://github.com/Flight-School/Codable-DIY-Kit)
 - [Swift Encoder/Decoder Slides](https://kaitlin.dev/files/encoder_decoder_slides.pdf)
 - [FlatBuffers Zero-Copy Design](https://en.wikipedia.org/wiki/FlatBuffers)
