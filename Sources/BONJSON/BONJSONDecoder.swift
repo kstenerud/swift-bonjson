@@ -1006,19 +1006,10 @@ final class _MapDecoder: Decoder {
 /// Lowered from 16 to 12 based on updated profiling.
 private let kSmallObjectThreshold = 12
 
-/// Lazy key lookup state - built on demand to avoid overhead for small objects.
-/// Uses a class to allow lazy mutation from within the struct container.
-private final class _LazyKeyState {
-    var keyCache: [String: size_t]?
-    let pairCount: Int
-    let firstChildIndex: Int
-    let useLinearSearch: Bool
-
-    init(entry: KSBONJSONMapEntry) {
-        self.pairCount = Int(entry.data.container.count) / 2
-        self.firstChildIndex = Int(entry.data.container.firstChild)
-        self.useLinearSearch = pairCount <= kSmallObjectThreshold
-    }
+/// Key cache holder - only allocated for large objects that need dictionary lookup.
+/// Using a class allows mutation from within the struct container.
+private final class _KeyCacheHolder {
+    var cache: [String: size_t]?
 }
 
 struct _MapKeyedDecodingContainer<Key: CodingKey>: KeyedDecodingContainerProtocol {
@@ -1027,8 +1018,14 @@ struct _MapKeyedDecodingContainer<Key: CodingKey>: KeyedDecodingContainerProtoco
     let entry: KSBONJSONMapEntry
     let codingPath: [CodingKey]
 
-    /// Lazy key lookup state - uses a class to allow mutation from value type.
-    private let lazyState: _LazyKeyState
+    // Stored directly in struct - no class allocation overhead for small objects
+    private let pairCount: Int
+    private let firstChildIndex: Int
+    private let useLinearSearch: Bool
+
+    /// Key cache holder - only allocated for large objects.
+    /// nil for small objects that use linear search.
+    private let keyCacheHolder: _KeyCacheHolder?
 
     /// All keys in this object - built on demand (not cached, since rarely used).
     var allKeys: [Key] {
@@ -1040,16 +1037,23 @@ struct _MapKeyedDecodingContainer<Key: CodingKey>: KeyedDecodingContainerProtoco
         self.objectIndex = objectIndex
         self.entry = entry
         self.codingPath = codingPath
-        self.lazyState = _LazyKeyState(entry: entry)
+
+        let count = Int(entry.data.container.count) / 2
+        self.pairCount = count
+        self.firstChildIndex = Int(entry.data.container.firstChild)
+        self.useLinearSearch = count <= kSmallObjectThreshold
+
+        // Only allocate cache holder for large objects - saves ~100ns per small object
+        self.keyCacheHolder = count > kSmallObjectThreshold ? _KeyCacheHolder() : nil
     }
 
     /// Build allKeys array - only called when allKeys is accessed.
     private func buildAllKeys() -> [Key] {
         var keys: [Key] = []
-        keys.reserveCapacity(lazyState.pairCount)
+        keys.reserveCapacity(pairCount)
 
-        var currentIndex = lazyState.firstChildIndex
-        for _ in 0..<lazyState.pairCount {
+        var currentIndex = firstChildIndex
+        for _ in 0..<pairCount {
             let keyIndex = currentIndex
             let valueIndex = state.map.nextSiblingIndex(keyIndex)
             currentIndex = state.map.nextSiblingIndex(valueIndex)
@@ -1067,13 +1071,13 @@ struct _MapKeyedDecodingContainer<Key: CodingKey>: KeyedDecodingContainerProtoco
     /// Ensure key cache is built (for larger objects).
     @inline(__always)
     private func ensureKeyCache() {
-        guard lazyState.keyCache == nil else { return }
+        guard let holder = keyCacheHolder, holder.cache == nil else { return }
 
         var cache: [String: size_t] = [:]
-        cache.reserveCapacity(lazyState.pairCount)
+        cache.reserveCapacity(pairCount)
 
-        var currentIndex = lazyState.firstChildIndex
-        for _ in 0..<lazyState.pairCount {
+        var currentIndex = firstChildIndex
+        for _ in 0..<pairCount {
             let keyIndex = currentIndex
             let valueIndex = state.map.nextSiblingIndex(keyIndex)
             currentIndex = state.map.nextSiblingIndex(valueIndex)
@@ -1082,14 +1086,14 @@ struct _MapKeyedDecodingContainer<Key: CodingKey>: KeyedDecodingContainerProtoco
                 cache[keyString] = size_t(valueIndex)
             }
         }
-        lazyState.keyCache = cache
+        holder.cache = cache
     }
 
     /// Linear search for key - used for small objects to avoid dictionary overhead.
     @inline(__always)
     private func linearFindValue(forOriginalKey key: String) -> size_t? {
-        var currentIndex = lazyState.firstChildIndex
-        for _ in 0..<lazyState.pairCount {
+        var currentIndex = firstChildIndex
+        for _ in 0..<pairCount {
             let keyIndex = currentIndex
             let valueIndex = state.map.nextSiblingIndex(keyIndex)
             currentIndex = state.map.nextSiblingIndex(valueIndex)
@@ -1129,8 +1133,8 @@ struct _MapKeyedDecodingContainer<Key: CodingKey>: KeyedDecodingContainerProtoco
             return key.stringValue
         default:
             // Slow path: need to find the original key that converts to this key
-            var currentIndex = lazyState.firstChildIndex
-            for _ in 0..<lazyState.pairCount {
+            var currentIndex = firstChildIndex
+            for _ in 0..<pairCount {
                 let keyIndex = currentIndex
                 let valueIndex = state.map.nextSiblingIndex(keyIndex)
                 currentIndex = state.map.nextSiblingIndex(valueIndex)
@@ -1149,11 +1153,11 @@ struct _MapKeyedDecodingContainer<Key: CodingKey>: KeyedDecodingContainerProtoco
     @inline(__always)
     func contains(_ key: Key) -> Bool {
         let originalKey = findOriginalKey(key)
-        if lazyState.useLinearSearch {
+        if useLinearSearch {
             return linearFindValue(forOriginalKey: originalKey) != nil
         }
         ensureKeyCache()
-        return lazyState.keyCache![originalKey] != nil
+        return keyCacheHolder!.cache![originalKey] != nil
     }
 
     @inline(__always)
@@ -1161,7 +1165,7 @@ struct _MapKeyedDecodingContainer<Key: CodingKey>: KeyedDecodingContainerProtoco
         let originalKey = findOriginalKey(key)
 
         // For small objects, use linear search
-        if lazyState.useLinearSearch {
+        if useLinearSearch {
             if let valueIdx = linearFindValue(forOriginalKey: originalKey) {
                 return valueIdx
             }
@@ -1173,7 +1177,7 @@ struct _MapKeyedDecodingContainer<Key: CodingKey>: KeyedDecodingContainerProtoco
 
         // For larger objects, use dictionary
         ensureKeyCache()
-        guard let valueIdx = lazyState.keyCache![originalKey] else {
+        guard let valueIdx = keyCacheHolder!.cache![originalKey] else {
             throw DecodingError.keyNotFound(key, DecodingError.Context(
                 codingPath: codingPath,
                 debugDescription: "Key '\(key.stringValue)' not found"

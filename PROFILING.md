@@ -436,6 +436,23 @@ All primitive array types now have batch encode:
 | `[Double]` | 19x faster |
 | `[String]` | 2.3x faster |
 
+### Phase 8: Eliminate Class Allocation for Small Objects (Completed)
+
+Removed mandatory class allocation (`_LazyKeyState`) for keyed decoding containers. Now only large objects (>12 fields) that need dictionary lookup allocate the cache holder class.
+
+**Changes:**
+- Store `pairCount`, `firstChildIndex`, `useLinearSearch` directly in struct
+- Only allocate `_KeyCacheHolder` class for large objects
+- Small objects (≤12 fields) have zero class allocations during decode
+
+**Results:**
+
+| Metric | Before | After | Improvement |
+|--------|--------|-------|-------------|
+| 1000 objects decode | 510 µs | 480 µs | **6% faster** |
+| Throughput | 51.3 MB/s | 54.6 MB/s | **6% higher** |
+| vs JSON ratio | 0.41x | 0.39x | **5% better** |
+
 ### Optional Future Optimizations
 
 If even more performance is needed:
