@@ -769,47 +769,7 @@ final class _MapDecoder: Decoder {
     }
 
     @inline(__always)
-    func decodeInt64() throws -> Int64 {
-        guard let entry = state.map.getEntry(at: entryIndex) else {
-            throw BONJSONDecodingError.unexpectedEndOfData
-        }
-
-        switch entry.type {
-        case KSBONJSON_TYPE_INT:
-            return entry.data.intValue
-        case KSBONJSON_TYPE_UINT:
-            let value = entry.data.uintValue
-            guard value <= UInt64(Int64.max) else {
-                throw BONJSONDecodingError.typeMismatch(expected: "Int64", actual: "UInt64 too large")
-            }
-            return Int64(value)
-        default:
-            throw BONJSONDecodingError.typeMismatch(expected: "integer", actual: describeType(entry.type))
-        }
-    }
-
-    @inline(__always)
-    func decodeUInt64() throws -> UInt64 {
-        guard let entry = state.map.getEntry(at: entryIndex) else {
-            throw BONJSONDecodingError.unexpectedEndOfData
-        }
-
-        switch entry.type {
-        case KSBONJSON_TYPE_UINT:
-            return entry.data.uintValue
-        case KSBONJSON_TYPE_INT:
-            let value = entry.data.intValue
-            guard value >= 0 else {
-                throw BONJSONDecodingError.typeMismatch(expected: "UInt64", actual: "negative integer")
-            }
-            return UInt64(value)
-        default:
-            throw BONJSONDecodingError.typeMismatch(expected: "unsigned integer", actual: describeType(entry.type))
-        }
-    }
-
-    @inline(__always)
-    func decodeDouble() throws -> Double {
+    private func decodeDouble() throws -> Double {
         guard let entry = state.map.getEntry(at: entryIndex) else {
             throw BONJSONDecodingError.unexpectedEndOfData
         }
@@ -830,30 +790,6 @@ final class _MapDecoder: Decoder {
         default:
             throw BONJSONDecodingError.typeMismatch(expected: "float", actual: describeType(entry.type))
         }
-    }
-
-    @inline(__always)
-    func decodeBool() throws -> Bool {
-        guard let entry = state.map.getEntry(at: entryIndex) else {
-            throw BONJSONDecodingError.unexpectedEndOfData
-        }
-
-        switch entry.type {
-        case KSBONJSON_TYPE_TRUE:
-            return true
-        case KSBONJSON_TYPE_FALSE:
-            return false
-        default:
-            throw BONJSONDecodingError.typeMismatch(expected: "boolean", actual: describeType(entry.type))
-        }
-    }
-
-    @inline(__always)
-    func decodeNil() -> Bool {
-        guard let entry = state.map.getEntry(at: entryIndex) else {
-            return false
-        }
-        return entry.type == KSBONJSON_TYPE_NULL
     }
 
     func decodeDate() throws -> Date {

@@ -2245,3 +2245,236 @@ final class BONJSONSpecialTypesInContainersTests: XCTestCase {
         XCTAssertEqual(decoded, value)
     }
 }
+
+// MARK: - AllKeys and CodingPath Tests
+
+final class BONJSONAllKeysTests: XCTestCase {
+
+    // Test allKeys property in keyed container (covers toArray() path)
+    func testAllKeysInKeyedContainer() throws {
+        // Use a flexible key type that can handle both known and dynamic fields
+        struct FlexibleKey: CodingKey {
+            var stringValue: String
+            var intValue: Int? { nil }
+            init(stringValue: String) { self.stringValue = stringValue }
+            init?(intValue: Int) { nil }
+
+            static let knownField = FlexibleKey(stringValue: "knownField")
+        }
+
+        struct DynamicObject: Codable, Equatable {
+            var knownField: String
+            var dynamicFields: [String: Int]
+
+            init(knownField: String, dynamicFields: [String: Int]) {
+                self.knownField = knownField
+                self.dynamicFields = dynamicFields
+            }
+
+            init(from decoder: Decoder) throws {
+                let container = try decoder.container(keyedBy: FlexibleKey.self)
+                knownField = try container.decode(String.self, forKey: .knownField)
+
+                // Use allKeys to discover dynamic fields
+                var fields: [String: Int] = [:]
+                for key in container.allKeys {
+                    if key.stringValue != "knownField" {
+                        if let value = try? container.decode(Int.self, forKey: key) {
+                            fields[key.stringValue] = value
+                        }
+                    }
+                }
+                dynamicFields = fields
+            }
+
+            func encode(to encoder: Encoder) throws {
+                var container = encoder.container(keyedBy: FlexibleKey.self)
+                try container.encode(knownField, forKey: .knownField)
+                for (key, value) in dynamicFields.sorted(by: { $0.key < $1.key }) {
+                    try container.encode(value, forKey: FlexibleKey(stringValue: key))
+                }
+            }
+        }
+
+        let encoder = BONJSONEncoder()
+        let decoder = BONJSONDecoder()
+
+        let value = DynamicObject(knownField: "test", dynamicFields: ["a": 1, "b": 2, "c": 3])
+        let data = try encoder.encode(value)
+        let decoded = try decoder.decode(DynamicObject.self, from: data)
+        XCTAssertEqual(decoded.knownField, value.knownField)
+        XCTAssertEqual(decoded.dynamicFields.count, 3)
+        XCTAssertEqual(decoded.dynamicFields["a"], 1)
+        XCTAssertEqual(decoded.dynamicFields["b"], 2)
+        XCTAssertEqual(decoded.dynamicFields["c"], 3)
+    }
+}
+
+// MARK: - UInt as Int64 Decoding Tests
+
+final class BONJSONUIntAsIntTests: XCTestCase {
+
+    // Test decoding unsigned int that fits in Int64 (covers UINT case in decodeInt64)
+    func testDecodeUIntAsInt64() throws {
+        // Encode a UInt64 value that fits in Int64
+        let encoder = BONJSONEncoder()
+        let decoder = BONJSONDecoder()
+
+        // Use a struct that encodes as UInt but decodes as Int
+        struct UIntHolder: Encodable {
+            var value: UInt64
+        }
+
+        struct IntHolder: Decodable {
+            var value: Int64
+        }
+
+        // Value 200 (0xC8) has MSB set in 1 byte, so it will be encoded as UINT
+        let original = UIntHolder(value: 200)
+        let data = try encoder.encode(original)
+        let decoded = try decoder.decode(IntHolder.self, from: data)
+        XCTAssertEqual(decoded.value, 200)
+    }
+
+    // Test in unkeyed container
+    func testDecodeUIntAsInt64InUnkeyedContainer() throws {
+        let encoder = BONJSONEncoder()
+        let decoder = BONJSONDecoder()
+
+        // Encode array of UInt64
+        let original: [UInt64] = [100, 200, 300]
+        let data = try encoder.encode(original)
+
+        // Decode as Int64 array
+        let decoded = try decoder.decode([Int64].self, from: data)
+        XCTAssertEqual(decoded, [100, 200, 300])
+    }
+
+    // Test in single value container - needs MSB set to use UINT encoding
+    func testDecodeUIntAsInt64SingleValue() throws {
+        let encoder = BONJSONEncoder()
+        let decoder = BONJSONDecoder()
+
+        // 200 has MSB set in 1 byte, so it's encoded as UINT
+        let original: UInt64 = 200
+        let data = try encoder.encode(original)
+        let decoded = try decoder.decode(Int64.self, from: data)
+        XCTAssertEqual(decoded, 200)
+    }
+
+    // Test decoding Int as UInt (for the reverse conversion path)
+    func testDecodeIntAsUInt64() throws {
+        let encoder = BONJSONEncoder()
+        let decoder = BONJSONDecoder()
+
+        struct IntHolder: Encodable {
+            var value: Int64
+        }
+
+        struct UIntHolder: Decodable {
+            var value: UInt64
+        }
+
+        // Small positive int (encoded as small int or signed int)
+        let original = IntHolder(value: 50)
+        let data = try encoder.encode(original)
+        let decoded = try decoder.decode(UIntHolder.self, from: data)
+        XCTAssertEqual(decoded.value, 50)
+    }
+
+    // Test decoding Int as UInt in single value container
+    func testDecodeIntAsUInt64SingleValue() throws {
+        let encoder = BONJSONEncoder()
+        let decoder = BONJSONDecoder()
+
+        let original: Int64 = 50
+        let data = try encoder.encode(original)
+        let decoded = try decoder.decode(UInt64.self, from: data)
+        XCTAssertEqual(decoded, 50)
+    }
+
+    // Test decoding UInt as Double (covers UINT case in decodeDouble)
+    func testDecodeUIntAsDouble() throws {
+        let encoder = BONJSONEncoder()
+        let decoder = BONJSONDecoder()
+
+        struct UIntHolder: Encodable {
+            var value: UInt64
+        }
+
+        struct DoubleHolder: Decodable {
+            var value: Double
+        }
+
+        // 200 is encoded as UINT
+        let original = UIntHolder(value: 200)
+        let data = try encoder.encode(original)
+        let decoded = try decoder.decode(DoubleHolder.self, from: data)
+        XCTAssertEqual(decoded.value, 200.0)
+    }
+
+    // Test decoding UInt as Double in single value container
+    func testDecodeUIntAsDoubleSingleValue() throws {
+        let encoder = BONJSONEncoder()
+        let decoder = BONJSONDecoder()
+
+        let original: UInt64 = 200
+        let data = try encoder.encode(original)
+        let decoded = try decoder.decode(Double.self, from: data)
+        XCTAssertEqual(decoded, 200.0)
+    }
+}
+
+// MARK: - Large Object SuperDecoder Tests
+
+final class BONJSONLargeObjectSuperDecoderTests: XCTestCase {
+
+    // Test superDecoder with large object (> 12 fields) to trigger dictionary cache
+    func testSuperDecoderWithLargeObject() throws {
+        struct Parent: Codable, Equatable {
+            var parentA: Int, parentB: Int, parentC: Int, parentD: Int, parentE: Int
+            var parentF: Int, parentG: Int, parentH: Int, parentI: Int, parentJ: Int
+            var parentK: Int, parentL: Int, parentM: Int
+        }
+
+        struct Child: Codable, Equatable {
+            var childValue: String
+            var parent: Parent
+
+            enum CodingKeys: String, CodingKey {
+                case childValue
+                case `super`
+            }
+
+            init(childValue: String, parent: Parent) {
+                self.childValue = childValue
+                self.parent = parent
+            }
+
+            init(from decoder: Decoder) throws {
+                let container = try decoder.container(keyedBy: CodingKeys.self)
+                childValue = try container.decode(String.self, forKey: .childValue)
+                let superDecoder = try container.superDecoder()
+                parent = try Parent(from: superDecoder)
+            }
+
+            func encode(to encoder: Encoder) throws {
+                var container = encoder.container(keyedBy: CodingKeys.self)
+                try container.encode(childValue, forKey: .childValue)
+                let superEncoder = container.superEncoder()
+                try parent.encode(to: superEncoder)
+            }
+        }
+
+        let encoder = BONJSONEncoder()
+        let decoder = BONJSONDecoder()
+
+        let parent = Parent(parentA: 1, parentB: 2, parentC: 3, parentD: 4, parentE: 5,
+                           parentF: 6, parentG: 7, parentH: 8, parentI: 9, parentJ: 10,
+                           parentK: 11, parentL: 12, parentM: 13)
+        let value = Child(childValue: "test", parent: parent)
+        let data = try encoder.encode(value)
+        let decoded = try decoder.decode(Child.self, from: data)
+        XCTAssertEqual(decoded, value)
+    }
+}
