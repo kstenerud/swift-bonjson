@@ -1334,6 +1334,143 @@ Stage 2: On-Demand Value Extraction
 
 ---
 
+## 7. Profiling Results and Revised Recommendations (January 2026)
+
+### 7.1 Key Profiling Findings
+
+Detailed profiling revealed a critical insight: **The C layer is fast; Swift Codable is the bottleneck.**
+
+| Component | Time | % of Total | Throughput |
+|-----------|------|------------|------------|
+| C Position Map Scan | 80 µs | 6% | 319 MB/s |
+| Swift Codable Layer | 1.27 ms | 94% | ~20 MB/s |
+
+The C scanner processes entries at 13ns each, achieving 319 MB/s. This is competitive with the fastest JSON parsers. However, Swift's Codable machinery dominates total time:
+
+- **Container creation**: ~470ns per object
+- **Field decoding**: ~176ns per field
+- **Primitive arrays**: 160ns per element (should be <10ns)
+
+### 7.2 Why Previous Assumptions Were Wrong
+
+**Original assumption**: "Moving more to C will make BONJSON faster."
+
+**Reality**: C is only 6% of time. Doubling C performance saves 40µs out of 1.35ms (3%).
+
+**Original assumption**: "SIMD scanning will provide major speedups."
+
+**Reality**: SIMD speeds up the 6%, not the 94%. Maximum gain: ~5%.
+
+**Original assumption**: "BONJSON's binary format should be much faster than JSON text."
+
+**Reality**: Both BONJSON and JSON are bottlenecked by Codable. BONJSON decode time (1.26ms) ≈ JSON decode time (1.23ms) despite BONJSON being 41% smaller.
+
+### 7.3 Revised Optimization Strategy
+
+Given that Codable is the bottleneck, the optimization strategy must change:
+
+#### Tier 1: Reduce Codable Overhead (2-3x improvement)
+
+1. **Batch Decode for Primitive Arrays**
+   ```c
+   // New C API
+   void ksbonjson_decode_int64_array(ctx, arrayIndex, outBuffer, count);
+   ```
+   - Decoding `[Int]` calls C once instead of 10,000 times
+   - Reduces per-element overhead from 160ns to ~10ns
+   - **Expected gain**: 10-15x for primitive arrays
+
+2. **Lazy Key Cache**
+   - Current: Build full dictionary at container creation
+   - Proposed: Build cache on first key access
+   - **Expected gain**: 20-50% for partial key access
+
+3. **Container Object Pooling**
+   - Reuse `KeyedDecodingContainer` instances for same type
+   - Avoid repeated dictionary allocation
+   - **Expected gain**: 10-20% for arrays of objects
+
+#### Tier 2: Bypass Codable Selectively (5-10x improvement)
+
+4. **Code Generation Macro**
+   ```swift
+   @BONJSONOptimized
+   struct Person: Codable {
+       var name: String
+       var age: Int
+   }
+
+   // Generates direct decode without Codable overhead:
+   extension Person {
+       static func _bonjson_decode(from map: _PositionMap, at index: Int) -> Person {
+           // Direct field extraction, no containers
+       }
+   }
+   ```
+   - Requires Swift 5.9+ macros
+   - Opt-in per type
+   - **Expected gain**: 5-10x for annotated types
+
+5. **Specialized Collection Decoders**
+   - Detect `[KnownType].self` patterns
+   - Use batch decode without per-element containers
+   - **Expected gain**: 3-5x for typed arrays
+
+#### Tier 3: Alternative Non-Codable API (10x+ improvement)
+
+6. **Direct Position Map Access**
+   ```swift
+   // Skip Codable entirely for maximum performance
+   let map = try BONJSONMap(data: data)
+   let name = map.getString(at: map.findKey("name"))
+   let age = map.getInt(at: map.findKey("age"))
+   ```
+   - Zero protocol overhead
+   - Manual but fast
+   - **Expected gain**: Approach C speed (10-15x)
+
+### 7.4 Revised Recommendation Matrix
+
+| Approach | Effort | Improvement | Compatibility |
+|----------|--------|-------------|---------------|
+| Batch primitive decode | Low | 10-15x (arrays) | Full |
+| Lazy key cache | Low | 20-50% (partial) | Full |
+| Container pooling | Medium | 10-20% | Full |
+| Code generation macro | High | 5-10x (opt-in) | Swift 5.9+ |
+| Direct map API | Medium | 10-15x | Non-Codable |
+
+### 7.5 Recommended Path Forward
+
+**Phase 1: Quick Wins (1-2 weeks)**
+1. Add batch decode C APIs for primitive arrays
+2. Implement lazy key cache in containers
+3. Expected result: 2-3x faster for typical workloads
+
+**Phase 2: Selective Bypass (2-4 weeks)**
+4. Design code generation macro for common patterns
+5. Add specialized `[T].self` decode paths
+6. Expected result: 5-10x for annotated types
+
+**Phase 3: Power User API (optional)**
+7. Expose direct position map access for maximum performance
+8. Document trade-offs vs Codable
+9. Expected result: 10-15x for power users
+
+### 7.6 Theoretical Performance Limits
+
+| Scenario | Throughput | Relative to Current |
+|----------|------------|---------------------|
+| Current implementation | 20 MB/s | 1x |
+| With batch primitives | 50-80 MB/s | 2.5-4x |
+| With code generation | 100-200 MB/s | 5-10x |
+| Direct map API | 300+ MB/s | 15x+ |
+| C scan only (theoretical) | 319 MB/s | 16x |
+| C with SIMD (theoretical) | 1+ GB/s | 50x+ |
+
+The fundamental limit for Codable-compatible decode is ~100-200 MB/s due to protocol overhead. Exceeding this requires bypassing Codable.
+
+---
+
 ## References
 
 - [Swift Foundation JSON Implementation](https://github.com/swiftlang/swift-foundation/tree/main/Sources/FoundationEssentials/JSON)

@@ -1,0 +1,255 @@
+# BONJSON Performance Profiling Report
+
+## Executive Summary
+
+**The C layer is fast. The Swift Codable layer is the bottleneck.**
+
+Profiling reveals that the C-based position map scanning achieves **319 MB/s** and accounts for only **6% of decode time**. The remaining **94% is spent in Swift's Codable protocol machinery** - container creation, key lookup, and protocol dispatch.
+
+This finding fundamentally changes our optimization strategy: moving more work to C will have diminishing returns because C is already fast. The bottleneck is inherent to Swift's Codable design.
+
+---
+
+## Profiling Results
+
+### Test Environment
+- Platform: Darwin (macOS)
+- Architecture: arm64e
+- Build: Release mode with optimizations
+- Test data: Arrays of simple structs with 5 integer fields
+
+### Decode Phase Breakdown
+
+| Phase | Time | % of Total | Throughput |
+|-------|------|------------|------------|
+| Position Map Creation (C) | 80 µs | 6.0% | 319 MB/s |
+| Codable Decoding (Swift) | 1.27 ms | 94.0% | ~20 MB/s |
+| **Total** | **1.35 ms** | **100%** | **19.4 MB/s** |
+
+**Key insight**: The C scan is 16x faster than the Swift decode phase.
+
+### Position Map Scaling
+
+| Object Count | Data Size | Map Time | Per Entry | Throughput |
+|--------------|-----------|----------|-----------|------------|
+| 100 | 2 KB | 7.5 µs | 12 ns | 277 MB/s |
+| 500 | 12 KB | 41 µs | 13 ns | 308 MB/s |
+| 1000 | 26 KB | 82 µs | 13 ns | 319 MB/s |
+| 2000 | 53 KB | 159 µs | 13 ns | 334 MB/s |
+| 5000 | 134 KB | 405 µs | 13 ns | 332 MB/s |
+
+**Key insight**: Position map scales linearly at ~13ns per entry, achieving ~320 MB/s consistently.
+
+### Container/Codable Overhead
+
+| Metric | Value |
+|--------|-------|
+| Position map only | 83 µs |
+| Full decode | 1.34 ms |
+| Container overhead | 1.25 ms (93.8%) |
+| Per object overhead | 1.25 µs |
+
+**Key insight**: Creating and using `KeyedDecodingContainer` costs 1.25µs per object.
+
+### Field Count Impact
+
+| Configuration | Total Time | Per Object | Per Field |
+|---------------|------------|------------|-----------|
+| 1000 objects × 1 field | 648 µs | 648 ns | 648 ns |
+| 1000 objects × 10 fields | 2.24 ms | 2.24 µs | 224 ns |
+
+| Derived Metric | Value |
+|----------------|-------|
+| Fixed overhead per object | ~470 ns |
+| Marginal cost per field | ~176 ns |
+
+**Key insight**: Each object has ~470ns fixed overhead (container creation). Additional fields cost ~176ns each.
+
+### Primitive Array Performance
+
+| Type | Count | Time | Per Element |
+|------|-------|------|-------------|
+| Int | 10,000 | 1.61 ms | 160 ns |
+| Double | 10,000 | 1.59 ms | 159 ns |
+| String | 1,000 | 252 µs | 252 ns |
+
+**Key insight**: Even simple primitive arrays cost 160ns per element due to Codable overhead.
+
+### BONJSON vs JSON Comparison
+
+| Codec | Time | Data Size | Throughput |
+|-------|------|-----------|------------|
+| BONJSON | 1.26 ms | 26 KB | 20.7 MB/s |
+| JSON | 1.23 ms | 44 KB | 36.0 MB/s |
+| **Ratio** | **1.02x** | **0.59x** | **0.57x** |
+
+**Key insight**: BONJSON and JSON have nearly identical decode TIME despite BONJSON being 41% smaller. This confirms the bottleneck is Codable overhead, not parsing.
+
+### Encoder Performance
+
+| Metric | Value |
+|--------|-------|
+| Total time (1000 objects) | 504 µs |
+| Per object | 503 ns |
+| Per value | 100 ns |
+| Throughput | 52 MB/s |
+
+**Key insight**: Encoder is 2.7x faster than decoder (52 MB/s vs 19 MB/s).
+
+---
+
+## Analysis
+
+### Why is the C Layer Fast?
+
+The C position map scanner achieves 319 MB/s because:
+1. Single pass through data
+2. No allocations during scan (pre-sized buffer)
+3. Direct memory access
+4. Simple type code dispatch
+
+At 13ns per entry, the C code is processing ~77 million entries per second.
+
+### Why is the Swift Layer Slow?
+
+The Swift Codable layer takes 94% of time because:
+
+1. **Container Creation Overhead (~470ns per object)**
+   - `KeyedDecodingContainer` wraps internal container in existential
+   - Key cache dictionary must be built for each object
+   - `allKeys` array allocation
+
+2. **Protocol Dispatch Overhead**
+   - Each `decode(_:forKey:)` call goes through protocol witness table
+   - Type checking and casting at runtime
+   - Error handling machinery
+
+3. **Key Lookup (~176ns per field)**
+   - Dictionary lookup for each field
+   - String comparison for keys
+   - Key strategy application
+
+4. **Per-Element Overhead in Arrays**
+   - Each element in `[Int]` still goes through `UnkeyedDecodingContainer.decode(_:)`
+   - No batch operations available
+
+### Why Does JSON Match BONJSON Speed?
+
+Despite BONJSON being a simpler binary format:
+- JSON parsing is highly optimized in swift-foundation
+- Both are bottlenecked by the same Codable overhead
+- The parsing advantage of BONJSON is swamped by container overhead
+
+---
+
+## Bottleneck Hierarchy
+
+```
+Total Decode Time: 1.35 ms (100%)
+├── Swift Codable Layer: 1.27 ms (94%)
+│   ├── Container creation: ~470 ns × 1000 = 470 µs (35%)
+│   ├── Field decoding: ~176 ns × 5000 = 880 µs (65%)
+│   │   ├── Key lookup (dictionary)
+│   │   ├── Entry access
+│   │   ├── Type checking
+│   │   └── Value extraction
+│   └── Array iteration overhead
+│
+└── C Position Map: 80 µs (6%)
+    ├── Scan input bytes
+    ├── Build entry array
+    └── Compute nextSibling indices
+```
+
+---
+
+## Implications for Optimization
+
+### What WON'T Help Much
+
+1. **Moving more to C**: The C layer is only 6% of time. Even making it 2x faster saves only 40µs.
+
+2. **SIMD scanning**: Would speed up the 6%, not the 94%.
+
+3. **Better position map structure**: Already at 13ns per entry.
+
+### What MIGHT Help
+
+1. **Reduce container creation overhead**
+   - Reuse containers across similar objects
+   - Lazy key cache construction
+   - Pool container objects
+
+2. **Batch operations for primitive arrays**
+   - `decode([Int].self)` should not create 10,000 individual decode calls
+   - Single C call to decode entire array
+
+3. **Code generation (bypass Codable)**
+   - Generate direct struct construction
+   - Eliminate protocol dispatch entirely
+   - 5-10x improvement potential for known types
+
+4. **Inline everything aggressively**
+   - Ensure no protocol witness table lookups in hot paths
+   - Use concrete types instead of existentials
+
+### Theoretical Limits
+
+If we eliminated ALL Swift overhead and only had C scanning:
+- Current: 19 MB/s (1.35 ms for 26 KB)
+- C-only theoretical: 319 MB/s (80 µs for 26 KB)
+- **Maximum possible speedup: 16x**
+
+But Codable requires Swift, so realistic gains are limited to reducing the 94% overhead, not eliminating it.
+
+---
+
+## Recommendations
+
+### Short Term (2-3x improvement potential)
+
+1. **Batch decode for primitive arrays**
+   - Add `ksbonjson_decode_int64_array()` to C
+   - Swift calls once instead of N times
+   - Reduces per-element overhead from 160ns to ~10ns
+
+2. **Lazy key cache**
+   - Don't build full key cache upfront
+   - Build on first access to each key
+   - Helps when not all keys are accessed
+
+3. **Container pooling**
+   - Reuse container objects for same struct type
+   - Avoid repeated dictionary allocation
+
+### Medium Term (5-10x improvement potential)
+
+4. **Code generation macro**
+   - `@BONJSONOptimized` generates direct decode
+   - Bypasses Codable for annotated types
+   - Swift 5.9+ macros
+
+5. **Specialized decoders for common patterns**
+   - `[Struct].self` uses batch container
+   - `[Int].self` uses C batch decode
+
+### Long Term (10x+ improvement potential)
+
+6. **Alternative API (non-Codable)**
+   - Direct struct construction from position map
+   - Zero protocol overhead
+   - Trading compatibility for speed
+
+---
+
+## Conclusion
+
+The profiling data shows that **C is not the bottleneck**. The C position map achieves 319 MB/s, which is competitive with the fastest JSON parsers. The bottleneck is Swift's Codable protocol machinery, which accounts for 94% of decode time.
+
+To significantly improve performance, we must either:
+1. Reduce Codable overhead through batching and caching
+2. Bypass Codable entirely through code generation
+
+Moving more work to C or adding SIMD will have minimal impact because the C layer is already fast and represents only 6% of total time.
+
+The good news: BONJSON's binary format means the C layer could theoretically achieve 1+ GB/s with SIMD. If we can reduce Codable overhead or bypass it, BONJSON could significantly outperform JSON.
