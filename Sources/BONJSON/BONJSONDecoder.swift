@@ -4,6 +4,37 @@
 import Foundation
 import CKSBonjson
 
+// MARK: - BufferView for Zero-Cost Buffer Access
+
+/// A lightweight view into a byte buffer with unchecked access in release builds.
+/// Similar to Apple's internal BufferView, this provides fast access without
+/// the overhead of Swift Array bounds checking.
+@usableFromInline
+struct _BufferView {
+    @usableFromInline let start: UnsafePointer<UInt8>
+    @usableFromInline let count: Int
+
+    @inline(__always) @usableFromInline
+    init(_ buffer: UnsafeBufferPointer<UInt8>) {
+        self.start = buffer.baseAddress!
+        self.count = buffer.count
+    }
+
+    /// Unchecked subscript - no bounds checking in release builds.
+    @inline(__always) @usableFromInline
+    subscript(unchecked offset: Int) -> UInt8 {
+        assert(offset >= 0 && offset < count, "BufferView index out of bounds")
+        return start[offset]
+    }
+
+    /// Get a slice as a new BufferView.
+    @inline(__always) @usableFromInline
+    func slice(offset: Int, length: Int) -> _BufferView {
+        assert(offset >= 0 && offset + length <= count, "BufferView slice out of bounds")
+        return _BufferView(UnsafeBufferPointer(start: start + offset, count: length))
+    }
+}
+
 /// An object that decodes instances of a data type from BONJSON data.
 ///
 /// Use `BONJSONDecoder` in the same way you would use `JSONDecoder`:
@@ -183,34 +214,35 @@ public enum BONJSONDecodingError: Error, CustomStringConvertible {
 /// Wraps the C position map API for Swift use.
 final class _PositionMap {
     /// The input data as a contiguous array - keeps pointer stable.
-    private let inputBytes: [UInt8]
+    private let inputBytes: ContiguousArray<UInt8>
 
     /// The map context.
     private var context: KSBONJSONMapContext
 
-    /// The entry buffer.
-    private var entries: [KSBONJSONMapEntry]
-
-    /// Precomputed subtree sizes for O(1) child access.
-    private var subtreeSizes: [Int]
+    /// The entry buffer - using ContiguousArray for better performance.
+    private var entries: ContiguousArray<KSBONJSONMapEntry>
 
     /// Precomputed next sibling index for each entry (index after subtree).
-    private var nextSibling: [Int]
+    /// Using ContiguousArray for cache-friendly access.
+    private var nextSibling: ContiguousArray<Int>
+
+    /// Cache for already-decoded strings, keyed by (offset, length).
+    /// This avoids creating duplicate String objects for repeated keys.
+    private var stringCache: [UInt64: String] = [:]
 
     /// Actual entry count after scanning.
-    private var entryCount: Int
+    @usableFromInline var entryCount: Int
 
     /// Root entry index.
-    private(set) var rootIndex: size_t
+    @usableFromInline private(set) var rootIndex: size_t
 
     init(data: Data) throws {
         // Copy to contiguous array to ensure stable pointer
-        self.inputBytes = Array(data)
+        self.inputBytes = ContiguousArray(data)
 
         // Estimate entry count
         let estimatedEntries = ksbonjson_map_estimateEntries(inputBytes.count)
-        self.entries = [KSBONJSONMapEntry](repeating: KSBONJSONMapEntry(), count: Int(estimatedEntries))
-        self.subtreeSizes = []  // Will be computed after scanning
+        self.entries = ContiguousArray<KSBONJSONMapEntry>(repeating: KSBONJSONMapEntry(), count: Int(estimatedEntries))
         self.nextSibling = []   // Will be computed after scanning
         self.entryCount = 0
         self.context = KSBONJSONMapContext()
@@ -238,16 +270,14 @@ final class _PositionMap {
         self.rootIndex = ksbonjson_map_root(&context)
         self.entryCount = Int(ksbonjson_map_count(&context))
 
-        // Precompute subtree sizes and next sibling indices for O(1) child access
-        self.subtreeSizes = computeSubtreeSizes()
-        self.nextSibling = subtreeSizes.enumerated().map { $0.offset + $0.element }
+        // Precompute next sibling indices for O(1) child navigation
+        self.nextSibling = computeNextSiblingIndices()
     }
 
-    /// Compute subtree sizes for all entries in reverse order.
-    /// Each container's size = 1 + sum of child sizes.
-    /// Primitives have size 1.
-    private func computeSubtreeSizes() -> [Int] {
-        var sizes = [Int](repeating: 1, count: entryCount)
+    /// Compute next sibling indices for all entries.
+    /// nextSibling[i] = index of the entry after the subtree rooted at i.
+    private func computeNextSiblingIndices() -> ContiguousArray<Int> {
+        var sizes = ContiguousArray<Int>(repeating: 1, count: entryCount)
 
         // Process in reverse order so children are computed before parents
         for i in stride(from: entryCount - 1, through: 0, by: -1) {
@@ -266,10 +296,15 @@ final class _PositionMap {
             // Primitives already have size 1
         }
 
-        return sizes
+        // Convert sizes to next sibling indices: nextSibling[i] = i + size[i]
+        return ContiguousArray(sizes.enumerated().map { $0.offset + $0.element })
     }
 
-    /// Get entry at index.
+    /// Sentinel value indicating "not found".
+    @usableFromInline static let notFound: size_t = -1
+
+    /// Get entry at index - inlined for performance.
+    @inline(__always)
     func getEntry(at index: size_t) -> KSBONJSONMapEntry? {
         guard index >= 0 && index < entryCount else {
             return nil
@@ -277,7 +312,16 @@ final class _PositionMap {
         return entries[Int(index)]
     }
 
+    /// Get entry at index without bounds checking - caller must ensure validity.
+    @inline(__always) @usableFromInline
+    func getEntryUnchecked(at index: Int) -> KSBONJSONMapEntry {
+        assert(index >= 0 && index < entryCount, "Entry index out of bounds")
+        return entries[index]
+    }
+
     /// Get string data - reads from stored input bytes using entry offset/length.
+    /// Uses caching to avoid creating duplicate String objects for repeated keys.
+    @inline(__always)
     func getString(at index: size_t) -> String? {
         guard index >= 0 && index < entryCount else {
             return nil
@@ -295,27 +339,28 @@ final class _PositionMap {
             return nil
         }
 
-        // Create string directly from the input bytes
-        return inputBytes.withUnsafeBufferPointer { ptr in
+        // Pack offset and length into a single UInt64 key for cache lookup
+        let cacheKey = UInt64(offset) << 32 | UInt64(length)
+
+        // Check cache first
+        if let cached = stringCache[cacheKey] {
+            return cached
+        }
+
+        // Create string directly from the input bytes using unchecked access
+        let string = inputBytes.withUnsafeBufferPointer { ptr in
             let start = ptr.baseAddress! + offset
             let buffer = UnsafeBufferPointer(start: start, count: length)
             return String(decoding: buffer, as: UTF8.self)
         }
+
+        // Cache for future lookups
+        stringCache[cacheKey] = string
+        return string
     }
 
-    /// Sentinel value indicating "not found".
-    static let notFound: size_t = -1
-
-    /// Get cached subtree size at index.
+    /// Get child entry index - inlined for performance.
     @inline(__always)
-    private func subtreeSize(at index: Int) -> Int {
-        guard index >= 0 && index < subtreeSizes.count else {
-            return 1
-        }
-        return subtreeSizes[index]
-    }
-
-    /// Get child entry index.
     func getChild(containerIndex: size_t, childIndex: size_t) -> size_t {
         guard containerIndex >= 0 && containerIndex < entryCount else {
             return Self.notFound
@@ -339,7 +384,19 @@ final class _PositionMap {
         return size_t(currentIndex)
     }
 
-    /// Find key in object.
+    /// Get child entry index without bounds checking - caller must ensure validity.
+    @inline(__always) @usableFromInline
+    func getChildUnchecked(containerIndex: Int, childIndex: Int) -> Int {
+        let entry = entries[containerIndex]
+        var currentIndex = Int(entry.data.container.firstChild)
+        for _ in 0..<childIndex {
+            currentIndex = nextSibling[currentIndex]
+        }
+        return currentIndex
+    }
+
+    /// Find key in object - inlined for performance.
+    @inline(__always)
     func findKey(objectIndex: size_t, key: String) -> size_t {
         guard objectIndex >= 0 && objectIndex < entryCount else {
             return Self.notFound
@@ -350,49 +407,62 @@ final class _PositionMap {
             return Self.notFound
         }
 
+        // Cache UTF-8 count to avoid repeated computation
+        let keyUTF8Count = key.utf8.count
+
         // Object children are stored as key, value, key, value, ...
         let pairCount = Int(objEntry.data.container.count) / 2
         var currentIndex = Int(objEntry.data.container.firstChild)
 
-        for _ in 0..<pairCount {
-            let keyIndex = currentIndex
-            guard keyIndex < entryCount else {
-                break
-            }
+        // Use withUnsafeBufferPointer once for all comparisons
+        return inputBytes.withUnsafeBufferPointer { ptr in
+            for _ in 0..<pairCount {
+                let keyIndex = currentIndex
+                guard keyIndex < entryCount else {
+                    break
+                }
 
-            let keyEntry = entries[keyIndex]
+                let keyEntry = entries[keyIndex]
 
-            // Advance past the key using nextSibling
-            let valueIndex = nextSibling[keyIndex]
-            // Advance past the value for next iteration
-            currentIndex = nextSibling[valueIndex]
+                // Advance past the key using nextSibling
+                let valueIndex = nextSibling[keyIndex]
+                // Advance past the value for next iteration
+                currentIndex = nextSibling[valueIndex]
 
-            guard keyEntry.type == KSBONJSON_TYPE_STRING else {
-                continue
-            }
+                guard keyEntry.type == KSBONJSON_TYPE_STRING else {
+                    continue
+                }
 
-            let keyOffset = Int(keyEntry.data.string.offset)
-            let keyLength = Int(keyEntry.data.string.length)
+                let keyOffset = Int(keyEntry.data.string.offset)
+                let keyLength = Int(keyEntry.data.string.length)
 
-            // Compare key strings
-            if keyLength == key.utf8.count {
-                let keyMatches = inputBytes.withUnsafeBufferPointer { ptr in
-                    key.withCString { cString in
+                // Compare key strings - fast path: check length first
+                if keyLength == keyUTF8Count {
+                    let keyMatches = key.withCString { cString in
                         memcmp(ptr.baseAddress! + keyOffset, cString, keyLength) == 0
                     }
-                }
-                if keyMatches {
-                    return size_t(valueIndex)
+                    if keyMatches {
+                        return size_t(valueIndex)
+                    }
                 }
             }
+            return Self.notFound
         }
-
-        return Self.notFound
     }
 
     /// Get entry count.
+    @inline(__always)
     var count: size_t {
-        return size_t(entries.count)
+        return size_t(entryCount)
+    }
+
+    /// Get next sibling index (exposed for key cache building).
+    @inline(__always)
+    func nextSiblingIndex(_ index: Int) -> Int {
+        guard index >= 0 && index < nextSibling.count else {
+            return index + 1
+        }
+        return nextSibling[index]
     }
 }
 
@@ -483,8 +553,9 @@ final class _MapDecoder: Decoder {
         )
     }
 
-    // MARK: - Value Reading
+    // MARK: - Value Reading (Hot Paths)
 
+    @inline(__always)
     func decodeString() throws -> String {
         guard let entry = state.map.getEntry(at: entryIndex) else {
             throw BONJSONDecodingError.unexpectedEndOfData
@@ -501,6 +572,7 @@ final class _MapDecoder: Decoder {
         return string
     }
 
+    @inline(__always)
     func decodeInt64() throws -> Int64 {
         guard let entry = state.map.getEntry(at: entryIndex) else {
             throw BONJSONDecodingError.unexpectedEndOfData
@@ -520,6 +592,7 @@ final class _MapDecoder: Decoder {
         }
     }
 
+    @inline(__always)
     func decodeUInt64() throws -> UInt64 {
         guard let entry = state.map.getEntry(at: entryIndex) else {
             throw BONJSONDecodingError.unexpectedEndOfData
@@ -539,6 +612,7 @@ final class _MapDecoder: Decoder {
         }
     }
 
+    @inline(__always)
     func decodeDouble() throws -> Double {
         guard let entry = state.map.getEntry(at: entryIndex) else {
             throw BONJSONDecodingError.unexpectedEndOfData
@@ -562,6 +636,7 @@ final class _MapDecoder: Decoder {
         }
     }
 
+    @inline(__always)
     func decodeBool() throws -> Bool {
         guard let entry = state.map.getEntry(at: entryIndex) else {
             throw BONJSONDecodingError.unexpectedEndOfData
@@ -577,6 +652,7 @@ final class _MapDecoder: Decoder {
         }
     }
 
+    @inline(__always)
     func decodeNil() -> Bool {
         guard let entry = state.map.getEntry(at: entryIndex) else {
             return false
@@ -663,23 +739,46 @@ struct _MapKeyedDecodingContainer<Key: CodingKey>: KeyedDecodingContainerProtoco
     /// All keys in this object.
     private(set) var allKeys: [Key] = []
 
+    /// Cached key -> value index mapping for O(1) lookup.
+    private let keyCache: [String: size_t]
+
     init(state: _MapDecoderState, objectIndex: size_t, entry: KSBONJSONMapEntry, codingPath: [CodingKey]) {
         self.state = state
         self.objectIndex = objectIndex
         self.entry = entry
         self.codingPath = codingPath
 
-        // Build allKeys
+        // Build key cache first (doesn't need self)
         let pairCount = Int(entry.data.container.count) / 2
-        for i in 0..<pairCount {
-            let keyIndex = state.map.getChild(containerIndex: objectIndex, childIndex: size_t(i * 2))
-            if let keyString = state.map.getString(at: keyIndex) {
-                let convertedKey = convertKey(keyString)
-                if let key = Key(stringValue: convertedKey) {
-                    allKeys.append(key)
-                }
+        var cache: [String: size_t] = [:]
+        cache.reserveCapacity(pairCount)
+
+        var currentIndex = Int(entry.data.container.firstChild)
+        for _ in 0..<pairCount {
+            let keyIndex = currentIndex
+            // Move to value index using nextSibling
+            let valueIndex = state.map.nextSiblingIndex(keyIndex)
+            // Move past value for next iteration
+            currentIndex = state.map.nextSiblingIndex(valueIndex)
+
+            if let keyString = state.map.getString(at: size_t(keyIndex)) {
+                // Cache with original key
+                cache[keyString] = size_t(valueIndex)
             }
         }
+
+        self.keyCache = cache
+
+        // Now build allKeys (can use self.convertKey since all stored properties initialized)
+        var keys: [Key] = []
+        keys.reserveCapacity(pairCount)
+        for keyString in cache.keys {
+            let convertedKey = convertKey(keyString)
+            if let key = Key(stringValue: convertedKey) {
+                keys.append(key)
+            }
+        }
+        self.allKeys = keys
     }
 
     private func convertKey(_ key: String) -> String {
@@ -694,30 +793,43 @@ struct _MapKeyedDecodingContainer<Key: CodingKey>: KeyedDecodingContainerProtoco
     }
 
     /// Find the original key string that matches the given key after conversion.
+    /// Fast path: if using default keys, the key string IS the original key.
+    @inline(__always)
     private func findOriginalKey(_ key: Key) -> String {
-        let pairCount = Int(entry.data.container.count) / 2
-        for i in 0..<pairCount {
-            let keyIndex = state.map.getChild(containerIndex: objectIndex, childIndex: size_t(i * 2))
-            if let keyString = state.map.getString(at: keyIndex) {
-                let convertedKey = convertKey(keyString)
-                if convertedKey == key.stringValue {
-                    return keyString
+        switch state.keyDecodingStrategy {
+        case .useDefaultKeys:
+            // Fast path: no conversion needed
+            return key.stringValue
+        default:
+            // Slow path: need to find the original key that converts to this key
+            let pairCount = Int(entry.data.container.count) / 2
+            var currentIndex = Int(entry.data.container.firstChild)
+            for _ in 0..<pairCount {
+                let keyIndex = currentIndex
+                let valueIndex = state.map.nextSiblingIndex(keyIndex)
+                currentIndex = state.map.nextSiblingIndex(valueIndex)
+
+                if let keyString = state.map.getString(at: size_t(keyIndex)) {
+                    let convertedKey = convertKey(keyString)
+                    if convertedKey == key.stringValue {
+                        return keyString
+                    }
                 }
             }
+            return key.stringValue
         }
-        return key.stringValue
     }
 
+    @inline(__always)
     func contains(_ key: Key) -> Bool {
         let originalKey = findOriginalKey(key)
-        let valueIndex = state.map.findKey(objectIndex: objectIndex, key: originalKey)
-        return valueIndex != _PositionMap.notFound
+        return keyCache[originalKey] != nil
     }
 
+    @inline(__always)
     private func valueIndex(forKey key: Key) throws -> size_t {
         let originalKey = findOriginalKey(key)
-        let valueIdx = state.map.findKey(objectIndex: objectIndex, key: originalKey)
-        guard valueIdx != _PositionMap.notFound else {
+        guard let valueIdx = keyCache[originalKey] else {
             throw DecodingError.keyNotFound(key, DecodingError.Context(
                 codingPath: codingPath,
                 debugDescription: "Key '\(key.stringValue)' not found"
@@ -726,73 +838,122 @@ struct _MapKeyedDecodingContainer<Key: CodingKey>: KeyedDecodingContainerProtoco
         return valueIdx
     }
 
+    /// Get entry for key - inlined hot path.
+    @inline(__always)
+    private func entryForKey(_ key: Key) throws -> KSBONJSONMapEntry {
+        let idx = try valueIndex(forKey: key)
+        guard let entry = state.map.getEntry(at: idx) else {
+            throw BONJSONDecodingError.unexpectedEndOfData
+        }
+        return entry
+    }
+
+    /// Only create full decoder when needed for nested types.
     private func decoder(forKey key: Key) throws -> _MapDecoder {
         let idx = try valueIndex(forKey: key)
         return _MapDecoder(state: state, entryIndex: idx, codingPath: codingPath + [key])
     }
 
     func decodeNil(forKey key: Key) throws -> Bool {
-        let idx = try valueIndex(forKey: key)
-        guard let entry = state.map.getEntry(at: idx) else {
-            return false
-        }
+        let entry = try entryForKey(key)
         return entry.type == KSBONJSON_TYPE_NULL
     }
 
+    @inline(__always)
     func decode(_ type: Bool.Type, forKey key: Key) throws -> Bool {
-        return try decoder(forKey: key).decodeBool()
+        let entry = try entryForKey(key)
+        switch entry.type {
+        case KSBONJSON_TYPE_TRUE: return true
+        case KSBONJSON_TYPE_FALSE: return false
+        default: throw BONJSONDecodingError.typeMismatch(expected: "boolean", actual: describeType(entry.type))
+        }
     }
 
+    @inline(__always)
     func decode(_ type: String.Type, forKey key: Key) throws -> String {
-        return try decoder(forKey: key).decodeString()
+        let idx = try valueIndex(forKey: key)
+        guard let string = state.map.getString(at: idx) else {
+            throw BONJSONDecodingError.invalidUTF8String
+        }
+        return string
     }
 
+    @inline(__always)
     func decode(_ type: Double.Type, forKey key: Key) throws -> Double {
-        return try decoder(forKey: key).decodeDouble()
+        let entry = try entryForKey(key)
+        switch entry.type {
+        case KSBONJSON_TYPE_FLOAT: return entry.data.floatValue
+        case KSBONJSON_TYPE_INT: return Double(entry.data.intValue)
+        case KSBONJSON_TYPE_UINT: return Double(entry.data.uintValue)
+        case KSBONJSON_TYPE_BIGNUMBER:
+            let bn = entry.data.bigNumber
+            let significand = Double(bn.significand)
+            let result = significand * pow(10.0, Double(bn.exponent))
+            return bn.sign < 0 ? -result : result
+        default: throw BONJSONDecodingError.typeMismatch(expected: "float", actual: describeType(entry.type))
+        }
     }
 
+    @inline(__always)
     func decode(_ type: Float.Type, forKey key: Key) throws -> Float {
-        return Float(try decoder(forKey: key).decodeDouble())
+        return Float(try decode(Double.self, forKey: key))
     }
 
-    func decode(_ type: Int.Type, forKey key: Key) throws -> Int {
-        return Int(try decoder(forKey: key).decodeInt64())
+    @inline(__always)
+    private func decodeInt64ForKey(_ key: Key) throws -> Int64 {
+        let entry = try entryForKey(key)
+        switch entry.type {
+        case KSBONJSON_TYPE_INT: return entry.data.intValue
+        case KSBONJSON_TYPE_UINT:
+            let value = entry.data.uintValue
+            guard value <= UInt64(Int64.max) else {
+                throw BONJSONDecodingError.typeMismatch(expected: "Int64", actual: "UInt64 too large")
+            }
+            return Int64(value)
+        default: throw BONJSONDecodingError.typeMismatch(expected: "integer", actual: describeType(entry.type))
+        }
     }
 
-    func decode(_ type: Int8.Type, forKey key: Key) throws -> Int8 {
-        return Int8(try decoder(forKey: key).decodeInt64())
+    @inline(__always)
+    private func decodeUInt64ForKey(_ key: Key) throws -> UInt64 {
+        let entry = try entryForKey(key)
+        switch entry.type {
+        case KSBONJSON_TYPE_UINT: return entry.data.uintValue
+        case KSBONJSON_TYPE_INT:
+            let value = entry.data.intValue
+            guard value >= 0 else {
+                throw BONJSONDecodingError.typeMismatch(expected: "UInt64", actual: "negative integer")
+            }
+            return UInt64(value)
+        default: throw BONJSONDecodingError.typeMismatch(expected: "unsigned integer", actual: describeType(entry.type))
+        }
     }
 
-    func decode(_ type: Int16.Type, forKey key: Key) throws -> Int16 {
-        return Int16(try decoder(forKey: key).decodeInt64())
-    }
+    @inline(__always) func decode(_ type: Int.Type, forKey key: Key) throws -> Int { return Int(try decodeInt64ForKey(key)) }
+    @inline(__always) func decode(_ type: Int8.Type, forKey key: Key) throws -> Int8 { return Int8(try decodeInt64ForKey(key)) }
+    @inline(__always) func decode(_ type: Int16.Type, forKey key: Key) throws -> Int16 { return Int16(try decodeInt64ForKey(key)) }
+    @inline(__always) func decode(_ type: Int32.Type, forKey key: Key) throws -> Int32 { return Int32(try decodeInt64ForKey(key)) }
+    @inline(__always) func decode(_ type: Int64.Type, forKey key: Key) throws -> Int64 { return try decodeInt64ForKey(key) }
+    @inline(__always) func decode(_ type: UInt.Type, forKey key: Key) throws -> UInt { return UInt(try decodeUInt64ForKey(key)) }
+    @inline(__always) func decode(_ type: UInt8.Type, forKey key: Key) throws -> UInt8 { return UInt8(try decodeUInt64ForKey(key)) }
+    @inline(__always) func decode(_ type: UInt16.Type, forKey key: Key) throws -> UInt16 { return UInt16(try decodeUInt64ForKey(key)) }
+    @inline(__always) func decode(_ type: UInt32.Type, forKey key: Key) throws -> UInt32 { return UInt32(try decodeUInt64ForKey(key)) }
+    @inline(__always) func decode(_ type: UInt64.Type, forKey key: Key) throws -> UInt64 { return try decodeUInt64ForKey(key) }
 
-    func decode(_ type: Int32.Type, forKey key: Key) throws -> Int32 {
-        return Int32(try decoder(forKey: key).decodeInt64())
-    }
-
-    func decode(_ type: Int64.Type, forKey key: Key) throws -> Int64 {
-        return try decoder(forKey: key).decodeInt64()
-    }
-
-    func decode(_ type: UInt.Type, forKey key: Key) throws -> UInt {
-        return UInt(try decoder(forKey: key).decodeUInt64())
-    }
-
-    func decode(_ type: UInt8.Type, forKey key: Key) throws -> UInt8 {
-        return UInt8(try decoder(forKey: key).decodeUInt64())
-    }
-
-    func decode(_ type: UInt16.Type, forKey key: Key) throws -> UInt16 {
-        return UInt16(try decoder(forKey: key).decodeUInt64())
-    }
-
-    func decode(_ type: UInt32.Type, forKey key: Key) throws -> UInt32 {
-        return UInt32(try decoder(forKey: key).decodeUInt64())
-    }
-
-    func decode(_ type: UInt64.Type, forKey key: Key) throws -> UInt64 {
-        return try decoder(forKey: key).decodeUInt64()
+    private func describeType(_ type: KSBONJSONValueType) -> String {
+        switch type {
+        case KSBONJSON_TYPE_NULL: return "null"
+        case KSBONJSON_TYPE_TRUE: return "true"
+        case KSBONJSON_TYPE_FALSE: return "false"
+        case KSBONJSON_TYPE_INT: return "integer"
+        case KSBONJSON_TYPE_UINT: return "unsigned integer"
+        case KSBONJSON_TYPE_FLOAT: return "float"
+        case KSBONJSON_TYPE_BIGNUMBER: return "big number"
+        case KSBONJSON_TYPE_STRING: return "string"
+        case KSBONJSON_TYPE_ARRAY: return "array"
+        case KSBONJSON_TYPE_OBJECT: return "object"
+        default: return "unknown"
+        }
     }
 
     func decode<T: Decodable>(_ type: T.Type, forKey key: Key) throws -> T {
@@ -843,13 +1004,18 @@ struct _MapUnkeyedDecodingContainer: UnkeyedDecodingContainer {
     let arrayIndex: size_t
     let entry: KSBONJSONMapEntry
     let codingPath: [CodingKey]
+    let elementCount: Int
 
+    /// Current logical index (0-based position in array).
     private(set) var currentIndex: Int = 0
 
-    var count: Int? { Int(entry.data.container.count) }
+    /// Current entry index in the position map - tracked for O(1) sequential access.
+    private var currentEntryIndex: Int
+
+    var count: Int? { elementCount }
 
     var isAtEnd: Bool {
-        return currentIndex >= Int(entry.data.container.count)
+        return currentIndex >= elementCount
     }
 
     init(state: _MapDecoderState, arrayIndex: size_t, entry: KSBONJSONMapEntry, codingPath: [CodingKey]) {
@@ -857,8 +1023,31 @@ struct _MapUnkeyedDecodingContainer: UnkeyedDecodingContainer {
         self.arrayIndex = arrayIndex
         self.entry = entry
         self.codingPath = codingPath
+        self.elementCount = Int(entry.data.container.count)
+        self.currentEntryIndex = Int(entry.data.container.firstChild)
     }
 
+    /// Get next entry - O(1) sequential access using tracked entry index.
+    @inline(__always)
+    private mutating func nextEntry() throws -> (index: Int, entry: KSBONJSONMapEntry) {
+        guard !isAtEnd else {
+            throw DecodingError.valueNotFound(Any.self, DecodingError.Context(
+                codingPath: codingPath,
+                debugDescription: "Unkeyed container is at end"
+            ))
+        }
+
+        let entryIdx = currentEntryIndex
+        let entry = state.map.getEntryUnchecked(at: entryIdx)
+
+        // Advance to next element using nextSibling
+        currentEntryIndex = state.map.nextSiblingIndex(entryIdx)
+        currentIndex += 1
+
+        return (entryIdx, entry)
+    }
+
+    /// Only create full decoder when needed for nested types.
     private mutating func nextDecoder() throws -> _MapDecoder {
         guard !isAtEnd else {
             throw DecodingError.valueNotFound(Any.self, DecodingError.Context(
@@ -867,83 +1056,129 @@ struct _MapUnkeyedDecodingContainer: UnkeyedDecodingContainer {
             ))
         }
 
-        let childIndex = state.map.getChild(containerIndex: arrayIndex, childIndex: size_t(currentIndex))
+        let entryIdx = currentEntryIndex
         let decoder = _MapDecoder(
             state: state,
-            entryIndex: childIndex,
+            entryIndex: size_t(entryIdx),
             codingPath: codingPath + [_BONJSONIndexKey(index: currentIndex)]
         )
+
+        // Advance to next element using nextSibling
+        currentEntryIndex = state.map.nextSiblingIndex(entryIdx)
         currentIndex += 1
+
         return decoder
     }
 
     mutating func decodeNil() throws -> Bool {
         guard !isAtEnd else { return false }
-        let childIndex = state.map.getChild(containerIndex: arrayIndex, childIndex: size_t(currentIndex))
-        guard let entry = state.map.getEntry(at: childIndex) else {
-            return false
-        }
+        let entry = state.map.getEntryUnchecked(at: currentEntryIndex)
         if entry.type == KSBONJSON_TYPE_NULL {
+            currentEntryIndex = state.map.nextSiblingIndex(currentEntryIndex)
             currentIndex += 1
             return true
         }
         return false
     }
 
+    @inline(__always)
     mutating func decode(_ type: Bool.Type) throws -> Bool {
-        return try nextDecoder().decodeBool()
+        let (_, entry) = try nextEntry()
+        switch entry.type {
+        case KSBONJSON_TYPE_TRUE: return true
+        case KSBONJSON_TYPE_FALSE: return false
+        default: throw BONJSONDecodingError.typeMismatch(expected: "boolean", actual: describeType(entry.type))
+        }
     }
 
+    @inline(__always)
     mutating func decode(_ type: String.Type) throws -> String {
-        return try nextDecoder().decodeString()
+        let (idx, entry) = try nextEntry()
+        guard entry.type == KSBONJSON_TYPE_STRING else {
+            throw BONJSONDecodingError.typeMismatch(expected: "string", actual: describeType(entry.type))
+        }
+        guard let string = state.map.getString(at: size_t(idx)) else {
+            throw BONJSONDecodingError.invalidUTF8String
+        }
+        return string
     }
 
+    @inline(__always)
     mutating func decode(_ type: Double.Type) throws -> Double {
-        return try nextDecoder().decodeDouble()
+        let (_, entry) = try nextEntry()
+        switch entry.type {
+        case KSBONJSON_TYPE_FLOAT: return entry.data.floatValue
+        case KSBONJSON_TYPE_INT: return Double(entry.data.intValue)
+        case KSBONJSON_TYPE_UINT: return Double(entry.data.uintValue)
+        case KSBONJSON_TYPE_BIGNUMBER:
+            let bn = entry.data.bigNumber
+            let significand = Double(bn.significand)
+            let result = significand * pow(10.0, Double(bn.exponent))
+            return bn.sign < 0 ? -result : result
+        default: throw BONJSONDecodingError.typeMismatch(expected: "float", actual: describeType(entry.type))
+        }
     }
 
+    @inline(__always)
     mutating func decode(_ type: Float.Type) throws -> Float {
-        return Float(try nextDecoder().decodeDouble())
+        return Float(try decode(Double.self))
     }
 
-    mutating func decode(_ type: Int.Type) throws -> Int {
-        return Int(try nextDecoder().decodeInt64())
+    @inline(__always)
+    private mutating func decodeInt64Value() throws -> Int64 {
+        let (_, entry) = try nextEntry()
+        switch entry.type {
+        case KSBONJSON_TYPE_INT: return entry.data.intValue
+        case KSBONJSON_TYPE_UINT:
+            let value = entry.data.uintValue
+            guard value <= UInt64(Int64.max) else {
+                throw BONJSONDecodingError.typeMismatch(expected: "Int64", actual: "UInt64 too large")
+            }
+            return Int64(value)
+        default: throw BONJSONDecodingError.typeMismatch(expected: "integer", actual: describeType(entry.type))
+        }
     }
 
-    mutating func decode(_ type: Int8.Type) throws -> Int8 {
-        return Int8(try nextDecoder().decodeInt64())
+    @inline(__always)
+    private mutating func decodeUInt64Value() throws -> UInt64 {
+        let (_, entry) = try nextEntry()
+        switch entry.type {
+        case KSBONJSON_TYPE_UINT: return entry.data.uintValue
+        case KSBONJSON_TYPE_INT:
+            let value = entry.data.intValue
+            guard value >= 0 else {
+                throw BONJSONDecodingError.typeMismatch(expected: "UInt64", actual: "negative integer")
+            }
+            return UInt64(value)
+        default: throw BONJSONDecodingError.typeMismatch(expected: "unsigned integer", actual: describeType(entry.type))
+        }
     }
 
-    mutating func decode(_ type: Int16.Type) throws -> Int16 {
-        return Int16(try nextDecoder().decodeInt64())
-    }
+    @inline(__always) mutating func decode(_ type: Int.Type) throws -> Int { return Int(try decodeInt64Value()) }
+    @inline(__always) mutating func decode(_ type: Int8.Type) throws -> Int8 { return Int8(try decodeInt64Value()) }
+    @inline(__always) mutating func decode(_ type: Int16.Type) throws -> Int16 { return Int16(try decodeInt64Value()) }
+    @inline(__always) mutating func decode(_ type: Int32.Type) throws -> Int32 { return Int32(try decodeInt64Value()) }
+    @inline(__always) mutating func decode(_ type: Int64.Type) throws -> Int64 { return try decodeInt64Value() }
+    @inline(__always) mutating func decode(_ type: UInt.Type) throws -> UInt { return UInt(try decodeUInt64Value()) }
+    @inline(__always) mutating func decode(_ type: UInt8.Type) throws -> UInt8 { return UInt8(try decodeUInt64Value()) }
+    @inline(__always) mutating func decode(_ type: UInt16.Type) throws -> UInt16 { return UInt16(try decodeUInt64Value()) }
+    @inline(__always) mutating func decode(_ type: UInt32.Type) throws -> UInt32 { return UInt32(try decodeUInt64Value()) }
+    @inline(__always) mutating func decode(_ type: UInt64.Type) throws -> UInt64 { return try decodeUInt64Value() }
 
-    mutating func decode(_ type: Int32.Type) throws -> Int32 {
-        return Int32(try nextDecoder().decodeInt64())
-    }
-
-    mutating func decode(_ type: Int64.Type) throws -> Int64 {
-        return try nextDecoder().decodeInt64()
-    }
-
-    mutating func decode(_ type: UInt.Type) throws -> UInt {
-        return UInt(try nextDecoder().decodeUInt64())
-    }
-
-    mutating func decode(_ type: UInt8.Type) throws -> UInt8 {
-        return UInt8(try nextDecoder().decodeUInt64())
-    }
-
-    mutating func decode(_ type: UInt16.Type) throws -> UInt16 {
-        return UInt16(try nextDecoder().decodeUInt64())
-    }
-
-    mutating func decode(_ type: UInt32.Type) throws -> UInt32 {
-        return UInt32(try nextDecoder().decodeUInt64())
-    }
-
-    mutating func decode(_ type: UInt64.Type) throws -> UInt64 {
-        return try nextDecoder().decodeUInt64()
+    private func describeType(_ type: KSBONJSONValueType) -> String {
+        switch type {
+        case KSBONJSON_TYPE_NULL: return "null"
+        case KSBONJSON_TYPE_TRUE: return "true"
+        case KSBONJSON_TYPE_FALSE: return "false"
+        case KSBONJSON_TYPE_INT: return "integer"
+        case KSBONJSON_TYPE_UINT: return "unsigned integer"
+        case KSBONJSON_TYPE_FLOAT: return "float"
+        case KSBONJSON_TYPE_BIGNUMBER: return "big number"
+        case KSBONJSON_TYPE_STRING: return "string"
+        case KSBONJSON_TYPE_ARRAY: return "array"
+        case KSBONJSON_TYPE_OBJECT: return "object"
+        default: return "unknown"
+        }
     }
 
     mutating func decode<T: Decodable>(_ type: T.Type) throws -> T {
@@ -987,94 +1222,147 @@ struct _MapSingleValueDecodingContainer: SingleValueDecodingContainer {
     let state: _MapDecoderState
     let entryIndex: size_t
     let codingPath: [CodingKey]
+    /// Cached entry - avoid repeated lookups
+    private let entry: KSBONJSONMapEntry?
 
     init(state: _MapDecoderState, entryIndex: size_t, codingPath: [CodingKey]) {
         self.state = state
         self.entryIndex = entryIndex
         self.codingPath = codingPath
+        self.entry = state.map.getEntry(at: entryIndex)
     }
 
-    private func makeDecoder() -> _MapDecoder {
-        return _MapDecoder(state: state, entryIndex: entryIndex, codingPath: codingPath)
-    }
-
+    @inline(__always)
     func decodeNil() -> Bool {
-        return makeDecoder().decodeNil()
+        return entry?.type == KSBONJSON_TYPE_NULL
     }
 
+    @inline(__always)
     func decode(_ type: Bool.Type) throws -> Bool {
-        return try makeDecoder().decodeBool()
+        guard let entry = entry else {
+            throw BONJSONDecodingError.unexpectedEndOfData
+        }
+        switch entry.type {
+        case KSBONJSON_TYPE_TRUE: return true
+        case KSBONJSON_TYPE_FALSE: return false
+        default: throw BONJSONDecodingError.typeMismatch(expected: "boolean", actual: describeType(entry.type))
+        }
     }
 
+    @inline(__always)
     func decode(_ type: String.Type) throws -> String {
-        return try makeDecoder().decodeString()
+        guard let entry = entry, entry.type == KSBONJSON_TYPE_STRING else {
+            throw BONJSONDecodingError.typeMismatch(expected: "string", actual: entry.map { describeType($0.type) } ?? "nil")
+        }
+        guard let string = state.map.getString(at: entryIndex) else {
+            throw BONJSONDecodingError.invalidUTF8String
+        }
+        return string
     }
 
+    @inline(__always)
     func decode(_ type: Double.Type) throws -> Double {
-        return try makeDecoder().decodeDouble()
+        guard let entry = entry else {
+            throw BONJSONDecodingError.unexpectedEndOfData
+        }
+        switch entry.type {
+        case KSBONJSON_TYPE_FLOAT: return entry.data.floatValue
+        case KSBONJSON_TYPE_INT: return Double(entry.data.intValue)
+        case KSBONJSON_TYPE_UINT: return Double(entry.data.uintValue)
+        case KSBONJSON_TYPE_BIGNUMBER:
+            let bn = entry.data.bigNumber
+            let significand = Double(bn.significand)
+            let result = significand * pow(10.0, Double(bn.exponent))
+            return bn.sign < 0 ? -result : result
+        default: throw BONJSONDecodingError.typeMismatch(expected: "float", actual: describeType(entry.type))
+        }
     }
 
+    @inline(__always)
     func decode(_ type: Float.Type) throws -> Float {
-        return Float(try makeDecoder().decodeDouble())
+        return Float(try decode(Double.self))
     }
 
-    func decode(_ type: Int.Type) throws -> Int {
-        return Int(try makeDecoder().decodeInt64())
+    @inline(__always)
+    private func decodeInt64() throws -> Int64 {
+        guard let entry = entry else {
+            throw BONJSONDecodingError.unexpectedEndOfData
+        }
+        switch entry.type {
+        case KSBONJSON_TYPE_INT: return entry.data.intValue
+        case KSBONJSON_TYPE_UINT:
+            let value = entry.data.uintValue
+            guard value <= UInt64(Int64.max) else {
+                throw BONJSONDecodingError.typeMismatch(expected: "Int64", actual: "UInt64 too large")
+            }
+            return Int64(value)
+        default: throw BONJSONDecodingError.typeMismatch(expected: "integer", actual: describeType(entry.type))
+        }
     }
 
-    func decode(_ type: Int8.Type) throws -> Int8 {
-        return Int8(try makeDecoder().decodeInt64())
+    @inline(__always)
+    private func decodeUInt64() throws -> UInt64 {
+        guard let entry = entry else {
+            throw BONJSONDecodingError.unexpectedEndOfData
+        }
+        switch entry.type {
+        case KSBONJSON_TYPE_UINT: return entry.data.uintValue
+        case KSBONJSON_TYPE_INT:
+            let value = entry.data.intValue
+            guard value >= 0 else {
+                throw BONJSONDecodingError.typeMismatch(expected: "UInt64", actual: "negative integer")
+            }
+            return UInt64(value)
+        default: throw BONJSONDecodingError.typeMismatch(expected: "unsigned integer", actual: describeType(entry.type))
+        }
     }
 
-    func decode(_ type: Int16.Type) throws -> Int16 {
-        return Int16(try makeDecoder().decodeInt64())
-    }
+    @inline(__always) func decode(_ type: Int.Type) throws -> Int { return Int(try decodeInt64()) }
+    @inline(__always) func decode(_ type: Int8.Type) throws -> Int8 { return Int8(try decodeInt64()) }
+    @inline(__always) func decode(_ type: Int16.Type) throws -> Int16 { return Int16(try decodeInt64()) }
+    @inline(__always) func decode(_ type: Int32.Type) throws -> Int32 { return Int32(try decodeInt64()) }
+    @inline(__always) func decode(_ type: Int64.Type) throws -> Int64 { return try decodeInt64() }
+    @inline(__always) func decode(_ type: UInt.Type) throws -> UInt { return UInt(try decodeUInt64()) }
+    @inline(__always) func decode(_ type: UInt8.Type) throws -> UInt8 { return UInt8(try decodeUInt64()) }
+    @inline(__always) func decode(_ type: UInt16.Type) throws -> UInt16 { return UInt16(try decodeUInt64()) }
+    @inline(__always) func decode(_ type: UInt32.Type) throws -> UInt32 { return UInt32(try decodeUInt64()) }
+    @inline(__always) func decode(_ type: UInt64.Type) throws -> UInt64 { return try decodeUInt64() }
 
-    func decode(_ type: Int32.Type) throws -> Int32 {
-        return Int32(try makeDecoder().decodeInt64())
-    }
-
-    func decode(_ type: Int64.Type) throws -> Int64 {
-        return try makeDecoder().decodeInt64()
-    }
-
-    func decode(_ type: UInt.Type) throws -> UInt {
-        return UInt(try makeDecoder().decodeUInt64())
-    }
-
-    func decode(_ type: UInt8.Type) throws -> UInt8 {
-        return UInt8(try makeDecoder().decodeUInt64())
-    }
-
-    func decode(_ type: UInt16.Type) throws -> UInt16 {
-        return UInt16(try makeDecoder().decodeUInt64())
-    }
-
-    func decode(_ type: UInt32.Type) throws -> UInt32 {
-        return UInt32(try makeDecoder().decodeUInt64())
-    }
-
-    func decode(_ type: UInt64.Type) throws -> UInt64 {
-        return try makeDecoder().decodeUInt64()
+    private func describeType(_ type: KSBONJSONValueType) -> String {
+        switch type {
+        case KSBONJSON_TYPE_NULL: return "null"
+        case KSBONJSON_TYPE_TRUE: return "true"
+        case KSBONJSON_TYPE_FALSE: return "false"
+        case KSBONJSON_TYPE_INT: return "integer"
+        case KSBONJSON_TYPE_UINT: return "unsigned integer"
+        case KSBONJSON_TYPE_FLOAT: return "float"
+        case KSBONJSON_TYPE_BIGNUMBER: return "big number"
+        case KSBONJSON_TYPE_STRING: return "string"
+        case KSBONJSON_TYPE_ARRAY: return "array"
+        case KSBONJSON_TYPE_OBJECT: return "object"
+        default: return "unknown"
+        }
     }
 
     func decode<T: Decodable>(_ type: T.Type) throws -> T {
-        let decoder = makeDecoder()
-
+        // Handle special types inline without creating decoder
         if type == Date.self {
+            let decoder = _MapDecoder(state: state, entryIndex: entryIndex, codingPath: codingPath)
             return try decoder.decodeDate() as! T
         }
         if type == Data.self {
+            let decoder = _MapDecoder(state: state, entryIndex: entryIndex, codingPath: codingPath)
             return try decoder.decodeData() as! T
         }
         if type == URL.self {
-            let string = try decoder.decodeString()
+            let string = try decode(String.self)
             guard let url = URL(string: string) else {
                 throw BONJSONDecodingError.invalidURL(string)
             }
             return url as! T
         }
 
+        let decoder = _MapDecoder(state: state, entryIndex: entryIndex, codingPath: codingPath)
         return try T(from: decoder)
     }
 }

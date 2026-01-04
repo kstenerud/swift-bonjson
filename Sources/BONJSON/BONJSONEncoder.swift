@@ -186,10 +186,15 @@ final class _BufferEncoderState {
     }
 
     /// Ensure buffer has enough capacity for the given additional bytes.
+    @inline(__always)
     func ensureCapacity(_ additionalBytes: Int) {
         let required = bytesWritten + additionalBytes
         guard required > buffer.count else { return }
+        growBuffer(to: required)
+    }
 
+    /// Grow buffer to at least the required size (slow path, not inlined).
+    private func growBuffer(to required: Int) {
         // Grow buffer exponentially
         var newCapacity = buffer.count
         while newCapacity < required {
@@ -333,6 +338,7 @@ final class _BufferEncoder: Encoder {
         }
     }
 
+    @inline(__always)
     func encodeString(_ value: String) throws {
         let utf8Count = value.utf8.count
         state.ensureCapacity(Int(ksbonjson_maxEncodedSize_string(utf8Count)))
@@ -347,29 +353,32 @@ final class _BufferEncoder: Encoder {
         }
     }
 
+    @inline(__always)
     func encodeFloat(_ value: Double) throws {
-        if !value.isFinite {
-            switch state.nonConformingFloatEncodingStrategy {
-            case .throw:
-                throw BONJSONEncodingError.invalidFloat(value)
-            case .convertToString(let posInf, let negInf, let nan):
-                if value.isNaN {
-                    try encodeString(nan)
-                } else if value == .infinity {
-                    try encodeString(posInf)
-                } else {
-                    try encodeString(negInf)
-                }
-                return
+        // Fast path for finite values
+        if value.isFinite {
+            state.ensureCapacity(Int(ksbonjson_maxEncodedSize_float()))
+            let result = ksbonjson_encodeToBuffer_float(&state.context, value)
+            if result < 0 {
+                throw BONJSONEncodingError.encodingFailed(
+                    ksbonjson_describeEncodeStatus(ksbonjson_encodeStatus(rawValue: UInt32(-result))).map { String(cString: $0) } ?? "Unknown error"
+                )
             }
+            return
         }
 
-        state.ensureCapacity(Int(ksbonjson_maxEncodedSize_float()))
-        let result = ksbonjson_encodeToBuffer_float(&state.context, value)
-        if result < 0 {
-            throw BONJSONEncodingError.encodingFailed(
-                ksbonjson_describeEncodeStatus(ksbonjson_encodeStatus(rawValue: UInt32(-result))).map { String(cString: $0) } ?? "Unknown error"
-            )
+        // Slow path for non-finite values
+        switch state.nonConformingFloatEncodingStrategy {
+        case .throw:
+            throw BONJSONEncodingError.invalidFloat(value)
+        case .convertToString(let posInf, let negInf, let nan):
+            if value.isNaN {
+                try encodeString(nan)
+            } else if value == .infinity {
+                try encodeString(posInf)
+            } else {
+                try encodeString(negInf)
+            }
         }
     }
 
