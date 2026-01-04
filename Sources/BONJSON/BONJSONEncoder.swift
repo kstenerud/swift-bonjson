@@ -468,18 +468,6 @@ final class _BufferEncoder: Encoder {
             }
         }
     }
-
-    /// Converts a key according to the key encoding strategy.
-    func convertedKey(_ key: CodingKey) -> String {
-        switch state.keyEncodingStrategy {
-        case .useDefaultKeys:
-            return key.stringValue
-        case .convertToSnakeCase:
-            return key.stringValue.convertToSnakeCase()
-        case .custom(let converter):
-            return converter(codingPath + [key]).stringValue
-        }
-    }
 }
 
 // MARK: - Keyed Encoding Container

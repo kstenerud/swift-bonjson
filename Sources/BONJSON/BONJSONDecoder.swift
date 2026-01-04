@@ -4,37 +4,6 @@
 import Foundation
 import CKSBonjson
 
-// MARK: - BufferView for Zero-Cost Buffer Access
-
-/// A lightweight view into a byte buffer with unchecked access in release builds.
-/// Similar to Apple's internal BufferView, this provides fast access without
-/// the overhead of Swift Array bounds checking.
-@usableFromInline
-struct _BufferView {
-    @usableFromInline let start: UnsafePointer<UInt8>
-    @usableFromInline let count: Int
-
-    @inline(__always) @usableFromInline
-    init(_ buffer: UnsafeBufferPointer<UInt8>) {
-        self.start = buffer.baseAddress!
-        self.count = buffer.count
-    }
-
-    /// Unchecked subscript - no bounds checking in release builds.
-    @inline(__always) @usableFromInline
-    subscript(unchecked offset: Int) -> UInt8 {
-        assert(offset >= 0 && offset < count, "BufferView index out of bounds")
-        return start[offset]
-    }
-
-    /// Get a slice as a new BufferView.
-    @inline(__always) @usableFromInline
-    func slice(offset: Int, length: Int) -> _BufferView {
-        assert(offset >= 0 && offset + length <= count, "BufferView slice out of bounds")
-        return _BufferView(UnsafeBufferPointer(start: start + offset, count: length))
-    }
-}
-
 /// An object that decodes instances of a data type from BONJSON data.
 ///
 /// Use `BONJSONDecoder` in the same way you would use `JSONDecoder`:
@@ -379,9 +348,6 @@ final class _PositionMap {
         return ContiguousArray(sizes.enumerated().map { $0.offset + $0.element })
     }
 
-    /// Sentinel value indicating "not found".
-    @usableFromInline static let notFound: size_t = -1
-
     /// Get entry at index - inlined for performance.
     @inline(__always)
     func getEntry(at index: size_t) -> KSBONJSONMapEntry? {
@@ -436,97 +402,6 @@ final class _PositionMap {
         // Cache for future lookups
         stringCache[cacheKey] = string
         return string
-    }
-
-    /// Get child entry index - inlined for performance.
-    @inline(__always)
-    func getChild(containerIndex: size_t, childIndex: size_t) -> size_t {
-        guard containerIndex >= 0 && containerIndex < entryCount else {
-            return Self.notFound
-        }
-
-        let entry = entries[Int(containerIndex)]
-        guard entry.type == KSBONJSON_TYPE_ARRAY || entry.type == KSBONJSON_TYPE_OBJECT else {
-            return Self.notFound
-        }
-
-        if childIndex >= entry.data.container.count {
-            return Self.notFound
-        }
-
-        // Walk from firstChild, using nextSibling for O(1) per step
-        var currentIndex = Int(entry.data.container.firstChild)
-        for _ in 0..<childIndex {
-            currentIndex = nextSibling[currentIndex]
-        }
-
-        return size_t(currentIndex)
-    }
-
-    /// Get child entry index without bounds checking - caller must ensure validity.
-    @inline(__always) @usableFromInline
-    func getChildUnchecked(containerIndex: Int, childIndex: Int) -> Int {
-        let entry = entries[containerIndex]
-        var currentIndex = Int(entry.data.container.firstChild)
-        for _ in 0..<childIndex {
-            currentIndex = nextSibling[currentIndex]
-        }
-        return currentIndex
-    }
-
-    /// Find key in object - inlined for performance.
-    @inline(__always)
-    func findKey(objectIndex: size_t, key: String) -> size_t {
-        guard objectIndex >= 0 && objectIndex < entryCount else {
-            return Self.notFound
-        }
-
-        let objEntry = entries[Int(objectIndex)]
-        guard objEntry.type == KSBONJSON_TYPE_OBJECT else {
-            return Self.notFound
-        }
-
-        // Cache UTF-8 count to avoid repeated computation
-        let keyUTF8Count = key.utf8.count
-
-        // Object children are stored as key, value, key, value, ...
-        let pairCount = Int(objEntry.data.container.count) / 2
-        var currentIndex = Int(objEntry.data.container.firstChild)
-
-        // Use withUnsafeBufferPointer once for all comparisons
-        return inputBytes.withUnsafeBufferPointer { ptr in
-            for _ in 0..<pairCount {
-                let keyIndex = currentIndex
-                guard keyIndex < entryCount else {
-                    break
-                }
-
-                let keyEntry = entries[keyIndex]
-
-                // Advance past the key using nextSibling
-                let valueIndex = nextSibling[keyIndex]
-                // Advance past the value for next iteration
-                currentIndex = nextSibling[valueIndex]
-
-                guard keyEntry.type == KSBONJSON_TYPE_STRING else {
-                    continue
-                }
-
-                let keyOffset = Int(keyEntry.data.string.offset)
-                let keyLength = Int(keyEntry.data.string.length)
-
-                // Compare key strings - fast path: check length first
-                if keyLength == keyUTF8Count {
-                    let keyMatches = key.withCString { cString in
-                        memcmp(ptr.baseAddress! + keyOffset, cString, keyLength) == 0
-                    }
-                    if keyMatches {
-                        return size_t(valueIndex)
-                    }
-                }
-            }
-            return Self.notFound
-        }
     }
 
     /// Get entry count.
