@@ -738,6 +738,7 @@ final class _PositionMap {
 // MARK: - Decoder State
 
 /// Shared state for the map-based decoder.
+
 final class _MapDecoderState {
     let map: _PositionMap
     let userInfo: [CodingUserInfoKey: Any]
@@ -1004,37 +1005,33 @@ final class _MapDecoder: Decoder {
 /// Profiling shows linear search is 1.5x faster than dictionary (98 ns vs 147 ns per field).
 private let kSmallObjectThreshold = 12
 
+/// Lazy key lookup state - built on demand to avoid overhead for small objects.
+/// Uses a class to allow lazy mutation from within the struct container.
+private final class _LazyKeyState {
+    var keyCache: [String: size_t]?
+    let pairCount: Int
+    let firstChildIndex: Int
+    let useLinearSearch: Bool
+
+    init(entry: KSBONJSONMapEntry) {
+        self.pairCount = Int(entry.data.container.count) / 2
+        self.firstChildIndex = Int(entry.data.container.firstChild)
+        self.useLinearSearch = pairCount <= kSmallObjectThreshold
+    }
+}
+
 struct _MapKeyedDecodingContainer<Key: CodingKey>: KeyedDecodingContainerProtocol {
     let state: _MapDecoderState
     let objectIndex: size_t
     let entry: KSBONJSONMapEntry
     let codingPath: [CodingKey]
 
-    /// Lazy state holder - uses class for reference semantics across struct copies.
-    private final class _LazyKeyState {
-        var keyCache: [String: size_t]?
-        var allKeysCache: [Key]?
-        let pairCount: Int
-        let firstChildIndex: Int
-        let useLinearSearch: Bool
-
-        init(entry: KSBONJSONMapEntry) {
-            self.pairCount = Int(entry.data.container.count) / 2
-            self.firstChildIndex = Int(entry.data.container.firstChild)
-            self.useLinearSearch = pairCount <= kSmallObjectThreshold
-        }
-    }
-
+    /// Lazy key lookup state - uses a class to allow mutation from value type.
     private let lazyState: _LazyKeyState
 
-    /// All keys in this object - built lazily on first access.
+    /// All keys in this object - built on demand (not cached, since rarely used).
     var allKeys: [Key] {
-        if let cached = lazyState.allKeysCache {
-            return cached
-        }
-        let keys = buildAllKeys()
-        lazyState.allKeysCache = keys
-        return keys
+        return buildAllKeys()
     }
 
     init(state: _MapDecoderState, objectIndex: size_t, entry: KSBONJSONMapEntry, codingPath: [CodingKey]) {
@@ -1043,7 +1040,6 @@ struct _MapKeyedDecodingContainer<Key: CodingKey>: KeyedDecodingContainerProtoco
         self.entry = entry
         self.codingPath = codingPath
         self.lazyState = _LazyKeyState(entry: entry)
-        // Key cache is now lazy - built on first key lookup
     }
 
     /// Build allKeys array - only called when allKeys is accessed.

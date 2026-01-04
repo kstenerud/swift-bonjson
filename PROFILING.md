@@ -383,12 +383,24 @@ Increased `kSmallObjectThreshold` from 8 to 12 fields. Profiling showed linear s
 | 10-field objects | 1.66 ms | 865 µs | **1.9x faster** |
 | vs JSON ratio | 0.41x | 0.39x | **+5%** |
 
-**Current Status: BONJSON is 2.56x faster than JSON**
+**Current Status: BONJSON is 2.6x faster than JSON**
+
+### Phase 5: Container Pooling Investigation (Not Feasible)
+
+Investigated container state pooling to reuse `_LazyKeyState` instances across containers.
+
+**Finding: Not feasible with struct-based containers**
+
+The container pooling approach was abandoned because:
+1. `_MapKeyedDecodingContainer` is a struct (required by Swift's Codable protocol)
+2. Structs don't have deinitializers, so we can't return pooled objects when the container goes out of scope
+3. Without the ability to release back to the pool, pooling doesn't provide any benefit
+
+The original design with `_LazyKeyState` is already efficient - the class allocation overhead (~214 ns per container) is acceptable given the overall performance.
 
 ### Optional Future Optimizations
 
 If even more performance is needed:
 
-1. **Container pooling** - Reuse `_LazyKeyState` instances across similar objects
-2. **Specialized collection decode** - Share container state when decoding `[SomeStruct].self`
-3. **Code generation macro** - Generate direct struct construction, bypassing Codable entirely
+1. **Specialized collection decode** - Share container state when decoding `[SomeStruct].self`
+2. **Code generation macro** - Generate direct struct construction, bypassing Codable entirely
