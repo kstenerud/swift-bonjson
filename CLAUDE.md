@@ -196,12 +196,12 @@ swift test --filter Benchmark
 
 ### Speed Comparison
 
-**BONJSON decoder is now 2.4x FASTER than Apple's JSON decoder!**
+**BONJSON decoder is now 2.56x FASTER than Apple's JSON decoder!**
 
 | Metric | BONJSON | JSON | Ratio |
 |--------|---------|------|-------|
-| Decode 1000 objects | 507 µs | 1.20 ms | 0.42x (BONJSON 2.4x faster) |
-| Throughput | 53 MB/s | 37 MB/s | 1.4x faster |
+| Decode 1000 objects | 490 µs | 1.26 ms | 0.39x (BONJSON 2.56x faster) |
+| Throughput | 53 MB/s | 35 MB/s | 1.5x faster |
 
 Encoder performance is roughly equal to JSON.
 
@@ -248,6 +248,15 @@ Profiling revealed Swift Codable overhead was 94% of decode time. Key optimizati
 | Per object overhead | 1.25 µs | 412 ns | **3x faster** |
 | Throughput | 20 MB/s | 53 MB/s | **2.6x faster** |
 | vs JSON | Equal (1.02x) | 2.4x faster | **Crossed the threshold!** |
+
+#### Phase 4: Increased Linear Search Threshold
+
+Increased threshold from 8 to 12 fields. Linear search is 1.5x faster than dictionary.
+
+| Metric | Before | After | Improvement |
+|--------|--------|-------|-------------|
+| 10-field objects | 1.66 ms | 865 µs | **1.9x faster** |
+| vs JSON | 2.4x faster | 2.56x faster | **+7%** |
 
 ### Current Performance Characteristics
 

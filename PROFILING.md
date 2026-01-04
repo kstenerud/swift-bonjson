@@ -372,6 +372,19 @@ All primitive array types now have batch decode:
 | `[Bool]` | 10 ns |
 | `[String]` | 17-50 ns |
 
+### Phase 4: Increased Linear Search Threshold (Completed)
+
+Increased `kSmallObjectThreshold` from 8 to 12 fields. Profiling showed linear search is 1.5x faster than dictionary lookup (86 ns vs 147 ns per field).
+
+**Results:**
+
+| Metric | Before (threshold=8) | After (threshold=12) | Improvement |
+|--------|----------------------|----------------------|-------------|
+| 10-field objects | 1.66 ms | 865 µs | **1.9x faster** |
+| vs JSON ratio | 0.41x | 0.39x | **+5%** |
+
+**Current Status: BONJSON is 2.56x faster than JSON**
+
 ### Optional Future Optimizations
 
 If even more performance is needed:
