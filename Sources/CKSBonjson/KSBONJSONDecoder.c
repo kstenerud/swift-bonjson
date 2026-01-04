@@ -27,6 +27,7 @@
 #include "KSBONJSONDecoder.h"
 #include "KSBONJSONCommon.h"
 #include <string.h> // For memcpy() and strnlen()
+#include <math.h>   // For pow()
 #ifdef _MSC_VER
 #include <intrin.h>
 #endif
@@ -1253,4 +1254,237 @@ size_t ksbonjson_map_estimateEntries(size_t inputLength)
         return 1; // At least one entry for empty container
     }
     return inputLength;
+}
+
+
+// ============================================================================
+// Batch Decode Functions
+// ============================================================================
+
+// Helper to convert any numeric entry to int64
+static inline int64_t entryToInt64(const KSBONJSONMapEntry* entry)
+{
+    switch (entry->type)
+    {
+        case KSBONJSON_TYPE_INT:
+            return entry->data.intValue;
+        case KSBONJSON_TYPE_UINT:
+            return (int64_t)entry->data.uintValue;
+        case KSBONJSON_TYPE_FLOAT:
+            return (int64_t)entry->data.floatValue;
+        case KSBONJSON_TYPE_TRUE:
+            return 1;
+        case KSBONJSON_TYPE_FALSE:
+        case KSBONJSON_TYPE_NULL:
+            return 0;
+        default:
+            return 0;
+    }
+}
+
+// Helper to convert any numeric entry to uint64
+static inline uint64_t entryToUInt64(const KSBONJSONMapEntry* entry)
+{
+    switch (entry->type)
+    {
+        case KSBONJSON_TYPE_UINT:
+            return entry->data.uintValue;
+        case KSBONJSON_TYPE_INT:
+            return (uint64_t)entry->data.intValue;
+        case KSBONJSON_TYPE_FLOAT:
+            return (uint64_t)entry->data.floatValue;
+        case KSBONJSON_TYPE_TRUE:
+            return 1;
+        case KSBONJSON_TYPE_FALSE:
+        case KSBONJSON_TYPE_NULL:
+            return 0;
+        default:
+            return 0;
+    }
+}
+
+// Helper to convert any numeric entry to double
+static inline double entryToDouble(const KSBONJSONMapEntry* entry)
+{
+    switch (entry->type)
+    {
+        case KSBONJSON_TYPE_FLOAT:
+            return entry->data.floatValue;
+        case KSBONJSON_TYPE_INT:
+            return (double)entry->data.intValue;
+        case KSBONJSON_TYPE_UINT:
+            return (double)entry->data.uintValue;
+        case KSBONJSON_TYPE_BIGNUMBER:
+        {
+            double significand = (double)entry->data.bigNumber.significand;
+            double result = significand * pow(10.0, (double)entry->data.bigNumber.exponent);
+            return entry->data.bigNumber.sign < 0 ? -result : result;
+        }
+        case KSBONJSON_TYPE_TRUE:
+            return 1.0;
+        case KSBONJSON_TYPE_FALSE:
+        case KSBONJSON_TYPE_NULL:
+            return 0.0;
+        default:
+            return 0.0;
+    }
+}
+
+// Helper to convert entry to bool
+static inline bool entryToBool(const KSBONJSONMapEntry* entry)
+{
+    switch (entry->type)
+    {
+        case KSBONJSON_TYPE_TRUE:
+            return true;
+        case KSBONJSON_TYPE_FALSE:
+        case KSBONJSON_TYPE_NULL:
+            return false;
+        case KSBONJSON_TYPE_INT:
+            return entry->data.intValue != 0;
+        case KSBONJSON_TYPE_UINT:
+            return entry->data.uintValue != 0;
+        case KSBONJSON_TYPE_FLOAT:
+            return entry->data.floatValue != 0.0;
+        default:
+            return false;
+    }
+}
+
+size_t ksbonjson_map_decodeInt64Array(
+    KSBONJSONMapContext* ctx,
+    size_t arrayIndex,
+    int64_t* outBuffer,
+    size_t maxCount)
+{
+    if (arrayIndex >= ctx->entriesCount)
+    {
+        return 0;
+    }
+
+    const KSBONJSONMapEntry* arrayEntry = &ctx->entries[arrayIndex];
+    if (arrayEntry->type != KSBONJSON_TYPE_ARRAY)
+    {
+        return 0;
+    }
+
+    uint32_t count = arrayEntry->data.container.count;
+    if (count > maxCount)
+    {
+        count = (uint32_t)maxCount;
+    }
+
+    // Fast path: iterate through child entries directly
+    size_t childIndex = arrayEntry->data.container.firstChild;
+    for (uint32_t i = 0; i < count; i++)
+    {
+        const KSBONJSONMapEntry* childEntry = &ctx->entries[childIndex];
+        outBuffer[i] = entryToInt64(childEntry);
+        // Advance to next child (primitives have size 1)
+        childIndex++;
+    }
+
+    return count;
+}
+
+size_t ksbonjson_map_decodeUInt64Array(
+    KSBONJSONMapContext* ctx,
+    size_t arrayIndex,
+    uint64_t* outBuffer,
+    size_t maxCount)
+{
+    if (arrayIndex >= ctx->entriesCount)
+    {
+        return 0;
+    }
+
+    const KSBONJSONMapEntry* arrayEntry = &ctx->entries[arrayIndex];
+    if (arrayEntry->type != KSBONJSON_TYPE_ARRAY)
+    {
+        return 0;
+    }
+
+    uint32_t count = arrayEntry->data.container.count;
+    if (count > maxCount)
+    {
+        count = (uint32_t)maxCount;
+    }
+
+    size_t childIndex = arrayEntry->data.container.firstChild;
+    for (uint32_t i = 0; i < count; i++)
+    {
+        const KSBONJSONMapEntry* childEntry = &ctx->entries[childIndex];
+        outBuffer[i] = entryToUInt64(childEntry);
+        childIndex++;
+    }
+
+    return count;
+}
+
+size_t ksbonjson_map_decodeDoubleArray(
+    KSBONJSONMapContext* ctx,
+    size_t arrayIndex,
+    double* outBuffer,
+    size_t maxCount)
+{
+    if (arrayIndex >= ctx->entriesCount)
+    {
+        return 0;
+    }
+
+    const KSBONJSONMapEntry* arrayEntry = &ctx->entries[arrayIndex];
+    if (arrayEntry->type != KSBONJSON_TYPE_ARRAY)
+    {
+        return 0;
+    }
+
+    uint32_t count = arrayEntry->data.container.count;
+    if (count > maxCount)
+    {
+        count = (uint32_t)maxCount;
+    }
+
+    size_t childIndex = arrayEntry->data.container.firstChild;
+    for (uint32_t i = 0; i < count; i++)
+    {
+        const KSBONJSONMapEntry* childEntry = &ctx->entries[childIndex];
+        outBuffer[i] = entryToDouble(childEntry);
+        childIndex++;
+    }
+
+    return count;
+}
+
+size_t ksbonjson_map_decodeBoolArray(
+    KSBONJSONMapContext* ctx,
+    size_t arrayIndex,
+    bool* outBuffer,
+    size_t maxCount)
+{
+    if (arrayIndex >= ctx->entriesCount)
+    {
+        return 0;
+    }
+
+    const KSBONJSONMapEntry* arrayEntry = &ctx->entries[arrayIndex];
+    if (arrayEntry->type != KSBONJSON_TYPE_ARRAY)
+    {
+        return 0;
+    }
+
+    uint32_t count = arrayEntry->data.container.count;
+    if (count > maxCount)
+    {
+        count = (uint32_t)maxCount;
+    }
+
+    size_t childIndex = arrayEntry->data.container.firstChild;
+    for (uint32_t i = 0; i < count; i++)
+    {
+        const KSBONJSONMapEntry* childEntry = &ctx->entries[childIndex];
+        outBuffer[i] = entryToBool(childEntry);
+        childIndex++;
+    }
+
+    return count;
 }

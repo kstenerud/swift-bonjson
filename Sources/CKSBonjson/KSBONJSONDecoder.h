@@ -257,6 +257,49 @@ KSBONJSON_PUBLIC size_t ksbonjson_map_findKey(
  */
 KSBONJSON_PUBLIC size_t ksbonjson_map_estimateEntries(size_t inputLength);
 
+/**
+ * Batch decode an array of int64 values.
+ * Returns the number of values decoded, or 0 if arrayIndex is not an array.
+ * Stops at maxCount or end of array, whichever comes first.
+ * Non-integer values are converted: floats truncated, bools become 0/1.
+ */
+KSBONJSON_PUBLIC size_t ksbonjson_map_decodeInt64Array(
+    KSBONJSONMapContext* ctx,
+    size_t arrayIndex,
+    int64_t* outBuffer,
+    size_t maxCount);
+
+/**
+ * Batch decode an array of uint64 values.
+ * Returns the number of values decoded, or 0 if arrayIndex is not an array.
+ */
+KSBONJSON_PUBLIC size_t ksbonjson_map_decodeUInt64Array(
+    KSBONJSONMapContext* ctx,
+    size_t arrayIndex,
+    uint64_t* outBuffer,
+    size_t maxCount);
+
+/**
+ * Batch decode an array of double values.
+ * Returns the number of values decoded, or 0 if arrayIndex is not an array.
+ * Integer values are converted to double.
+ */
+KSBONJSON_PUBLIC size_t ksbonjson_map_decodeDoubleArray(
+    KSBONJSONMapContext* ctx,
+    size_t arrayIndex,
+    double* outBuffer,
+    size_t maxCount);
+
+/**
+ * Batch decode an array of bool values.
+ * Returns the number of values decoded, or 0 if arrayIndex is not an array.
+ */
+KSBONJSON_PUBLIC size_t ksbonjson_map_decodeBoolArray(
+    KSBONJSONMapContext* ctx,
+    size_t arrayIndex,
+    bool* outBuffer,
+    size_t maxCount);
+
 
 // ============================================================================
 // Callback-Based Decoder (Original API - Preserved for Compatibility)

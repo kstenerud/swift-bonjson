@@ -126,6 +126,13 @@ public final class BONJSONDecoder {
         // Build the position map using C API
         let map = try _PositionMap(data: data)
 
+        let rootIndex = map.rootIndex
+
+        // Fast path: batch decode for primitive arrays
+        if let result = tryBatchDecode(type, from: map, at: rootIndex) {
+            return result
+        }
+
         let state = _MapDecoderState(
             map: map,
             userInfo: userInfo,
@@ -135,7 +142,6 @@ public final class BONJSONDecoder {
             keyDecodingStrategy: keyDecodingStrategy
         )
 
-        let rootIndex = map.rootIndex
         let decoder = _MapDecoder(state: state, entryIndex: rootIndex, codingPath: [])
 
         // Handle special types that need custom decoding
@@ -156,6 +162,75 @@ public final class BONJSONDecoder {
         }
 
         return try T(from: decoder)
+    }
+
+    /// Try batch decode for known primitive array types.
+    /// Returns nil if type is not a batch-decodable array type.
+    @inline(__always)
+    private func tryBatchDecode<T>(_ type: T.Type, from map: _PositionMap, at index: size_t) -> T? {
+        // [Int] - most common case
+        if type == [Int].self {
+            guard let int64Array = map.decodeInt64Array(at: index) else { return nil }
+            return int64Array.map { Int($0) } as? T
+        }
+        // [Int64]
+        if type == [Int64].self {
+            return map.decodeInt64Array(at: index) as? T
+        }
+        // [Int32]
+        if type == [Int32].self {
+            guard let int64Array = map.decodeInt64Array(at: index) else { return nil }
+            return int64Array.map { Int32($0) } as? T
+        }
+        // [Int16]
+        if type == [Int16].self {
+            guard let int64Array = map.decodeInt64Array(at: index) else { return nil }
+            return int64Array.map { Int16($0) } as? T
+        }
+        // [Int8]
+        if type == [Int8].self {
+            guard let int64Array = map.decodeInt64Array(at: index) else { return nil }
+            return int64Array.map { Int8($0) } as? T
+        }
+        // [UInt]
+        if type == [UInt].self {
+            guard let uint64Array = map.decodeUInt64Array(at: index) else { return nil }
+            return uint64Array.map { UInt($0) } as? T
+        }
+        // [UInt64]
+        if type == [UInt64].self {
+            return map.decodeUInt64Array(at: index) as? T
+        }
+        // [UInt32]
+        if type == [UInt32].self {
+            guard let uint64Array = map.decodeUInt64Array(at: index) else { return nil }
+            return uint64Array.map { UInt32($0) } as? T
+        }
+        // [UInt16]
+        if type == [UInt16].self {
+            guard let uint64Array = map.decodeUInt64Array(at: index) else { return nil }
+            return uint64Array.map { UInt16($0) } as? T
+        }
+        // [UInt8]
+        if type == [UInt8].self {
+            guard let uint64Array = map.decodeUInt64Array(at: index) else { return nil }
+            return uint64Array.map { UInt8($0) } as? T
+        }
+        // [Double]
+        if type == [Double].self {
+            return map.decodeDoubleArray(at: index) as? T
+        }
+        // [Float]
+        if type == [Float].self {
+            guard let doubleArray = map.decodeDoubleArray(at: index) else { return nil }
+            return doubleArray.map { Float($0) } as? T
+        }
+        // [Bool]
+        if type == [Bool].self {
+            return map.decodeBoolArray(at: index) as? T
+        }
+
+        return nil
     }
 }
 
@@ -464,6 +539,146 @@ final class _PositionMap {
         }
         return nextSibling[index]
     }
+
+    /// Compare a key string directly against bytes in input buffer.
+    /// Returns true if the key matches the string at the given offset/length.
+    @inline(__always)
+    func compareKeyBytes(offset: Int, length: Int, with key: String) -> Bool {
+        guard length == key.utf8.count else { return false }
+        return inputBytes.withUnsafeBufferPointer { ptr in
+            key.withCString { cString in
+                memcmp(ptr.baseAddress! + offset, cString, length) == 0
+            }
+        }
+    }
+
+    // MARK: - Batch Decode Methods
+
+    /// Batch decode an array of Int64 values.
+    /// Returns nil if index is not an array.
+    @inline(__always)
+    func decodeInt64Array(at arrayIndex: size_t) -> [Int64]? {
+        guard arrayIndex >= 0 && arrayIndex < entryCount else {
+            return nil
+        }
+
+        let entry = entries[Int(arrayIndex)]
+        guard entry.type == KSBONJSON_TYPE_ARRAY else {
+            return nil
+        }
+
+        let count = Int(entry.data.container.count)
+        guard count > 0 else {
+            return []
+        }
+
+        var result = [Int64](repeating: 0, count: count)
+        result.withUnsafeMutableBufferPointer { buffer in
+            entries.withUnsafeBufferPointer { entriesPtr in
+                inputBytes.withUnsafeBufferPointer { inputPtr in
+                    // Update context pointers for batch decode
+                    var localContext = context
+                    localContext.entries = UnsafeMutablePointer(mutating: entriesPtr.baseAddress)
+                    localContext.input = inputPtr.baseAddress
+                    _ = ksbonjson_map_decodeInt64Array(&localContext, arrayIndex, buffer.baseAddress!, count)
+                }
+            }
+        }
+        return result
+    }
+
+    /// Batch decode an array of UInt64 values.
+    @inline(__always)
+    func decodeUInt64Array(at arrayIndex: size_t) -> [UInt64]? {
+        guard arrayIndex >= 0 && arrayIndex < entryCount else {
+            return nil
+        }
+
+        let entry = entries[Int(arrayIndex)]
+        guard entry.type == KSBONJSON_TYPE_ARRAY else {
+            return nil
+        }
+
+        let count = Int(entry.data.container.count)
+        guard count > 0 else {
+            return []
+        }
+
+        var result = [UInt64](repeating: 0, count: count)
+        result.withUnsafeMutableBufferPointer { buffer in
+            entries.withUnsafeBufferPointer { entriesPtr in
+                inputBytes.withUnsafeBufferPointer { inputPtr in
+                    var localContext = context
+                    localContext.entries = UnsafeMutablePointer(mutating: entriesPtr.baseAddress)
+                    localContext.input = inputPtr.baseAddress
+                    _ = ksbonjson_map_decodeUInt64Array(&localContext, arrayIndex, buffer.baseAddress!, count)
+                }
+            }
+        }
+        return result
+    }
+
+    /// Batch decode an array of Double values.
+    @inline(__always)
+    func decodeDoubleArray(at arrayIndex: size_t) -> [Double]? {
+        guard arrayIndex >= 0 && arrayIndex < entryCount else {
+            return nil
+        }
+
+        let entry = entries[Int(arrayIndex)]
+        guard entry.type == KSBONJSON_TYPE_ARRAY else {
+            return nil
+        }
+
+        let count = Int(entry.data.container.count)
+        guard count > 0 else {
+            return []
+        }
+
+        var result = [Double](repeating: 0, count: count)
+        result.withUnsafeMutableBufferPointer { buffer in
+            entries.withUnsafeBufferPointer { entriesPtr in
+                inputBytes.withUnsafeBufferPointer { inputPtr in
+                    var localContext = context
+                    localContext.entries = UnsafeMutablePointer(mutating: entriesPtr.baseAddress)
+                    localContext.input = inputPtr.baseAddress
+                    _ = ksbonjson_map_decodeDoubleArray(&localContext, arrayIndex, buffer.baseAddress!, count)
+                }
+            }
+        }
+        return result
+    }
+
+    /// Batch decode an array of Bool values.
+    @inline(__always)
+    func decodeBoolArray(at arrayIndex: size_t) -> [Bool]? {
+        guard arrayIndex >= 0 && arrayIndex < entryCount else {
+            return nil
+        }
+
+        let entry = entries[Int(arrayIndex)]
+        guard entry.type == KSBONJSON_TYPE_ARRAY else {
+            return nil
+        }
+
+        let count = Int(entry.data.container.count)
+        guard count > 0 else {
+            return []
+        }
+
+        var result = [Bool](repeating: false, count: count)
+        result.withUnsafeMutableBufferPointer { buffer in
+            entries.withUnsafeBufferPointer { entriesPtr in
+                inputBytes.withUnsafeBufferPointer { inputPtr in
+                    var localContext = context
+                    localContext.entries = UnsafeMutablePointer(mutating: entriesPtr.baseAddress)
+                    localContext.input = inputPtr.baseAddress
+                    _ = ksbonjson_map_decodeBoolArray(&localContext, arrayIndex, buffer.baseAddress!, count)
+                }
+            }
+        }
+        return result
+    }
 }
 
 // MARK: - Decoder State
@@ -730,55 +945,115 @@ final class _MapDecoder: Decoder {
 
 // MARK: - Keyed Decoding Container
 
+/// Threshold for using linear search vs dictionary lookup.
+/// For small objects, linear search avoids dictionary allocation overhead.
+private let kSmallObjectThreshold = 8
+
 struct _MapKeyedDecodingContainer<Key: CodingKey>: KeyedDecodingContainerProtocol {
     let state: _MapDecoderState
     let objectIndex: size_t
     let entry: KSBONJSONMapEntry
     let codingPath: [CodingKey]
 
-    /// All keys in this object.
-    private(set) var allKeys: [Key] = []
+    /// Lazy state holder - uses class for reference semantics across struct copies.
+    private final class _LazyKeyState {
+        var keyCache: [String: size_t]?
+        var allKeysCache: [Key]?
+        let pairCount: Int
+        let firstChildIndex: Int
+        let useLinearSearch: Bool
 
-    /// Cached key -> value index mapping for O(1) lookup.
-    private let keyCache: [String: size_t]
+        init(entry: KSBONJSONMapEntry) {
+            self.pairCount = Int(entry.data.container.count) / 2
+            self.firstChildIndex = Int(entry.data.container.firstChild)
+            self.useLinearSearch = pairCount <= kSmallObjectThreshold
+        }
+    }
+
+    private let lazyState: _LazyKeyState
+
+    /// All keys in this object - built lazily on first access.
+    var allKeys: [Key] {
+        if let cached = lazyState.allKeysCache {
+            return cached
+        }
+        let keys = buildAllKeys()
+        lazyState.allKeysCache = keys
+        return keys
+    }
 
     init(state: _MapDecoderState, objectIndex: size_t, entry: KSBONJSONMapEntry, codingPath: [CodingKey]) {
         self.state = state
         self.objectIndex = objectIndex
         self.entry = entry
         self.codingPath = codingPath
+        self.lazyState = _LazyKeyState(entry: entry)
+        // Key cache is now lazy - built on first key lookup
+    }
 
-        // Build key cache first (doesn't need self)
-        let pairCount = Int(entry.data.container.count) / 2
-        var cache: [String: size_t] = [:]
-        cache.reserveCapacity(pairCount)
+    /// Build allKeys array - only called when allKeys is accessed.
+    private func buildAllKeys() -> [Key] {
+        var keys: [Key] = []
+        keys.reserveCapacity(lazyState.pairCount)
 
-        var currentIndex = Int(entry.data.container.firstChild)
-        for _ in 0..<pairCount {
+        var currentIndex = lazyState.firstChildIndex
+        for _ in 0..<lazyState.pairCount {
             let keyIndex = currentIndex
-            // Move to value index using nextSibling
             let valueIndex = state.map.nextSiblingIndex(keyIndex)
-            // Move past value for next iteration
             currentIndex = state.map.nextSiblingIndex(valueIndex)
 
             if let keyString = state.map.getString(at: size_t(keyIndex)) {
-                // Cache with original key
+                let convertedKey = convertKey(keyString)
+                if let key = Key(stringValue: convertedKey) {
+                    keys.append(key)
+                }
+            }
+        }
+        return keys
+    }
+
+    /// Ensure key cache is built (for larger objects).
+    @inline(__always)
+    private func ensureKeyCache() {
+        guard lazyState.keyCache == nil else { return }
+
+        var cache: [String: size_t] = [:]
+        cache.reserveCapacity(lazyState.pairCount)
+
+        var currentIndex = lazyState.firstChildIndex
+        for _ in 0..<lazyState.pairCount {
+            let keyIndex = currentIndex
+            let valueIndex = state.map.nextSiblingIndex(keyIndex)
+            currentIndex = state.map.nextSiblingIndex(valueIndex)
+
+            if let keyString = state.map.getString(at: size_t(keyIndex)) {
                 cache[keyString] = size_t(valueIndex)
             }
         }
+        lazyState.keyCache = cache
+    }
 
-        self.keyCache = cache
+    /// Linear search for key - used for small objects to avoid dictionary overhead.
+    @inline(__always)
+    private func linearFindValue(forOriginalKey key: String) -> size_t? {
+        var currentIndex = lazyState.firstChildIndex
+        for _ in 0..<lazyState.pairCount {
+            let keyIndex = currentIndex
+            let valueIndex = state.map.nextSiblingIndex(keyIndex)
+            currentIndex = state.map.nextSiblingIndex(valueIndex)
 
-        // Now build allKeys (can use self.convertKey since all stored properties initialized)
-        var keys: [Key] = []
-        keys.reserveCapacity(pairCount)
-        for keyString in cache.keys {
-            let convertedKey = convertKey(keyString)
-            if let key = Key(stringValue: convertedKey) {
-                keys.append(key)
+            let keyEntry = state.map.getEntryUnchecked(at: keyIndex)
+            guard keyEntry.type == KSBONJSON_TYPE_STRING else { continue }
+
+            let keyOffset = Int(keyEntry.data.string.offset)
+            let keyLength = Int(keyEntry.data.string.length)
+
+            // Compare bytes directly using the helper
+            if state.map.compareKeyBytes(offset: keyOffset, length: keyLength, with: key) {
+                return size_t(valueIndex)
             }
         }
-        self.allKeys = keys
+        return nil
     }
 
     private func convertKey(_ key: String) -> String {
@@ -802,9 +1077,8 @@ struct _MapKeyedDecodingContainer<Key: CodingKey>: KeyedDecodingContainerProtoco
             return key.stringValue
         default:
             // Slow path: need to find the original key that converts to this key
-            let pairCount = Int(entry.data.container.count) / 2
-            var currentIndex = Int(entry.data.container.firstChild)
-            for _ in 0..<pairCount {
+            var currentIndex = lazyState.firstChildIndex
+            for _ in 0..<lazyState.pairCount {
                 let keyIndex = currentIndex
                 let valueIndex = state.map.nextSiblingIndex(keyIndex)
                 currentIndex = state.map.nextSiblingIndex(valueIndex)
@@ -823,13 +1097,31 @@ struct _MapKeyedDecodingContainer<Key: CodingKey>: KeyedDecodingContainerProtoco
     @inline(__always)
     func contains(_ key: Key) -> Bool {
         let originalKey = findOriginalKey(key)
-        return keyCache[originalKey] != nil
+        if lazyState.useLinearSearch {
+            return linearFindValue(forOriginalKey: originalKey) != nil
+        }
+        ensureKeyCache()
+        return lazyState.keyCache![originalKey] != nil
     }
 
     @inline(__always)
     private func valueIndex(forKey key: Key) throws -> size_t {
         let originalKey = findOriginalKey(key)
-        guard let valueIdx = keyCache[originalKey] else {
+
+        // For small objects, use linear search
+        if lazyState.useLinearSearch {
+            if let valueIdx = linearFindValue(forOriginalKey: originalKey) {
+                return valueIdx
+            }
+            throw DecodingError.keyNotFound(key, DecodingError.Context(
+                codingPath: codingPath,
+                debugDescription: "Key '\(key.stringValue)' not found"
+            ))
+        }
+
+        // For larger objects, use dictionary
+        ensureKeyCache()
+        guard let valueIdx = lazyState.keyCache![originalKey] else {
             throw DecodingError.keyNotFound(key, DecodingError.Context(
                 codingPath: codingPath,
                 debugDescription: "Key '\(key.stringValue)' not found"
