@@ -520,6 +520,140 @@ ssize_t ksbonjson_encodeToBuffer_endAllContainers(KSBONJSONBufferEncodeContext* 
     return totalBytes;
 }
 
+// Batch encoding - optimized for arrays of primitives
+
+size_t ksbonjson_maxEncodedSize_int64Array(size_t count)
+{
+    // Array begin (1) + count * max int size (9) + array end (1)
+    return 2 + count * 9;
+}
+
+size_t ksbonjson_maxEncodedSize_doubleArray(size_t count)
+{
+    // Array begin (1) + count * max float size (9) + array end (1)
+    return 2 + count * 9;
+}
+
+// Internal: encode a single int64 without container state checks (for batch use)
+static inline size_t encodeInt64Fast(KSBONJSONBufferEncodeContext* ctx, int64_t value)
+{
+    // Small int optimization
+    if ((uint64_t)(value - SMALLINT_NEGATIVE_EDGE) <= (SMALLINT_POSITIVE_EDGE - SMALLINT_NEGATIVE_EDGE))
+    {
+        bufferWriteByte(ctx, (uint8_t)value);
+        return 1;
+    }
+
+    size_t byteCount = requiredSignedIntegerBytesMin1(value);
+
+    // If it's positive and fits in less bytes as unsigned, save as type unsigned.
+    const uint64_t maskOutIfNegative = (uint64_t)~(value >> 63);
+    const uint64_t highByteIs0 = !(value >> (8 * (byteCount - 1)));
+    const uint64_t isPositiveAndHighByteIs0 = maskOutIfNegative & highByteIs0;
+
+    byteCount -= isPositiveAndHighByteIs0;
+    const uint8_t typeCode = (uint8_t)(TYPE_SINT8 + byteCount - 1 - 8 * isPositiveAndHighByteIs0);
+
+    // Write type code + value bytes
+    union num64_bits bits[2];
+    bits[0].b[7] = typeCode;
+    bits[1].u64 = toLittleEndian((uint64_t)value);
+    bufferWriteBytes(ctx, &bits[0].b[7], byteCount + 1);
+
+    return byteCount + 1;
+}
+
+// Internal: encode a single double without container state checks (for batch use)
+static inline size_t encodeDoubleFast(KSBONJSONBufferEncodeContext* ctx, double value)
+{
+    const int64_t asInt = (int64_t)value;
+
+#pragma GCC diagnostic push
+#pragma GCC diagnostic ignored "-Wfloat-equal"
+    if ((double)asInt == value)
+    {
+#pragma GCC diagnostic pop
+        // Value can be represented exactly as integer - use int encoding
+        return encodeInt64Fast(ctx, asInt);
+    }
+
+    // Use float encoding
+    bufferWriteByte(ctx, TYPE_FLOAT64);
+    union num64_bits bits;
+    bits.f64 = value;
+    bits.u64 = toLittleEndian(bits.u64);
+    bufferWriteBytes(ctx, bits.b, 8);
+    return 9;
+}
+
+ssize_t ksbonjson_encodeToBuffer_int64Array(
+    KSBONJSONBufferEncodeContext* ctx,
+    const int64_t* values,
+    size_t count)
+{
+    KSBONJSONContainerState* const container = getBufferContainer(ctx);
+    unlikely_if((container->isObject & container->isExpectingName) | container->isChunkingString)
+    {
+        return container->isChunkingString ? -KSBONJSON_ENCODE_CHUNKING_STRING : -KSBONJSON_ENCODE_EXPECTED_OBJECT_NAME;
+    }
+    container->isExpectingName = true;
+
+    size_t totalBytes = 0;
+
+    // Begin array
+    ctx->containerDepth++;
+    ctx->containers[ctx->containerDepth] = (KSBONJSONContainerState){0};
+    bufferWriteByte(ctx, TYPE_ARRAY);
+    totalBytes++;
+
+    // Encode all values in tight loop (no per-element state checks)
+    for (size_t i = 0; i < count; i++)
+    {
+        totalBytes += encodeInt64Fast(ctx, values[i]);
+    }
+
+    // End array
+    ctx->containerDepth--;
+    bufferWriteByte(ctx, TYPE_END);
+    totalBytes++;
+
+    return (ssize_t)totalBytes;
+}
+
+ssize_t ksbonjson_encodeToBuffer_doubleArray(
+    KSBONJSONBufferEncodeContext* ctx,
+    const double* values,
+    size_t count)
+{
+    KSBONJSONContainerState* const container = getBufferContainer(ctx);
+    unlikely_if((container->isObject & container->isExpectingName) | container->isChunkingString)
+    {
+        return container->isChunkingString ? -KSBONJSON_ENCODE_CHUNKING_STRING : -KSBONJSON_ENCODE_EXPECTED_OBJECT_NAME;
+    }
+    container->isExpectingName = true;
+
+    size_t totalBytes = 0;
+
+    // Begin array
+    ctx->containerDepth++;
+    ctx->containers[ctx->containerDepth] = (KSBONJSONContainerState){0};
+    bufferWriteByte(ctx, TYPE_ARRAY);
+    totalBytes++;
+
+    // Encode all values in tight loop (no per-element state checks)
+    for (size_t i = 0; i < count; i++)
+    {
+        totalBytes += encodeDoubleFast(ctx, values[i]);
+    }
+
+    // End array
+    ctx->containerDepth--;
+    bufferWriteByte(ctx, TYPE_END);
+    totalBytes++;
+
+    return (ssize_t)totalBytes;
+}
+
 
 // ============================================================================
 // Callback-Based Encoder Implementation (Original API)

@@ -398,6 +398,22 @@ The container pooling approach was abandoned because:
 
 The original design with `_LazyKeyState` is already efficient - the class allocation overhead (~214 ns per container) is acceptable given the overall performance.
 
+### Phase 6: Encoder Batch Encoding (Completed)
+
+Added C batch encoding functions for primitive arrays (`[Int]`, `[Double]`).
+
+**Results:**
+
+| Array Type | Before | After | Improvement |
+|------------|--------|-------|-------------|
+| 1000 integers | 0.158 ms | 0.002 ms | **79x faster** |
+| 1000 doubles | 0.172 ms | 0.003 ms | **57x faster** |
+
+| vs JSON | Before | After |
+|---------|--------|-------|
+| Integer arrays | JSON 8.8x faster | **BONJSON 7.7x faster** |
+| Double arrays | JSON 3.6x faster | **BONJSON 12x faster** |
+
 ### Optional Future Optimizations
 
 If even more performance is needed:

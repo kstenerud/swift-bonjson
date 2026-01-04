@@ -99,8 +99,18 @@ public final class BONJSONEncoder {
             keyEncodingStrategy: keyEncodingStrategy
         )
 
-        let encoder = _BufferEncoder(state: state, codingPath: [])
-        try encoder.encodeValue(value)
+        // Fast path for primitive arrays
+        if let intArray = value as? [Int] {
+            try state.encodeBatchInt64Array(intArray)
+        } else if let int64Array = value as? [Int64] {
+            try state.encodeBatchInt64Array(int64Array)
+        } else if let doubleArray = value as? [Double] {
+            try state.encodeBatchDoubleArray(doubleArray)
+        } else {
+            // Default path through Codable
+            let encoder = _BufferEncoder(state: state, codingPath: [])
+            try encoder.encodeValue(value)
+        }
 
         // Close all remaining containers and finalize
         try state.finalize()
@@ -242,6 +252,48 @@ final class _BufferEncoderState {
         if endResult < 0 {
             throw BONJSONEncodingError.encodingFailed(
                 ksbonjson_describeEncodeStatus(ksbonjson_encodeStatus(rawValue: UInt32(-endResult))).map { String(cString: $0) } ?? "Unknown error"
+            )
+        }
+    }
+
+    /// Batch encode an array of Int values.
+    func encodeBatchInt64Array(_ values: [Int]) throws {
+        ensureCapacity(Int(ksbonjson_maxEncodedSize_int64Array(values.count)))
+        let result = values.withUnsafeBufferPointer { ptr in
+            // Convert Int to Int64 pointer - safe on 64-bit platforms
+            ptr.baseAddress!.withMemoryRebound(to: Int64.self, capacity: values.count) { int64Ptr in
+                ksbonjson_encodeToBuffer_int64Array(&context, int64Ptr, values.count)
+            }
+        }
+        if result < 0 {
+            throw BONJSONEncodingError.encodingFailed(
+                ksbonjson_describeEncodeStatus(ksbonjson_encodeStatus(rawValue: UInt32(-result))).map { String(cString: $0) } ?? "Unknown error"
+            )
+        }
+    }
+
+    /// Batch encode an array of Int64 values.
+    func encodeBatchInt64Array(_ values: [Int64]) throws {
+        ensureCapacity(Int(ksbonjson_maxEncodedSize_int64Array(values.count)))
+        let result = values.withUnsafeBufferPointer { ptr in
+            ksbonjson_encodeToBuffer_int64Array(&context, ptr.baseAddress, values.count)
+        }
+        if result < 0 {
+            throw BONJSONEncodingError.encodingFailed(
+                ksbonjson_describeEncodeStatus(ksbonjson_encodeStatus(rawValue: UInt32(-result))).map { String(cString: $0) } ?? "Unknown error"
+            )
+        }
+    }
+
+    /// Batch encode an array of Double values.
+    func encodeBatchDoubleArray(_ values: [Double]) throws {
+        ensureCapacity(Int(ksbonjson_maxEncodedSize_doubleArray(values.count)))
+        let result = values.withUnsafeBufferPointer { ptr in
+            ksbonjson_encodeToBuffer_doubleArray(&context, ptr.baseAddress, values.count)
+        }
+        if result < 0 {
+            throw BONJSONEncodingError.encodingFailed(
+                ksbonjson_describeEncodeStatus(ksbonjson_encodeStatus(rawValue: UInt32(-result))).map { String(cString: $0) } ?? "Unknown error"
             )
         }
     }

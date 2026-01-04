@@ -232,6 +232,46 @@ KSBONJSON_PUBLIC int ksbonjson_encodeToBuffer_getDepth(KSBONJSONBufferEncodeCont
  */
 KSBONJSON_PUBLIC bool ksbonjson_encodeToBuffer_isInObject(KSBONJSONBufferEncodeContext* ctx);
 
+// Batch encoding functions for primitive arrays - much faster than encoding one at a time
+
+/**
+ * Encode an array of int64 values.
+ * This is much faster than encoding elements one at a time.
+ *
+ * @param ctx The encoding context
+ * @param values Pointer to array of int64 values
+ * @param count Number of values to encode
+ * @return Total bytes written (positive) or error code (negative)
+ */
+KSBONJSON_PUBLIC ssize_t ksbonjson_encodeToBuffer_int64Array(
+    KSBONJSONBufferEncodeContext* ctx,
+    const int64_t* values,
+    size_t count);
+
+/**
+ * Encode an array of double values.
+ * This is much faster than encoding elements one at a time.
+ *
+ * @param ctx The encoding context
+ * @param values Pointer to array of double values
+ * @param count Number of values to encode
+ * @return Total bytes written (positive) or error code (negative)
+ */
+KSBONJSON_PUBLIC ssize_t ksbonjson_encodeToBuffer_doubleArray(
+    KSBONJSONBufferEncodeContext* ctx,
+    const double* values,
+    size_t count);
+
+/**
+ * Calculate maximum bytes needed for an int64 array.
+ */
+KSBONJSON_PUBLIC size_t ksbonjson_maxEncodedSize_int64Array(size_t count);
+
+/**
+ * Calculate maximum bytes needed for a double array.
+ */
+KSBONJSON_PUBLIC size_t ksbonjson_maxEncodedSize_doubleArray(size_t count);
+
 
 // ============================================================================
 // Callback-Based Encoder (Original API - Preserved for Compatibility)
