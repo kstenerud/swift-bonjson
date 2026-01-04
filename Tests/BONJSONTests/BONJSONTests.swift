@@ -1784,3 +1784,464 @@ final class BONJSONRoundTripTests: XCTestCase {
         XCTAssertEqual(decoded, value, "Round-trip failed for \(value)", file: file, line: line)
     }
 }
+
+// MARK: - Unkeyed Container Primitive Tests
+
+final class BONJSONUnkeyedPrimitiveTests: XCTestCase {
+
+    // Test all primitive types encoded directly in unkeyed container
+    func testUnkeyedContainerAllPrimitives() throws {
+        struct AllPrimitives: Codable, Equatable {
+            var boolVal: Bool
+            var stringVal: String
+            var doubleVal: Double
+            var floatVal: Float
+            var int8Val: Int8
+            var int16Val: Int16
+            var int32Val: Int32
+            var int64Val: Int64
+            var uintVal: UInt
+            var uint8Val: UInt8
+            var uint16Val: UInt16
+            var uint32Val: UInt32
+            var uint64Val: UInt64
+
+            func encode(to encoder: Encoder) throws {
+                var container = encoder.unkeyedContainer()
+                try container.encode(boolVal)
+                try container.encode(stringVal)
+                try container.encode(doubleVal)
+                try container.encode(floatVal)
+                try container.encode(int8Val)
+                try container.encode(int16Val)
+                try container.encode(int32Val)
+                try container.encode(int64Val)
+                try container.encode(uintVal)
+                try container.encode(uint8Val)
+                try container.encode(uint16Val)
+                try container.encode(uint32Val)
+                try container.encode(uint64Val)
+            }
+
+            init(from decoder: Decoder) throws {
+                var container = try decoder.unkeyedContainer()
+                boolVal = try container.decode(Bool.self)
+                stringVal = try container.decode(String.self)
+                doubleVal = try container.decode(Double.self)
+                floatVal = try container.decode(Float.self)
+                int8Val = try container.decode(Int8.self)
+                int16Val = try container.decode(Int16.self)
+                int32Val = try container.decode(Int32.self)
+                int64Val = try container.decode(Int64.self)
+                uintVal = try container.decode(UInt.self)
+                uint8Val = try container.decode(UInt8.self)
+                uint16Val = try container.decode(UInt16.self)
+                uint32Val = try container.decode(UInt32.self)
+                uint64Val = try container.decode(UInt64.self)
+            }
+
+            init() {
+                boolVal = true
+                stringVal = "test"
+                doubleVal = 3.14159
+                floatVal = 2.5
+                int8Val = -42
+                int16Val = -1000
+                int32Val = -100000
+                int64Val = -10000000000
+                uintVal = 12345
+                uint8Val = 200
+                uint16Val = 50000
+                uint32Val = 3000000000
+                uint64Val = 10000000000000000000
+            }
+        }
+
+        let encoder = BONJSONEncoder()
+        let decoder = BONJSONDecoder()
+
+        let value = AllPrimitives()
+        let data = try encoder.encode(value)
+        let decoded = try decoder.decode(AllPrimitives.self, from: data)
+        XCTAssertEqual(decoded, value)
+    }
+
+    // Test superEncoder in unkeyed container
+    func testSuperEncoderInUnkeyedContainer() throws {
+        struct Parent: Codable, Equatable {
+            var parentValue: Int
+
+            enum CodingKeys: String, CodingKey {
+                case parentValue
+            }
+        }
+
+        struct ArrayWithSuper: Codable, Equatable {
+            var count: Int
+            var parentData: Parent
+
+            func encode(to encoder: Encoder) throws {
+                var container = encoder.unkeyedContainer()
+                // First encode count so we know how many items follow
+                try container.encode(count)
+                // Use superEncoder in unkeyed container
+                let superEnc = container.superEncoder()
+                try parentData.encode(to: superEnc)
+            }
+
+            init(count: Int, parentData: Parent) {
+                self.count = count
+                self.parentData = parentData
+            }
+
+            init(from decoder: Decoder) throws {
+                var container = try decoder.unkeyedContainer()
+                self.count = try container.decode(Int.self)
+                // Decode parent using superDecoder
+                let superDec = try container.superDecoder()
+                self.parentData = try Parent(from: superDec)
+            }
+        }
+
+        let encoder = BONJSONEncoder()
+        let decoder = BONJSONDecoder()
+
+        let value = ArrayWithSuper(count: 42, parentData: Parent(parentValue: 99))
+        let data = try encoder.encode(value)
+        let decoded = try decoder.decode(ArrayWithSuper.self, from: data)
+        XCTAssertEqual(decoded.count, value.count)
+        XCTAssertEqual(decoded.parentData, value.parentData)
+    }
+
+    // Test Float in keyed container
+    func testFloatInKeyedContainer() throws {
+        struct WithFloat: Codable, Equatable {
+            var value: Float
+
+            enum CodingKeys: String, CodingKey {
+                case value
+            }
+
+            func encode(to encoder: Encoder) throws {
+                var container = encoder.container(keyedBy: CodingKeys.self)
+                try container.encode(value, forKey: .value)
+            }
+
+            init(value: Float) {
+                self.value = value
+            }
+
+            init(from decoder: Decoder) throws {
+                let container = try decoder.container(keyedBy: CodingKeys.self)
+                value = try container.decode(Float.self, forKey: .value)
+            }
+        }
+
+        let encoder = BONJSONEncoder()
+        let decoder = BONJSONDecoder()
+
+        let value = WithFloat(value: 3.14)
+        let data = try encoder.encode(value)
+        let decoded = try decoder.decode(WithFloat.self, from: data)
+        XCTAssertEqual(decoded.value, value.value, accuracy: 0.001)
+    }
+}
+
+// MARK: - Single Value Container Tests
+
+final class BONJSONSingleValueContainerTests: XCTestCase {
+
+    // Test single value encoding/decoding for primitives
+    func testSingleValueInt64() throws {
+        let encoder = BONJSONEncoder()
+        let decoder = BONJSONDecoder()
+
+        let value: Int64 = -9223372036854775807
+        let data = try encoder.encode(value)
+        let decoded = try decoder.decode(Int64.self, from: data)
+        XCTAssertEqual(decoded, value)
+    }
+
+    func testSingleValueUInt64() throws {
+        let encoder = BONJSONEncoder()
+        let decoder = BONJSONDecoder()
+
+        let value: UInt64 = 18446744073709551615
+        let data = try encoder.encode(value)
+        let decoded = try decoder.decode(UInt64.self, from: data)
+        XCTAssertEqual(decoded, value)
+    }
+
+    func testSingleValueBool() throws {
+        let encoder = BONJSONEncoder()
+        let decoder = BONJSONDecoder()
+
+        let data = try encoder.encode(true)
+        let decoded = try decoder.decode(Bool.self, from: data)
+        XCTAssertEqual(decoded, true)
+    }
+
+    func testSingleValueNil() throws {
+        let encoder = BONJSONEncoder()
+        let decoder = BONJSONDecoder()
+
+        let value: Int? = nil
+        let data = try encoder.encode(value)
+        let decoded = try decoder.decode(Int?.self, from: data)
+        XCTAssertNil(decoded)
+    }
+
+    func testSingleValueURL() throws {
+        let encoder = BONJSONEncoder()
+        let decoder = BONJSONDecoder()
+
+        let value = URL(string: "https://example.com/path")!
+        let data = try encoder.encode(value)
+        let decoded = try decoder.decode(URL.self, from: data)
+        XCTAssertEqual(decoded, value)
+    }
+
+    func testSingleValueDate() throws {
+        let encoder = BONJSONEncoder()
+        let decoder = BONJSONDecoder()
+
+        let value = Date(timeIntervalSince1970: 1234567890)
+        let data = try encoder.encode(value)
+        let decoded = try decoder.decode(Date.self, from: data)
+        XCTAssertEqual(decoded.timeIntervalSince1970, value.timeIntervalSince1970, accuracy: 0.001)
+    }
+
+    func testSingleValueData() throws {
+        let encoder = BONJSONEncoder()
+        let decoder = BONJSONDecoder()
+
+        let value = Data([0x01, 0x02, 0x03, 0x04])
+        let data = try encoder.encode(value)
+        let decoded = try decoder.decode(Data.self, from: data)
+        XCTAssertEqual(decoded, value)
+    }
+}
+
+// MARK: - Large Object Tests (Dictionary Cache Path)
+
+final class BONJSONLargeObjectKeyLookupTests: XCTestCase {
+
+    // Test object with > 12 fields to trigger dictionary cache path
+    func testLargeObjectDictionaryCache() throws {
+        struct LargeObject: Codable, Equatable {
+            var a: Int, b: Int, c: Int, d: Int, e: Int
+            var f: Int, g: Int, h: Int, i: Int, j: Int
+            var k: Int, l: Int, m: Int, n: Int, o: Int
+        }
+
+        let encoder = BONJSONEncoder()
+        let decoder = BONJSONDecoder()
+
+        let value = LargeObject(a: 1, b: 2, c: 3, d: 4, e: 5,
+                                f: 6, g: 7, h: 8, i: 9, j: 10,
+                                k: 11, l: 12, m: 13, n: 14, o: 15)
+        let data = try encoder.encode(value)
+        let decoded = try decoder.decode(LargeObject.self, from: data)
+        XCTAssertEqual(decoded, value)
+    }
+}
+
+// MARK: - Nested Container Decoder Tests
+
+final class BONJSONNestedContainerDecoderTests: XCTestCase {
+
+    // Test nestedContainer in keyed decoder
+    func testNestedKeyedContainerInKeyedDecoder() throws {
+        struct Outer: Codable, Equatable {
+            var name: String
+            var inner: Inner
+
+            struct Inner: Codable, Equatable {
+                var x: Int
+                var y: Int
+
+                enum CodingKeys: String, CodingKey {
+                    case x, y
+                }
+            }
+
+            enum CodingKeys: String, CodingKey {
+                case name, inner
+            }
+
+            init(from decoder: Decoder) throws {
+                let container = try decoder.container(keyedBy: CodingKeys.self)
+                name = try container.decode(String.self, forKey: .name)
+                // Use nestedContainer to decode inner
+                let nestedContainer = try container.nestedContainer(keyedBy: Inner.CodingKeys.self, forKey: .inner)
+                let x = try nestedContainer.decode(Int.self, forKey: .x)
+                let y = try nestedContainer.decode(Int.self, forKey: .y)
+                inner = Inner(x: x, y: y)
+            }
+
+            func encode(to encoder: Encoder) throws {
+                var container = encoder.container(keyedBy: CodingKeys.self)
+                try container.encode(name, forKey: .name)
+                try container.encode(inner, forKey: .inner)
+            }
+
+            init(name: String, inner: Inner) {
+                self.name = name
+                self.inner = inner
+            }
+        }
+
+        let encoder = BONJSONEncoder()
+        let decoder = BONJSONDecoder()
+
+        let value = Outer(name: "test", inner: Outer.Inner(x: 10, y: 20))
+        let data = try encoder.encode(value)
+        let decoded = try decoder.decode(Outer.self, from: data)
+        XCTAssertEqual(decoded, value)
+    }
+
+    // Test nestedUnkeyedContainer in keyed decoder
+    func testNestedUnkeyedContainerInKeyedDecoder() throws {
+        struct WithArray: Codable, Equatable {
+            var name: String
+            var values: [Int]
+
+            enum CodingKeys: String, CodingKey {
+                case name, values
+            }
+
+            init(from decoder: Decoder) throws {
+                let container = try decoder.container(keyedBy: CodingKeys.self)
+                name = try container.decode(String.self, forKey: .name)
+                // Use nestedUnkeyedContainer to decode values
+                var nestedContainer = try container.nestedUnkeyedContainer(forKey: .values)
+                var values: [Int] = []
+                while !nestedContainer.isAtEnd {
+                    values.append(try nestedContainer.decode(Int.self))
+                }
+                self.values = values
+            }
+
+            func encode(to encoder: Encoder) throws {
+                var container = encoder.container(keyedBy: CodingKeys.self)
+                try container.encode(name, forKey: .name)
+                try container.encode(values, forKey: .values)
+            }
+
+            init(name: String, values: [Int]) {
+                self.name = name
+                self.values = values
+            }
+        }
+
+        let encoder = BONJSONEncoder()
+        let decoder = BONJSONDecoder()
+
+        let value = WithArray(name: "test", values: [1, 2, 3, 4, 5])
+        let data = try encoder.encode(value)
+        let decoded = try decoder.decode(WithArray.self, from: data)
+        XCTAssertEqual(decoded, value)
+    }
+
+    // Test nestedContainer in unkeyed decoder
+    func testNestedKeyedContainerInUnkeyedDecoder() throws {
+        struct Item: Codable, Equatable {
+            var x: Int
+            var y: Int
+
+            enum CodingKeys: String, CodingKey {
+                case x, y
+            }
+        }
+
+        struct ItemList: Codable, Equatable {
+            var items: [Item]
+
+            init(from decoder: Decoder) throws {
+                var container = try decoder.unkeyedContainer()
+                var items: [Item] = []
+                while !container.isAtEnd {
+                    // Use nestedContainer in unkeyed decoder
+                    let nestedContainer = try container.nestedContainer(keyedBy: Item.CodingKeys.self)
+                    let x = try nestedContainer.decode(Int.self, forKey: .x)
+                    let y = try nestedContainer.decode(Int.self, forKey: .y)
+                    items.append(Item(x: x, y: y))
+                }
+                self.items = items
+            }
+
+            func encode(to encoder: Encoder) throws {
+                var container = encoder.unkeyedContainer()
+                for item in items {
+                    try container.encode(item)
+                }
+            }
+
+            init(items: [Item]) {
+                self.items = items
+            }
+        }
+
+        let encoder = BONJSONEncoder()
+        let decoder = BONJSONDecoder()
+
+        let value = ItemList(items: [Item(x: 1, y: 2), Item(x: 3, y: 4)])
+        let data = try encoder.encode(value)
+        let decoded = try decoder.decode(ItemList.self, from: data)
+        XCTAssertEqual(decoded, value)
+    }
+}
+
+// MARK: - URL/Date/Data in Containers Tests
+
+final class BONJSONSpecialTypesInContainersTests: XCTestCase {
+
+    // Test URL in keyed container
+    func testURLInKeyedContainer() throws {
+        struct WithURL: Codable, Equatable {
+            var url: URL
+        }
+
+        let encoder = BONJSONEncoder()
+        let decoder = BONJSONDecoder()
+
+        let value = WithURL(url: URL(string: "https://example.com")!)
+        let data = try encoder.encode(value)
+        let decoded = try decoder.decode(WithURL.self, from: data)
+        XCTAssertEqual(decoded, value)
+    }
+
+    // Test URL in unkeyed container
+    func testURLInUnkeyedContainer() throws {
+        let encoder = BONJSONEncoder()
+        let decoder = BONJSONDecoder()
+
+        let value = [URL(string: "https://a.com")!, URL(string: "https://b.com")!]
+        let data = try encoder.encode(value)
+        let decoded = try decoder.decode([URL].self, from: data)
+        XCTAssertEqual(decoded, value)
+    }
+
+    // Test Date in unkeyed container
+    func testDateInUnkeyedContainer() throws {
+        let encoder = BONJSONEncoder()
+        let decoder = BONJSONDecoder()
+
+        let value = [Date(timeIntervalSince1970: 1000), Date(timeIntervalSince1970: 2000)]
+        let data = try encoder.encode(value)
+        let decoded = try decoder.decode([Date].self, from: data)
+        XCTAssertEqual(decoded[0].timeIntervalSince1970, value[0].timeIntervalSince1970, accuracy: 0.001)
+        XCTAssertEqual(decoded[1].timeIntervalSince1970, value[1].timeIntervalSince1970, accuracy: 0.001)
+    }
+
+    // Test Data in unkeyed container
+    func testDataInUnkeyedContainer() throws {
+        let encoder = BONJSONEncoder()
+        let decoder = BONJSONDecoder()
+
+        let value = [Data([1, 2, 3]), Data([4, 5, 6])]
+        let data = try encoder.encode(value)
+        let decoded = try decoder.decode([Data].self, from: data)
+        XCTAssertEqual(decoded, value)
+    }
+}
