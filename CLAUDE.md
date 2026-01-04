@@ -216,7 +216,7 @@ Applied fundamental Swift optimizations (prior to profiling):
 - O(1) sequential array access in `UnkeyedDecodingContainer`
 - String caching to avoid duplicate String objects
 
-#### Phase 1: Batch Decode for Primitive Arrays
+#### Phase 1: Batch Decode for Numeric Arrays
 
 Added C batch decode functions to decode entire arrays in one call:
 
@@ -224,6 +224,15 @@ Added C batch decode functions to decode entire arrays in one call:
 |------|--------|-------|-------------|
 | 10,000 ints | 1.61 ms | 109 µs | **16x faster** |
 | 10,000 doubles | 1.59 ms | 102 µs | **15.6x faster** |
+
+#### Phase 3: Batch Decode for String Arrays
+
+Added C function to return string offsets/lengths in batch, then Swift creates strings in one pass:
+
+| Type | Before | After | Improvement |
+|------|--------|-------|-------------|
+| 10,000 strings | 2.17 ms | 177 µs | **12x faster** |
+| 1,000 strings | 257 µs | 50 µs | **5x faster** |
 
 #### Phase 2: Lazy Key Cache + Linear Search
 
@@ -246,6 +255,9 @@ Profiling revealed Swift Codable overhead was 94% of decode time. Key optimizati
 - **Swift Codable layer**: ~82% of decode time
 - **Per-object overhead**: ~280 ns (for 1-field objects)
 - **Per-field overhead**: ~153 ns
+- **Primitive array decode** (all batched):
+  - `[Int]`, `[Double]`, `[Bool]`: ~10 ns per element
+  - `[String]`: ~17-50 ns per element
 
 ### Optional Future Optimizations
 

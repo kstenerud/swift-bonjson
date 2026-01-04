@@ -229,6 +229,10 @@ public final class BONJSONDecoder {
         if type == [Bool].self {
             return map.decodeBoolArray(at: index) as? T
         }
+        // [String]
+        if type == [String].self {
+            return map.decodeStringArray(at: index) as? T
+        }
 
         return nil
     }
@@ -678,6 +682,56 @@ final class _PositionMap {
             }
         }
         return result
+    }
+
+    /// Batch decode an array of String values.
+    /// Uses C batch function to get string offsets, then creates strings in batch.
+    @inline(__always)
+    func decodeStringArray(at arrayIndex: size_t) -> [String]? {
+        guard arrayIndex >= 0 && arrayIndex < entryCount else {
+            return nil
+        }
+
+        let entry = entries[Int(arrayIndex)]
+        guard entry.type == KSBONJSON_TYPE_ARRAY else {
+            return nil
+        }
+
+        let count = Int(entry.data.container.count)
+        guard count > 0 else {
+            return []
+        }
+
+        // Get string offsets in batch from C
+        var stringRefs = [KSBONJSONStringRef](repeating: KSBONJSONStringRef(), count: count)
+        let decoded = stringRefs.withUnsafeMutableBufferPointer { buffer in
+            entries.withUnsafeBufferPointer { entriesPtr in
+                inputBytes.withUnsafeBufferPointer { inputPtr in
+                    var localContext = context
+                    localContext.entries = UnsafeMutablePointer(mutating: entriesPtr.baseAddress)
+                    localContext.input = inputPtr.baseAddress
+                    return ksbonjson_map_decodeStringArray(&localContext, arrayIndex, buffer.baseAddress!, count)
+                }
+            }
+        }
+
+        guard decoded == count else {
+            return nil
+        }
+
+        // Create strings from offsets - all in one pass through inputBytes
+        return inputBytes.withUnsafeBufferPointer { ptr in
+            stringRefs.map { ref in
+                let offset = Int(ref.offset)
+                let length = Int(ref.length)
+                if length == 0 {
+                    return ""
+                }
+                let start = ptr.baseAddress! + offset
+                let buffer = UnsafeBufferPointer(start: start, count: length)
+                return String(decoding: buffer, as: UTF8.self)
+            }
+        }
     }
 }
 

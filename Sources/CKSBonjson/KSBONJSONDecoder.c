@@ -1488,3 +1488,47 @@ size_t ksbonjson_map_decodeBoolArray(
 
     return count;
 }
+
+size_t ksbonjson_map_decodeStringArray(
+    KSBONJSONMapContext* ctx,
+    size_t arrayIndex,
+    KSBONJSONStringRef* outBuffer,
+    size_t maxCount)
+{
+    if (arrayIndex >= ctx->entriesCount)
+    {
+        return 0;
+    }
+
+    const KSBONJSONMapEntry* arrayEntry = &ctx->entries[arrayIndex];
+    if (arrayEntry->type != KSBONJSON_TYPE_ARRAY)
+    {
+        return 0;
+    }
+
+    uint32_t count = arrayEntry->data.container.count;
+    if (count > maxCount)
+    {
+        count = (uint32_t)maxCount;
+    }
+
+    size_t childIndex = arrayEntry->data.container.firstChild;
+    for (uint32_t i = 0; i < count; i++)
+    {
+        const KSBONJSONMapEntry* childEntry = &ctx->entries[childIndex];
+        if (childEntry->type == KSBONJSON_TYPE_STRING)
+        {
+            outBuffer[i].offset = childEntry->data.string.offset;
+            outBuffer[i].length = childEntry->data.string.length;
+        }
+        else
+        {
+            // Non-string elements get zero offset/length
+            outBuffer[i].offset = 0;
+            outBuffer[i].length = 0;
+        }
+        childIndex++;
+    }
+
+    return count;
+}

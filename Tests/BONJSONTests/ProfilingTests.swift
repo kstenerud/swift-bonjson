@@ -398,4 +398,214 @@ final class ProfilingTests: XCTestCase {
         try testDictionaryKeyLookupOverhead()
         try testCompareWithJSON()
     }
+
+    // MARK: - Detailed Analysis Tests
+
+    func testObjectSizeVsCount() throws {
+        // Compare: 1 object with 100 fields vs 100 objects with 1 field
+        struct OneField: Codable { var x: Int }
+        struct TenFields: Codable {
+            var a: Int, b: Int, c: Int, d: Int, e: Int
+            var f: Int, g: Int, h: Int, i: Int, j: Int
+        }
+
+        let many1Field = (0..<1000).map { OneField(x: $0) }
+        let few10Fields = (0..<100).map { i in
+            TenFields(a: i, b: i, c: i, d: i, e: i, f: i, g: i, h: i, i: i, j: i)
+        }
+
+        let many1FieldData = try BONJSONEncoder().encode(many1Field)
+        let few10FieldsData = try BONJSONEncoder().encode(few10Fields)
+
+        let iterations = 100
+
+        // 1000 objects × 1 field
+        var many1FieldTimes: [UInt64] = []
+        _ = try BONJSONDecoder().decode([OneField].self, from: many1FieldData)
+        for _ in 0..<iterations {
+            let start = DispatchTime.now().uptimeNanoseconds
+            _ = try BONJSONDecoder().decode([OneField].self, from: many1FieldData)
+            let end = DispatchTime.now().uptimeNanoseconds
+            many1FieldTimes.append(end - start)
+        }
+
+        // 100 objects × 10 fields
+        var few10FieldsTimes: [UInt64] = []
+        _ = try BONJSONDecoder().decode([TenFields].self, from: few10FieldsData)
+        for _ in 0..<iterations {
+            let start = DispatchTime.now().uptimeNanoseconds
+            _ = try BONJSONDecoder().decode([TenFields].self, from: few10FieldsData)
+            let end = DispatchTime.now().uptimeNanoseconds
+            few10FieldsTimes.append(end - start)
+        }
+
+        let avgMany1 = many1FieldTimes.reduce(0, +) / UInt64(iterations)
+        let avgFew10 = few10FieldsTimes.reduce(0, +) / UInt64(iterations)
+
+        print("""
+
+        === Object Count vs Field Count (1000 total fields) ===
+        1000 objects × 1 field:  \(formatNs(avgMany1)) (\(formatNs(avgMany1 / 1000)) per container)
+        100 objects × 10 fields: \(formatNs(avgFew10)) (\(formatNs(avgFew10 / 100)) per container)
+        Container creation cost: \(formatNs((avgMany1 - avgFew10) / 900)) per container (derived)
+        """)
+    }
+
+    func testNestedObjectOverhead() throws {
+        struct Inner: Codable { var x: Int }
+        struct Middle: Codable { var inner: Inner }
+        struct Outer: Codable { var middle: Middle }
+
+        let flat = (0..<1000).map { Inner(x: $0) }
+        let nested = (0..<1000).map { Outer(middle: Middle(inner: Inner(x: $0))) }
+
+        let flatData = try BONJSONEncoder().encode(flat)
+        let nestedData = try BONJSONEncoder().encode(nested)
+
+        let iterations = 100
+
+        // Flat
+        var flatTimes: [UInt64] = []
+        _ = try BONJSONDecoder().decode([Inner].self, from: flatData)
+        for _ in 0..<iterations {
+            let start = DispatchTime.now().uptimeNanoseconds
+            _ = try BONJSONDecoder().decode([Inner].self, from: flatData)
+            let end = DispatchTime.now().uptimeNanoseconds
+            flatTimes.append(end - start)
+        }
+
+        // Nested (3 levels)
+        var nestedTimes: [UInt64] = []
+        _ = try BONJSONDecoder().decode([Outer].self, from: nestedData)
+        for _ in 0..<iterations {
+            let start = DispatchTime.now().uptimeNanoseconds
+            _ = try BONJSONDecoder().decode([Outer].self, from: nestedData)
+            let end = DispatchTime.now().uptimeNanoseconds
+            nestedTimes.append(end - start)
+        }
+
+        let avgFlat = flatTimes.reduce(0, +) / UInt64(iterations)
+        let avgNested = nestedTimes.reduce(0, +) / UInt64(iterations)
+
+        print("""
+
+        === Nesting Depth Overhead ===
+        1000 flat objects (1 level):   \(formatNs(avgFlat)) (\(formatNs(avgFlat / 1000)) per object)
+        1000 nested objects (3 levels): \(formatNs(avgNested)) (\(formatNs(avgNested / 1000)) per object)
+        Extra cost for 2 nesting levels: \(formatNs((avgNested - avgFlat) / 1000)) per object
+        """)
+    }
+
+    func testLargeObjectDecoding() throws {
+        // Test decoding objects with many fields (triggers dictionary instead of linear search)
+        struct SmallObject: Codable {
+            var a: Int, b: Int, c: Int, d: Int, e: Int
+        }
+        struct LargeObject: Codable {
+            var a: Int, b: Int, c: Int, d: Int, e: Int
+            var f: Int, g: Int, h: Int, i: Int, j: Int
+            var k: Int, l: Int, m: Int, n: Int, o: Int
+        }
+
+        let smallObjs = (0..<1000).map { i in
+            SmallObject(a: i, b: i, c: i, d: i, e: i)
+        }
+        let largeObjs = (0..<1000).map { i in
+            LargeObject(a: i, b: i, c: i, d: i, e: i, f: i, g: i, h: i, i: i, j: i, k: i, l: i, m: i, n: i, o: i)
+        }
+
+        let smallData = try BONJSONEncoder().encode(smallObjs)
+        let largeData = try BONJSONEncoder().encode(largeObjs)
+
+        let iterations = 100
+
+        // Small (5 fields, uses linear search)
+        var smallTimes: [UInt64] = []
+        _ = try BONJSONDecoder().decode([SmallObject].self, from: smallData)
+        for _ in 0..<iterations {
+            let start = DispatchTime.now().uptimeNanoseconds
+            _ = try BONJSONDecoder().decode([SmallObject].self, from: smallData)
+            let end = DispatchTime.now().uptimeNanoseconds
+            smallTimes.append(end - start)
+        }
+
+        // Large (15 fields, uses dictionary)
+        var largeTimes: [UInt64] = []
+        _ = try BONJSONDecoder().decode([LargeObject].self, from: largeData)
+        for _ in 0..<iterations {
+            let start = DispatchTime.now().uptimeNanoseconds
+            _ = try BONJSONDecoder().decode([LargeObject].self, from: largeData)
+            let end = DispatchTime.now().uptimeNanoseconds
+            largeTimes.append(end - start)
+        }
+
+        let avgSmall = smallTimes.reduce(0, +) / UInt64(iterations)
+        let avgLarge = largeTimes.reduce(0, +) / UInt64(iterations)
+
+        print("""
+
+        === Small vs Large Objects (linear search vs dictionary) ===
+        1000 objects × 5 fields (linear):   \(formatNs(avgSmall)) (\(formatNs(avgSmall / 5000)) per field)
+        1000 objects × 15 fields (dict):    \(formatNs(avgLarge)) (\(formatNs(avgLarge / 15000)) per field)
+        Dictionary mode per-field cost: \(formatNs(avgLarge / 15000))
+        Linear mode per-field cost:     \(formatNs(avgSmall / 5000))
+        """)
+    }
+
+    func testStringArrayVsIntArray() throws {
+        // Compare string array performance (not batched) vs int array (batched)
+        let intArray = Array(0..<10000)
+        let stringArray = (0..<10000).map { "Item\($0)" }
+
+        let intData = try BONJSONEncoder().encode(intArray)
+        let stringData = try BONJSONEncoder().encode(stringArray)
+
+        let iterations = 50
+
+        // Int array (batched)
+        var intTimes: [UInt64] = []
+        _ = try BONJSONDecoder().decode([Int].self, from: intData)
+        for _ in 0..<iterations {
+            let start = DispatchTime.now().uptimeNanoseconds
+            _ = try BONJSONDecoder().decode([Int].self, from: intData)
+            let end = DispatchTime.now().uptimeNanoseconds
+            intTimes.append(end - start)
+        }
+
+        // String array (not batched)
+        var stringTimes: [UInt64] = []
+        _ = try BONJSONDecoder().decode([String].self, from: stringData)
+        for _ in 0..<iterations {
+            let start = DispatchTime.now().uptimeNanoseconds
+            _ = try BONJSONDecoder().decode([String].self, from: stringData)
+            let end = DispatchTime.now().uptimeNanoseconds
+            stringTimes.append(end - start)
+        }
+
+        let avgInt = intTimes.reduce(0, +) / UInt64(iterations)
+        let avgString = stringTimes.reduce(0, +) / UInt64(iterations)
+
+        print("""
+
+        === String Array vs Int Array (10000 elements) ===
+        Int array (batched):      \(formatNs(avgInt)) (\(formatNs(avgInt / 10000)) per element)
+        String array (unbatched): \(formatNs(avgString)) (\(formatNs(avgString / 10000)) per element)
+        String/Int ratio: \(String(format: "%.1f", Double(avgString) / Double(avgInt)))x
+        Potential savings from string batch: \(formatNs(avgString - avgInt))
+        """)
+    }
+
+    func testDetailedAnalysis() throws {
+        print("""
+
+        ================================================================================
+                                DETAILED BOTTLENECK ANALYSIS
+        ================================================================================
+        """)
+
+        try testObjectSizeVsCount()
+        try testNestedObjectOverhead()
+        try testLargeObjectDecoding()
+        try testStringArrayVsIntArray()
+    }
 }

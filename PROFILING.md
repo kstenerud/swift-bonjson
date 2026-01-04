@@ -352,6 +352,26 @@ Phase 2's lazy key cache and linear search for small objects achieved all Phase 
 - **3x reduction** in per-object overhead (1.25 µs → 412 ns)
 - **2.4x faster than JSON** (was 1.02x, i.e., equal speed)
 
+### Phase 3: String Array Batch Decode (Completed)
+
+Added C batch function to return string offsets/lengths, then Swift creates all strings in a single pass.
+
+**Results:**
+
+| Array Type | Before | After | Improvement |
+|------------|--------|-------|-------------|
+| 10,000 strings | 2.17 ms (216 ns/str) | 177 µs (17 ns/str) | **12x faster** |
+| 1,000 strings | 257 µs (257 ns/str) | 50 µs (50 ns/str) | **5x faster** |
+
+All primitive array types now have batch decode:
+
+| Type | Per Element |
+|------|-------------|
+| `[Int]` | 10 ns |
+| `[Double]` | 10 ns |
+| `[Bool]` | 10 ns |
+| `[String]` | 17-50 ns |
+
 ### Optional Future Optimizations
 
 If even more performance is needed:

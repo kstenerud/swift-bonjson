@@ -300,6 +300,27 @@ KSBONJSON_PUBLIC size_t ksbonjson_map_decodeBoolArray(
     bool* outBuffer,
     size_t maxCount);
 
+/**
+ * String reference for batch string decoding.
+ * Contains offset and length into the original input buffer.
+ */
+typedef struct {
+    uint32_t offset;  // Byte offset in input buffer
+    uint32_t length;  // Length in bytes
+} KSBONJSONStringRef;
+
+/**
+ * Batch decode an array of string references.
+ * Returns the number of strings decoded, or 0 if arrayIndex is not an array.
+ * Non-string elements get offset=0, length=0.
+ * The caller can then create strings from the input buffer using these offsets.
+ */
+KSBONJSON_PUBLIC size_t ksbonjson_map_decodeStringArray(
+    KSBONJSONMapContext* ctx,
+    size_t arrayIndex,
+    KSBONJSONStringRef* outBuffer,
+    size_t maxCount);
+
 
 // ============================================================================
 // Callback-Based Decoder (Original API - Preserved for Compatibility)
