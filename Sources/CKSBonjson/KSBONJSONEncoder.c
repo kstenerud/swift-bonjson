@@ -192,20 +192,6 @@ static inline void bufferWriteByte(KSBONJSONBufferEncodeContext* ctx, uint8_t by
     ctx->buffer[ctx->position++] = byte;
 }
 
-// Max encoded sizes for capacity checks
-size_t ksbonjson_maxEncodedSize_null(void) { return 1; }
-size_t ksbonjson_maxEncodedSize_bool(void) { return 1; }
-size_t ksbonjson_maxEncodedSize_int(void) { return 9; }  // type + 8 bytes
-size_t ksbonjson_maxEncodedSize_float(void) { return 9; } // type + 8 bytes
-size_t ksbonjson_maxEncodedSize_string(size_t stringLength)
-{
-    if (stringLength <= 15) return 1 + stringLength;
-    // type + length field (max 9 bytes) + string
-    return 1 + 9 + stringLength;
-}
-size_t ksbonjson_maxEncodedSize_containerBegin(void) { return 1; }
-size_t ksbonjson_maxEncodedSize_containerEnd(void) { return 1; }
-
 void ksbonjson_encodeToBuffer_begin(KSBONJSONBufferEncodeContext* ctx,
                                     uint8_t* buffer,
                                     size_t capacity)
@@ -522,17 +508,6 @@ ssize_t ksbonjson_encodeToBuffer_endAllContainers(KSBONJSONBufferEncodeContext* 
 
 // Batch encoding - optimized for arrays of primitives
 
-size_t ksbonjson_maxEncodedSize_int64Array(size_t count)
-{
-    // Array begin (1) + count * max int size (9) + array end (1)
-    return 2 + count * 9;
-}
-
-size_t ksbonjson_maxEncodedSize_doubleArray(size_t count)
-{
-    // Array begin (1) + count * max float size (9) + array end (1)
-    return 2 + count * 9;
-}
 
 // Internal: encode a single int64 without container state checks (for batch use)
 static inline size_t encodeInt64Fast(KSBONJSONBufferEncodeContext* ctx, int64_t value)
@@ -654,11 +629,6 @@ ssize_t ksbonjson_encodeToBuffer_doubleArray(
     return (ssize_t)totalBytes;
 }
 
-size_t ksbonjson_maxEncodedSize_stringArray(size_t count, size_t totalStringLength)
-{
-    // Array begin (1) + count * max string header (10 per string) + total string bytes + array end (1)
-    return 2 + count * 10 + totalStringLength;
-}
 
 // Internal: encode a single string without container state checks (for batch use)
 static inline size_t encodeStringFast(KSBONJSONBufferEncodeContext* ctx,

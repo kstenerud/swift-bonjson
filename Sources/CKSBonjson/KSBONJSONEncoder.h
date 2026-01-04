@@ -179,16 +179,25 @@ KSBONJSON_PUBLIC void ksbonjson_encodeToBuffer_setBuffer(
 KSBONJSON_PUBLIC ssize_t ksbonjson_encodeToBuffer_end(KSBONJSONBufferEncodeContext* ctx);
 
 /**
- * Calculate the maximum bytes needed to encode a value of the given type.
- * Use this to ensure buffer capacity before encoding.
+ * Maximum bytes needed to encode values of each type.
+ * These are compile-time constants for use in capacity calculations.
  */
-KSBONJSON_PUBLIC size_t ksbonjson_maxEncodedSize_null(void);
-KSBONJSON_PUBLIC size_t ksbonjson_maxEncodedSize_bool(void);
-KSBONJSON_PUBLIC size_t ksbonjson_maxEncodedSize_int(void);
-KSBONJSON_PUBLIC size_t ksbonjson_maxEncodedSize_float(void);
-KSBONJSON_PUBLIC size_t ksbonjson_maxEncodedSize_string(size_t stringLength);
-KSBONJSON_PUBLIC size_t ksbonjson_maxEncodedSize_containerBegin(void);
-KSBONJSON_PUBLIC size_t ksbonjson_maxEncodedSize_containerEnd(void);
+#define KSBONJSON_MAX_ENCODED_SIZE_NULL           1
+#define KSBONJSON_MAX_ENCODED_SIZE_BOOL           1
+#define KSBONJSON_MAX_ENCODED_SIZE_INT            9   // type byte + 8 bytes max
+#define KSBONJSON_MAX_ENCODED_SIZE_FLOAT          9   // type byte + 8 bytes max
+#define KSBONJSON_MAX_ENCODED_SIZE_CONTAINER_BEGIN 1
+#define KSBONJSON_MAX_ENCODED_SIZE_CONTAINER_END  1
+
+/**
+ * Calculate the maximum bytes needed to encode a string.
+ */
+static inline size_t ksbonjson_maxEncodedSize_string(size_t stringLength)
+{
+    if (stringLength <= 15) return 1 + stringLength;
+    // type + length field (max 9 bytes) + string
+    return 10 + stringLength;
+}
 
 // Encoding functions - return bytes written (positive) or error code (negative)
 // All functions assume sufficient buffer capacity - caller must check first!
@@ -265,12 +274,20 @@ KSBONJSON_PUBLIC ssize_t ksbonjson_encodeToBuffer_doubleArray(
 /**
  * Calculate maximum bytes needed for an int64 array.
  */
-KSBONJSON_PUBLIC size_t ksbonjson_maxEncodedSize_int64Array(size_t count);
+static inline size_t ksbonjson_maxEncodedSize_int64Array(size_t count)
+{
+    // Array begin (1) + count * max int size (9) + array end (1)
+    return 2 + count * KSBONJSON_MAX_ENCODED_SIZE_INT;
+}
 
 /**
  * Calculate maximum bytes needed for a double array.
  */
-KSBONJSON_PUBLIC size_t ksbonjson_maxEncodedSize_doubleArray(size_t count);
+static inline size_t ksbonjson_maxEncodedSize_doubleArray(size_t count)
+{
+    // Array begin (1) + count * max float size (9) + array end (1)
+    return 2 + count * KSBONJSON_MAX_ENCODED_SIZE_FLOAT;
+}
 
 /**
  * Encode an array of strings.
@@ -292,7 +309,11 @@ KSBONJSON_PUBLIC ssize_t ksbonjson_encodeToBuffer_stringArray(
  * Calculate maximum bytes needed for a string array.
  * Note: This requires the total length of all strings.
  */
-KSBONJSON_PUBLIC size_t ksbonjson_maxEncodedSize_stringArray(size_t count, size_t totalStringLength);
+static inline size_t ksbonjson_maxEncodedSize_stringArray(size_t count, size_t totalStringLength)
+{
+    // Array begin (1) + count * max string header (10 per string) + total string bytes + array end (1)
+    return 2 + count * 10 + totalStringLength;
+}
 
 
 // ============================================================================

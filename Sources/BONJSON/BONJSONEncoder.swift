@@ -229,7 +229,7 @@ final class _BufferEncoderState {
     /// Close containers until we reach the target depth.
     func closeContainersToDepth(_ targetDepth: Int) throws {
         while currentDepth > targetDepth {
-            ensureCapacity(Int(ksbonjson_maxEncodedSize_containerEnd()))
+            ensureCapacity(Int(KSBONJSON_MAX_ENCODED_SIZE_CONTAINER_END))
             let result = ksbonjson_encodeToBuffer_endContainer(&context)
             if result < 0 {
                 throw BONJSONEncodingError.encodingFailed(
@@ -242,7 +242,7 @@ final class _BufferEncoderState {
     /// Finalize encoding - close all containers and end the document.
     func finalize() throws {
         // Close all open containers
-        ensureCapacity(Int(ksbonjson_maxEncodedSize_containerEnd()) * (currentDepth + 1))
+        ensureCapacity(Int(KSBONJSON_MAX_ENCODED_SIZE_CONTAINER_END) * (currentDepth + 1))
         let closeResult = ksbonjson_encodeToBuffer_endAllContainers(&context)
         if closeResult < 0 {
             throw BONJSONEncodingError.encodingFailed(
@@ -468,7 +468,7 @@ final class _BufferEncoder: Encoder {
     func encodeFloat(_ value: Double) throws {
         // Fast path for finite values
         if value.isFinite {
-            state.ensureCapacity(Int(ksbonjson_maxEncodedSize_float()))
+            state.ensureCapacity(Int(KSBONJSON_MAX_ENCODED_SIZE_FLOAT))
             let result = ksbonjson_encodeToBuffer_float(&state.context, value)
             if result < 0 {
                 throw BONJSONEncodingError.encodingFailed(
@@ -520,7 +520,7 @@ struct _BufferKeyedEncodingContainer<Key: CodingKey>: KeyedEncodingContainerProt
         self.codingPath = codingPath
 
         // Begin object
-        state.ensureCapacity(Int(ksbonjson_maxEncodedSize_containerBegin()))
+        state.ensureCapacity(Int(KSBONJSON_MAX_ENCODED_SIZE_CONTAINER_BEGIN))
         let result = ksbonjson_encodeToBuffer_beginObject(&state.context)
         assert(result >= 0, "Failed to begin object")
 
@@ -561,7 +561,7 @@ struct _BufferKeyedEncodingContainer<Key: CodingKey>: KeyedEncodingContainerProt
     mutating func encodeNil(forKey key: Key) throws {
         try prepareToEncode()
         try encodeKey(key)
-        state.ensureCapacity(Int(ksbonjson_maxEncodedSize_null()))
+        state.ensureCapacity(Int(KSBONJSON_MAX_ENCODED_SIZE_NULL))
         let result = ksbonjson_encodeToBuffer_null(&state.context)
         if result < 0 {
             throw BONJSONEncodingError.encodingFailed(
@@ -573,7 +573,7 @@ struct _BufferKeyedEncodingContainer<Key: CodingKey>: KeyedEncodingContainerProt
     mutating func encode(_ value: Bool, forKey key: Key) throws {
         try prepareToEncode()
         try encodeKey(key)
-        state.ensureCapacity(Int(ksbonjson_maxEncodedSize_bool()))
+        state.ensureCapacity(Int(KSBONJSON_MAX_ENCODED_SIZE_BOOL))
         let result = ksbonjson_encodeToBuffer_bool(&state.context, value)
         if result < 0 {
             throw BONJSONEncodingError.encodingFailed(
@@ -612,7 +612,7 @@ struct _BufferKeyedEncodingContainer<Key: CodingKey>: KeyedEncodingContainerProt
     mutating func encode(_ value: Int, forKey key: Key) throws {
         try prepareToEncode()
         try encodeKey(key)
-        state.ensureCapacity(Int(ksbonjson_maxEncodedSize_int()))
+        state.ensureCapacity(Int(KSBONJSON_MAX_ENCODED_SIZE_INT))
         let result = ksbonjson_encodeToBuffer_int(&state.context, Int64(value))
         if result < 0 {
             throw BONJSONEncodingError.encodingFailed(
@@ -624,7 +624,7 @@ struct _BufferKeyedEncodingContainer<Key: CodingKey>: KeyedEncodingContainerProt
     mutating func encode(_ value: Int8, forKey key: Key) throws {
         try prepareToEncode()
         try encodeKey(key)
-        state.ensureCapacity(Int(ksbonjson_maxEncodedSize_int()))
+        state.ensureCapacity(Int(KSBONJSON_MAX_ENCODED_SIZE_INT))
         let result = ksbonjson_encodeToBuffer_int(&state.context, Int64(value))
         if result < 0 {
             throw BONJSONEncodingError.encodingFailed(
@@ -636,7 +636,7 @@ struct _BufferKeyedEncodingContainer<Key: CodingKey>: KeyedEncodingContainerProt
     mutating func encode(_ value: Int16, forKey key: Key) throws {
         try prepareToEncode()
         try encodeKey(key)
-        state.ensureCapacity(Int(ksbonjson_maxEncodedSize_int()))
+        state.ensureCapacity(Int(KSBONJSON_MAX_ENCODED_SIZE_INT))
         let result = ksbonjson_encodeToBuffer_int(&state.context, Int64(value))
         if result < 0 {
             throw BONJSONEncodingError.encodingFailed(
@@ -648,7 +648,7 @@ struct _BufferKeyedEncodingContainer<Key: CodingKey>: KeyedEncodingContainerProt
     mutating func encode(_ value: Int32, forKey key: Key) throws {
         try prepareToEncode()
         try encodeKey(key)
-        state.ensureCapacity(Int(ksbonjson_maxEncodedSize_int()))
+        state.ensureCapacity(Int(KSBONJSON_MAX_ENCODED_SIZE_INT))
         let result = ksbonjson_encodeToBuffer_int(&state.context, Int64(value))
         if result < 0 {
             throw BONJSONEncodingError.encodingFailed(
@@ -660,7 +660,7 @@ struct _BufferKeyedEncodingContainer<Key: CodingKey>: KeyedEncodingContainerProt
     mutating func encode(_ value: Int64, forKey key: Key) throws {
         try prepareToEncode()
         try encodeKey(key)
-        state.ensureCapacity(Int(ksbonjson_maxEncodedSize_int()))
+        state.ensureCapacity(Int(KSBONJSON_MAX_ENCODED_SIZE_INT))
         let result = ksbonjson_encodeToBuffer_int(&state.context, value)
         if result < 0 {
             throw BONJSONEncodingError.encodingFailed(
@@ -672,7 +672,7 @@ struct _BufferKeyedEncodingContainer<Key: CodingKey>: KeyedEncodingContainerProt
     mutating func encode(_ value: UInt, forKey key: Key) throws {
         try prepareToEncode()
         try encodeKey(key)
-        state.ensureCapacity(Int(ksbonjson_maxEncodedSize_int()))
+        state.ensureCapacity(Int(KSBONJSON_MAX_ENCODED_SIZE_INT))
         let result = ksbonjson_encodeToBuffer_uint(&state.context, UInt64(value))
         if result < 0 {
             throw BONJSONEncodingError.encodingFailed(
@@ -684,7 +684,7 @@ struct _BufferKeyedEncodingContainer<Key: CodingKey>: KeyedEncodingContainerProt
     mutating func encode(_ value: UInt8, forKey key: Key) throws {
         try prepareToEncode()
         try encodeKey(key)
-        state.ensureCapacity(Int(ksbonjson_maxEncodedSize_int()))
+        state.ensureCapacity(Int(KSBONJSON_MAX_ENCODED_SIZE_INT))
         let result = ksbonjson_encodeToBuffer_uint(&state.context, UInt64(value))
         if result < 0 {
             throw BONJSONEncodingError.encodingFailed(
@@ -696,7 +696,7 @@ struct _BufferKeyedEncodingContainer<Key: CodingKey>: KeyedEncodingContainerProt
     mutating func encode(_ value: UInt16, forKey key: Key) throws {
         try prepareToEncode()
         try encodeKey(key)
-        state.ensureCapacity(Int(ksbonjson_maxEncodedSize_int()))
+        state.ensureCapacity(Int(KSBONJSON_MAX_ENCODED_SIZE_INT))
         let result = ksbonjson_encodeToBuffer_uint(&state.context, UInt64(value))
         if result < 0 {
             throw BONJSONEncodingError.encodingFailed(
@@ -708,7 +708,7 @@ struct _BufferKeyedEncodingContainer<Key: CodingKey>: KeyedEncodingContainerProt
     mutating func encode(_ value: UInt32, forKey key: Key) throws {
         try prepareToEncode()
         try encodeKey(key)
-        state.ensureCapacity(Int(ksbonjson_maxEncodedSize_int()))
+        state.ensureCapacity(Int(KSBONJSON_MAX_ENCODED_SIZE_INT))
         let result = ksbonjson_encodeToBuffer_uint(&state.context, UInt64(value))
         if result < 0 {
             throw BONJSONEncodingError.encodingFailed(
@@ -720,7 +720,7 @@ struct _BufferKeyedEncodingContainer<Key: CodingKey>: KeyedEncodingContainerProt
     mutating func encode(_ value: UInt64, forKey key: Key) throws {
         try prepareToEncode()
         try encodeKey(key)
-        state.ensureCapacity(Int(ksbonjson_maxEncodedSize_int()))
+        state.ensureCapacity(Int(KSBONJSON_MAX_ENCODED_SIZE_INT))
         let result = ksbonjson_encodeToBuffer_uint(&state.context, value)
         if result < 0 {
             throw BONJSONEncodingError.encodingFailed(
@@ -800,7 +800,7 @@ struct _BufferUnkeyedEncodingContainer: UnkeyedEncodingContainer {
         self.codingPath = codingPath
 
         // Begin array
-        state.ensureCapacity(Int(ksbonjson_maxEncodedSize_containerBegin()))
+        state.ensureCapacity(Int(KSBONJSON_MAX_ENCODED_SIZE_CONTAINER_BEGIN))
         let result = ksbonjson_encodeToBuffer_beginArray(&state.context)
         assert(result >= 0, "Failed to begin array")
 
@@ -815,7 +815,7 @@ struct _BufferUnkeyedEncodingContainer: UnkeyedEncodingContainer {
 
     mutating func encodeNil() throws {
         try prepareToEncode()
-        state.ensureCapacity(Int(ksbonjson_maxEncodedSize_null()))
+        state.ensureCapacity(Int(KSBONJSON_MAX_ENCODED_SIZE_NULL))
         let result = ksbonjson_encodeToBuffer_null(&state.context)
         if result < 0 {
             throw BONJSONEncodingError.encodingFailed(
@@ -826,7 +826,7 @@ struct _BufferUnkeyedEncodingContainer: UnkeyedEncodingContainer {
 
     mutating func encode(_ value: Bool) throws {
         try prepareToEncode()
-        state.ensureCapacity(Int(ksbonjson_maxEncodedSize_bool()))
+        state.ensureCapacity(Int(KSBONJSON_MAX_ENCODED_SIZE_BOOL))
         let result = ksbonjson_encodeToBuffer_bool(&state.context, value)
         if result < 0 {
             throw BONJSONEncodingError.encodingFailed(
@@ -862,7 +862,7 @@ struct _BufferUnkeyedEncodingContainer: UnkeyedEncodingContainer {
 
     mutating func encode(_ value: Int) throws {
         try prepareToEncode()
-        state.ensureCapacity(Int(ksbonjson_maxEncodedSize_int()))
+        state.ensureCapacity(Int(KSBONJSON_MAX_ENCODED_SIZE_INT))
         let result = ksbonjson_encodeToBuffer_int(&state.context, Int64(value))
         if result < 0 {
             throw BONJSONEncodingError.encodingFailed(
@@ -873,7 +873,7 @@ struct _BufferUnkeyedEncodingContainer: UnkeyedEncodingContainer {
 
     mutating func encode(_ value: Int8) throws {
         try prepareToEncode()
-        state.ensureCapacity(Int(ksbonjson_maxEncodedSize_int()))
+        state.ensureCapacity(Int(KSBONJSON_MAX_ENCODED_SIZE_INT))
         let result = ksbonjson_encodeToBuffer_int(&state.context, Int64(value))
         if result < 0 {
             throw BONJSONEncodingError.encodingFailed(
@@ -884,7 +884,7 @@ struct _BufferUnkeyedEncodingContainer: UnkeyedEncodingContainer {
 
     mutating func encode(_ value: Int16) throws {
         try prepareToEncode()
-        state.ensureCapacity(Int(ksbonjson_maxEncodedSize_int()))
+        state.ensureCapacity(Int(KSBONJSON_MAX_ENCODED_SIZE_INT))
         let result = ksbonjson_encodeToBuffer_int(&state.context, Int64(value))
         if result < 0 {
             throw BONJSONEncodingError.encodingFailed(
@@ -895,7 +895,7 @@ struct _BufferUnkeyedEncodingContainer: UnkeyedEncodingContainer {
 
     mutating func encode(_ value: Int32) throws {
         try prepareToEncode()
-        state.ensureCapacity(Int(ksbonjson_maxEncodedSize_int()))
+        state.ensureCapacity(Int(KSBONJSON_MAX_ENCODED_SIZE_INT))
         let result = ksbonjson_encodeToBuffer_int(&state.context, Int64(value))
         if result < 0 {
             throw BONJSONEncodingError.encodingFailed(
@@ -906,7 +906,7 @@ struct _BufferUnkeyedEncodingContainer: UnkeyedEncodingContainer {
 
     mutating func encode(_ value: Int64) throws {
         try prepareToEncode()
-        state.ensureCapacity(Int(ksbonjson_maxEncodedSize_int()))
+        state.ensureCapacity(Int(KSBONJSON_MAX_ENCODED_SIZE_INT))
         let result = ksbonjson_encodeToBuffer_int(&state.context, value)
         if result < 0 {
             throw BONJSONEncodingError.encodingFailed(
@@ -917,7 +917,7 @@ struct _BufferUnkeyedEncodingContainer: UnkeyedEncodingContainer {
 
     mutating func encode(_ value: UInt) throws {
         try prepareToEncode()
-        state.ensureCapacity(Int(ksbonjson_maxEncodedSize_int()))
+        state.ensureCapacity(Int(KSBONJSON_MAX_ENCODED_SIZE_INT))
         let result = ksbonjson_encodeToBuffer_uint(&state.context, UInt64(value))
         if result < 0 {
             throw BONJSONEncodingError.encodingFailed(
@@ -928,7 +928,7 @@ struct _BufferUnkeyedEncodingContainer: UnkeyedEncodingContainer {
 
     mutating func encode(_ value: UInt8) throws {
         try prepareToEncode()
-        state.ensureCapacity(Int(ksbonjson_maxEncodedSize_int()))
+        state.ensureCapacity(Int(KSBONJSON_MAX_ENCODED_SIZE_INT))
         let result = ksbonjson_encodeToBuffer_uint(&state.context, UInt64(value))
         if result < 0 {
             throw BONJSONEncodingError.encodingFailed(
@@ -939,7 +939,7 @@ struct _BufferUnkeyedEncodingContainer: UnkeyedEncodingContainer {
 
     mutating func encode(_ value: UInt16) throws {
         try prepareToEncode()
-        state.ensureCapacity(Int(ksbonjson_maxEncodedSize_int()))
+        state.ensureCapacity(Int(KSBONJSON_MAX_ENCODED_SIZE_INT))
         let result = ksbonjson_encodeToBuffer_uint(&state.context, UInt64(value))
         if result < 0 {
             throw BONJSONEncodingError.encodingFailed(
@@ -950,7 +950,7 @@ struct _BufferUnkeyedEncodingContainer: UnkeyedEncodingContainer {
 
     mutating func encode(_ value: UInt32) throws {
         try prepareToEncode()
-        state.ensureCapacity(Int(ksbonjson_maxEncodedSize_int()))
+        state.ensureCapacity(Int(KSBONJSON_MAX_ENCODED_SIZE_INT))
         let result = ksbonjson_encodeToBuffer_uint(&state.context, UInt64(value))
         if result < 0 {
             throw BONJSONEncodingError.encodingFailed(
@@ -961,7 +961,7 @@ struct _BufferUnkeyedEncodingContainer: UnkeyedEncodingContainer {
 
     mutating func encode(_ value: UInt64) throws {
         try prepareToEncode()
-        state.ensureCapacity(Int(ksbonjson_maxEncodedSize_int()))
+        state.ensureCapacity(Int(KSBONJSON_MAX_ENCODED_SIZE_INT))
         let result = ksbonjson_encodeToBuffer_uint(&state.context, value)
         if result < 0 {
             throw BONJSONEncodingError.encodingFailed(
@@ -1028,7 +1028,7 @@ struct _BufferSingleValueEncodingContainer: SingleValueEncodingContainer {
     }
 
     mutating func encodeNil() throws {
-        state.ensureCapacity(Int(ksbonjson_maxEncodedSize_null()))
+        state.ensureCapacity(Int(KSBONJSON_MAX_ENCODED_SIZE_NULL))
         let result = ksbonjson_encodeToBuffer_null(&state.context)
         if result < 0 {
             throw BONJSONEncodingError.encodingFailed(
@@ -1038,7 +1038,7 @@ struct _BufferSingleValueEncodingContainer: SingleValueEncodingContainer {
     }
 
     mutating func encode(_ value: Bool) throws {
-        state.ensureCapacity(Int(ksbonjson_maxEncodedSize_bool()))
+        state.ensureCapacity(Int(KSBONJSON_MAX_ENCODED_SIZE_BOOL))
         let result = ksbonjson_encodeToBuffer_bool(&state.context, value)
         if result < 0 {
             throw BONJSONEncodingError.encodingFailed(
@@ -1071,7 +1071,7 @@ struct _BufferSingleValueEncodingContainer: SingleValueEncodingContainer {
     }
 
     mutating func encode(_ value: Int) throws {
-        state.ensureCapacity(Int(ksbonjson_maxEncodedSize_int()))
+        state.ensureCapacity(Int(KSBONJSON_MAX_ENCODED_SIZE_INT))
         let result = ksbonjson_encodeToBuffer_int(&state.context, Int64(value))
         if result < 0 {
             throw BONJSONEncodingError.encodingFailed(
@@ -1081,7 +1081,7 @@ struct _BufferSingleValueEncodingContainer: SingleValueEncodingContainer {
     }
 
     mutating func encode(_ value: Int8) throws {
-        state.ensureCapacity(Int(ksbonjson_maxEncodedSize_int()))
+        state.ensureCapacity(Int(KSBONJSON_MAX_ENCODED_SIZE_INT))
         let result = ksbonjson_encodeToBuffer_int(&state.context, Int64(value))
         if result < 0 {
             throw BONJSONEncodingError.encodingFailed(
@@ -1091,7 +1091,7 @@ struct _BufferSingleValueEncodingContainer: SingleValueEncodingContainer {
     }
 
     mutating func encode(_ value: Int16) throws {
-        state.ensureCapacity(Int(ksbonjson_maxEncodedSize_int()))
+        state.ensureCapacity(Int(KSBONJSON_MAX_ENCODED_SIZE_INT))
         let result = ksbonjson_encodeToBuffer_int(&state.context, Int64(value))
         if result < 0 {
             throw BONJSONEncodingError.encodingFailed(
@@ -1101,7 +1101,7 @@ struct _BufferSingleValueEncodingContainer: SingleValueEncodingContainer {
     }
 
     mutating func encode(_ value: Int32) throws {
-        state.ensureCapacity(Int(ksbonjson_maxEncodedSize_int()))
+        state.ensureCapacity(Int(KSBONJSON_MAX_ENCODED_SIZE_INT))
         let result = ksbonjson_encodeToBuffer_int(&state.context, Int64(value))
         if result < 0 {
             throw BONJSONEncodingError.encodingFailed(
@@ -1111,7 +1111,7 @@ struct _BufferSingleValueEncodingContainer: SingleValueEncodingContainer {
     }
 
     mutating func encode(_ value: Int64) throws {
-        state.ensureCapacity(Int(ksbonjson_maxEncodedSize_int()))
+        state.ensureCapacity(Int(KSBONJSON_MAX_ENCODED_SIZE_INT))
         let result = ksbonjson_encodeToBuffer_int(&state.context, value)
         if result < 0 {
             throw BONJSONEncodingError.encodingFailed(
@@ -1121,7 +1121,7 @@ struct _BufferSingleValueEncodingContainer: SingleValueEncodingContainer {
     }
 
     mutating func encode(_ value: UInt) throws {
-        state.ensureCapacity(Int(ksbonjson_maxEncodedSize_int()))
+        state.ensureCapacity(Int(KSBONJSON_MAX_ENCODED_SIZE_INT))
         let result = ksbonjson_encodeToBuffer_uint(&state.context, UInt64(value))
         if result < 0 {
             throw BONJSONEncodingError.encodingFailed(
@@ -1131,7 +1131,7 @@ struct _BufferSingleValueEncodingContainer: SingleValueEncodingContainer {
     }
 
     mutating func encode(_ value: UInt8) throws {
-        state.ensureCapacity(Int(ksbonjson_maxEncodedSize_int()))
+        state.ensureCapacity(Int(KSBONJSON_MAX_ENCODED_SIZE_INT))
         let result = ksbonjson_encodeToBuffer_uint(&state.context, UInt64(value))
         if result < 0 {
             throw BONJSONEncodingError.encodingFailed(
@@ -1141,7 +1141,7 @@ struct _BufferSingleValueEncodingContainer: SingleValueEncodingContainer {
     }
 
     mutating func encode(_ value: UInt16) throws {
-        state.ensureCapacity(Int(ksbonjson_maxEncodedSize_int()))
+        state.ensureCapacity(Int(KSBONJSON_MAX_ENCODED_SIZE_INT))
         let result = ksbonjson_encodeToBuffer_uint(&state.context, UInt64(value))
         if result < 0 {
             throw BONJSONEncodingError.encodingFailed(
@@ -1151,7 +1151,7 @@ struct _BufferSingleValueEncodingContainer: SingleValueEncodingContainer {
     }
 
     mutating func encode(_ value: UInt32) throws {
-        state.ensureCapacity(Int(ksbonjson_maxEncodedSize_int()))
+        state.ensureCapacity(Int(KSBONJSON_MAX_ENCODED_SIZE_INT))
         let result = ksbonjson_encodeToBuffer_uint(&state.context, UInt64(value))
         if result < 0 {
             throw BONJSONEncodingError.encodingFailed(
@@ -1161,7 +1161,7 @@ struct _BufferSingleValueEncodingContainer: SingleValueEncodingContainer {
     }
 
     mutating func encode(_ value: UInt64) throws {
-        state.ensureCapacity(Int(ksbonjson_maxEncodedSize_int()))
+        state.ensureCapacity(Int(KSBONJSON_MAX_ENCODED_SIZE_INT))
         let result = ksbonjson_encodeToBuffer_uint(&state.context, value)
         if result < 0 {
             throw BONJSONEncodingError.encodingFailed(
