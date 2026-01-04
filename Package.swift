@@ -24,6 +24,9 @@ let package = Package(
         .executableTarget(
             name: "BONJSONBenchmark",
             dependencies: ["BONJSON"]),
+        .executableTarget(
+            name: "BONJSONProfiler",
+            dependencies: ["BONJSON"]),
         .testTarget(
             name: "BONJSONTests",
             dependencies: ["BONJSON"]),

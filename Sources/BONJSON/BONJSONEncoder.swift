@@ -117,7 +117,7 @@ public final class BONJSONEncoder {
         // Close all remaining containers and finalize
         try state.finalize()
 
-        return Data(state.buffer[0..<state.bytesWritten])
+        return state.buffer.withUnsafeBytes { Data($0.prefix(state.bytesWritten)) }
     }
 }
 
@@ -147,7 +147,8 @@ public enum BONJSONEncodingError: Error, CustomStringConvertible {
 /// Manages the buffer and C context directly for optimal performance.
 final class _BufferEncoderState {
     /// The encoding buffer - Swift-managed, passed to C for direct writes.
-    var buffer: [UInt8]
+    /// Uses ContiguousArray to avoid NSArray bridging overhead.
+    var buffer: ContiguousArray<UInt8>
 
     /// The C encoder context.
     var context: KSBONJSONBufferEncodeContext
@@ -179,7 +180,7 @@ final class _BufferEncoderState {
         self.nonConformingFloatEncodingStrategy = nonConformingFloatEncodingStrategy
         self.keyEncodingStrategy = keyEncodingStrategy
 
-        self.buffer = [UInt8](repeating: 0, count: Self.initialCapacity)
+        self.buffer = ContiguousArray<UInt8>(repeating: 0, count: Self.initialCapacity)
         self.context = KSBONJSONBufferEncodeContext()
 
         // Initialize the buffer-based encoder
