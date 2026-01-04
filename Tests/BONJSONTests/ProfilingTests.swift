@@ -442,12 +442,15 @@ final class ProfilingTests: XCTestCase {
         let avgMany1 = many1FieldTimes.reduce(0, +) / UInt64(iterations)
         let avgFew10 = few10FieldsTimes.reduce(0, +) / UInt64(iterations)
 
+        // Use signed arithmetic to handle case where few10 is slower
+        let containerCost = (Int64(avgMany1) - Int64(avgFew10)) / 900
+
         print("""
 
         === Object Count vs Field Count (1000 total fields) ===
         1000 objects × 1 field:  \(formatNs(avgMany1)) (\(formatNs(avgMany1 / 1000)) per container)
         100 objects × 10 fields: \(formatNs(avgFew10)) (\(formatNs(avgFew10 / 100)) per container)
-        Container creation cost: \(formatNs((avgMany1 - avgFew10) / 900)) per container (derived)
+        Container creation cost: \(containerCost > 0 ? formatNs(UInt64(containerCost)) : "-\(formatNs(UInt64(-containerCost)))") per container (derived)
         """)
     }
 
