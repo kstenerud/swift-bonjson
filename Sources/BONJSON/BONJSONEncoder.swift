@@ -1,7 +1,8 @@
 // ABOUTME: Public BONJSONEncoder API matching Apple's JSONEncoder interface.
-// ABOUTME: Provides Codable support for encoding Swift types to BONJSON binary format.
+// ABOUTME: Uses the C ksbonjson library for high-performance streaming encoding.
 
 import Foundation
+import CKSBonjson
 
 /// An object that encodes instances of a data type as BONJSON data.
 ///
@@ -90,8 +91,7 @@ public final class BONJSONEncoder {
     /// - Returns: A new `Data` value containing the encoded BONJSON data.
     /// - Throws: An error if encoding fails.
     public func encode<T: Encodable>(_ value: T) throws -> Data {
-        let encoder = _BONJSONEncoder(
-            codingPath: [],
+        let state = _EncoderState(
             userInfo: userInfo,
             dateEncodingStrategy: dateEncodingStrategy,
             dataEncodingStrategy: dataEncodingStrategy,
@@ -99,134 +99,171 @@ public final class BONJSONEncoder {
             keyEncodingStrategy: keyEncodingStrategy
         )
 
+        let encoder = _StreamingEncoder(state: state, codingPath: [])
         try encoder.encodeValue(value)
 
-        guard let topValue = encoder.value else {
-            throw BONJSONEncodingError.internalError("No value was encoded")
+        // Close any remaining open containers
+        let terminateStatus = ksbonjson_terminateDocument(&state.context)
+        guard terminateStatus == KSBONJSON_ENCODE_OK else {
+            throw BONJSONEncodingError.encodingFailed(
+                ksbonjson_describeEncodeStatus(terminateStatus).map { String(cString: $0) } ?? "Unknown error"
+            )
         }
 
-        // Serialize the intermediate representation to BONJSON binary
-        let writer = BONJSONWriter()
-        try serializeValue(topValue, to: writer)
-        return writer.data
+        let endStatus = ksbonjson_endEncode(&state.context)
+        guard endStatus == KSBONJSON_ENCODE_OK else {
+            throw BONJSONEncodingError.encodingFailed(
+                ksbonjson_describeEncodeStatus(endStatus).map { String(cString: $0) } ?? "Unknown error"
+            )
+        }
+
+        return Data(state.buffer)
     }
 }
 
-// MARK: - Intermediate Value Type
+// MARK: - Errors
 
-/// Intermediate representation of a value during encoding.
-/// This mirrors BONJSONValue but is built during encoding.
-indirect enum _EncodedValue {
-    case null
-    case bool(Bool)
-    case int(Int64)
-    case uint(UInt64)
-    case float(Double)
-    case string(String)
-    case array([_EncodedValue])
-    case object([(String, _EncodedValue)])
-}
+/// Errors that can occur during BONJSON encoding.
+public enum BONJSONEncodingError: Error, CustomStringConvertible {
+    case invalidFloat(Double)
+    case encodingFailed(String)
+    case internalError(String)
 
-// MARK: - Serialization
-
-/// Serializes an encoded value to binary BONJSON format.
-private func serializeValue(_ value: _EncodedValue, to writer: BONJSONWriter) throws {
-    switch value {
-    case .null:
-        writer.writeNull()
-
-    case .bool(let b):
-        writer.writeBool(b)
-
-    case .int(let i):
-        writer.writeInt(i)
-
-    case .uint(let u):
-        writer.writeUInt(u)
-
-    case .float(let f):
-        try writer.writeFloat(f)
-
-    case .string(let s):
-        writer.writeString(s)
-
-    case .array(let elements):
-        try writer.beginArray()
-        for element in elements {
-            try serializeValue(element, to: writer)
+    public var description: String {
+        switch self {
+        case .invalidFloat(let value):
+            return "Cannot encode non-conforming float value: \(value)"
+        case .encodingFailed(let message):
+            return "Encoding failed: \(message)"
+        case .internalError(let message):
+            return "Internal error: \(message)"
         }
-        writer.endContainer()
-
-    case .object(let pairs):
-        try writer.beginObject()
-        for (key, value) in pairs {
-            writer.writeString(key)
-            try serializeValue(value, to: writer)
-        }
-        writer.endContainer()
     }
 }
 
-// MARK: - Internal Encoder Implementation
+// MARK: - Shared Encoder State
 
-/// Internal encoder that implements the Encoder protocol.
-/// Builds an intermediate representation that is later serialized.
-final class _BONJSONEncoder: Encoder {
-    let codingPath: [CodingKey]
+/// Shared mutable state for the streaming encoder.
+/// Uses reference semantics so all containers share the same C context and buffer.
+final class _EncoderState {
+    var context: KSBONJSONEncodeContext
+    var buffer: [UInt8] = []
+
     let userInfo: [CodingUserInfoKey: Any]
-
     let dateEncodingStrategy: BONJSONEncoder.DateEncodingStrategy
     let dataEncodingStrategy: BONJSONEncoder.DataEncodingStrategy
     let nonConformingFloatEncodingStrategy: BONJSONEncoder.NonConformingFloatEncodingStrategy
     let keyEncodingStrategy: BONJSONEncoder.KeyEncodingStrategy
 
-    /// The encoded value (set after encoding completes).
-    var value: _EncodedValue?
+    /// Tracks the depth at which containers were created.
+    /// Used to auto-close nested containers when returning to a parent.
+    var containerDepths: [Int] = []
 
     init(
-        codingPath: [CodingKey],
         userInfo: [CodingUserInfoKey: Any],
         dateEncodingStrategy: BONJSONEncoder.DateEncodingStrategy,
         dataEncodingStrategy: BONJSONEncoder.DataEncodingStrategy,
         nonConformingFloatEncodingStrategy: BONJSONEncoder.NonConformingFloatEncodingStrategy,
         keyEncodingStrategy: BONJSONEncoder.KeyEncodingStrategy
     ) {
-        self.codingPath = codingPath
         self.userInfo = userInfo
         self.dateEncodingStrategy = dateEncodingStrategy
         self.dataEncodingStrategy = dataEncodingStrategy
         self.nonConformingFloatEncodingStrategy = nonConformingFloatEncodingStrategy
         self.keyEncodingStrategy = keyEncodingStrategy
+
+        self.context = KSBONJSONEncodeContext()
+
+        // Initialize the C encoder with our callback
+        withUnsafeMutablePointer(to: &self.context) { contextPtr in
+            ksbonjson_beginEncode(
+                contextPtr,
+                { (data, length, userData) -> ksbonjson_encodeStatus in
+                    guard let data = data, let userData = userData else {
+                        return KSBONJSON_ENCODE_NULL_POINTER
+                    }
+                    let state = Unmanaged<_EncoderState>.fromOpaque(userData).takeUnretainedValue()
+                    state.buffer.append(contentsOf: UnsafeBufferPointer(start: data, count: length))
+                    return KSBONJSON_ENCODE_OK
+                },
+                Unmanaged.passUnretained(self).toOpaque()
+            )
+        }
+    }
+
+    /// Current container depth in the C encoder.
+    var currentDepth: Int {
+        return Int(context.containerDepth)
+    }
+
+    /// Close containers until we reach the target depth.
+    func closeContainersToDepth(_ targetDepth: Int) throws {
+        while currentDepth > targetDepth {
+            let status = ksbonjson_endContainer(&context)
+            guard status == KSBONJSON_ENCODE_OK else {
+                throw BONJSONEncodingError.encodingFailed(
+                    ksbonjson_describeEncodeStatus(status).map { String(cString: $0) } ?? "Unknown error"
+                )
+            }
+        }
+    }
+}
+
+// MARK: - Streaming Encoder
+
+/// Internal encoder that implements the Encoder protocol using streaming C calls.
+final class _StreamingEncoder: Encoder {
+    let state: _EncoderState
+    let codingPath: [CodingKey]
+
+    /// The depth when this encoder was created.
+    let creationDepth: Int
+
+    var userInfo: [CodingUserInfoKey: Any] { state.userInfo }
+
+    init(state: _EncoderState, codingPath: [CodingKey]) {
+        self.state = state
+        self.codingPath = codingPath
+        self.creationDepth = state.currentDepth
     }
 
     func container<Key: CodingKey>(keyedBy type: Key.Type) -> KeyedEncodingContainer<Key> {
-        let container = _BONJSONKeyedEncodingContainer<Key>(encoder: self, codingPath: codingPath)
+        let container = _StreamingKeyedEncodingContainer<Key>(
+            state: state,
+            codingPath: codingPath
+        )
         return KeyedEncodingContainer(container)
     }
 
     func unkeyedContainer() -> UnkeyedEncodingContainer {
-        return _BONJSONUnkeyedEncodingContainer(encoder: self, codingPath: codingPath)
+        return _StreamingUnkeyedEncodingContainer(
+            state: state,
+            codingPath: codingPath
+        )
     }
 
     func singleValueContainer() -> SingleValueEncodingContainer {
-        return _BONJSONSingleValueEncodingContainer(encoder: self, codingPath: codingPath)
+        return _StreamingSingleValueEncodingContainer(
+            state: state,
+            codingPath: codingPath
+        )
     }
 
-    /// Encodes a value and stores the result.
+    /// Encodes a value, handling special types.
     func encodeValue<T: Encodable>(_ value: T) throws {
         // Handle special types
         if let date = value as? Date {
-            self.value = try encodeDate(date)
+            try encodeDate(date)
             return
         }
 
         if let data = value as? Data {
-            self.value = try encodeData(data)
+            try encodeData(data)
             return
         }
 
         if let url = value as? URL {
-            self.value = .string(url.absoluteString)
+            try encodeString(url.absoluteString)
             return
         }
 
@@ -235,59 +272,127 @@ final class _BONJSONEncoder: Encoder {
     }
 
     /// Encodes a Date using the configured strategy.
-    private func encodeDate(_ date: Date) throws -> _EncodedValue {
-        switch dateEncodingStrategy {
+    private func encodeDate(_ date: Date) throws {
+        switch state.dateEncodingStrategy {
         case .secondsSince1970:
-            return .float(date.timeIntervalSince1970)
+            try encodeFloat(date.timeIntervalSince1970)
 
         case .millisecondsSince1970:
-            return .float(date.timeIntervalSince1970 * 1000)
+            try encodeFloat(date.timeIntervalSince1970 * 1000)
 
         case .iso8601:
             let formatter = ISO8601DateFormatter()
             formatter.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
-            return .string(formatter.string(from: date))
+            try encodeString(formatter.string(from: date))
 
         case .formatted(let formatter):
-            return .string(formatter.string(from: date))
+            try encodeString(formatter.string(from: date))
 
         case .custom(let closure):
-            let encoder = _BONJSONEncoder(
-                codingPath: codingPath,
-                userInfo: userInfo,
-                dateEncodingStrategy: dateEncodingStrategy,
-                dataEncodingStrategy: dataEncodingStrategy,
-                nonConformingFloatEncodingStrategy: nonConformingFloatEncodingStrategy,
-                keyEncodingStrategy: keyEncodingStrategy
-            )
-            try closure(date, encoder)
-            return encoder.value ?? .null
+            try closure(date, self)
         }
     }
 
     /// Encodes Data using the configured strategy.
-    private func encodeData(_ data: Data) throws -> _EncodedValue {
-        switch dataEncodingStrategy {
+    private func encodeData(_ data: Data) throws {
+        switch state.dataEncodingStrategy {
         case .base64:
-            return .string(data.base64EncodedString())
+            try encodeString(data.base64EncodedString())
 
         case .custom(let closure):
-            let encoder = _BONJSONEncoder(
-                codingPath: codingPath,
-                userInfo: userInfo,
-                dateEncodingStrategy: dateEncodingStrategy,
-                dataEncodingStrategy: dataEncodingStrategy,
-                nonConformingFloatEncodingStrategy: nonConformingFloatEncodingStrategy,
-                keyEncodingStrategy: keyEncodingStrategy
+            try closure(data, self)
+        }
+    }
+
+    func encodeString(_ value: String) throws {
+        let status = value.withCString { cString in
+            ksbonjson_addString(&state.context, cString, strlen(cString))
+        }
+        guard status == KSBONJSON_ENCODE_OK else {
+            throw BONJSONEncodingError.encodingFailed(
+                ksbonjson_describeEncodeStatus(status).map { String(cString: $0) } ?? "Unknown error"
             )
-            try closure(data, encoder)
-            return encoder.value ?? .null
+        }
+    }
+
+    func encodeFloat(_ value: Double) throws {
+        if !value.isFinite {
+            switch state.nonConformingFloatEncodingStrategy {
+            case .throw:
+                throw BONJSONEncodingError.invalidFloat(value)
+            case .convertToString(let posInf, let negInf, let nan):
+                if value.isNaN {
+                    try encodeString(nan)
+                } else if value == .infinity {
+                    try encodeString(posInf)
+                } else {
+                    try encodeString(negInf)
+                }
+                return
+            }
+        }
+
+        let status = ksbonjson_addFloat(&state.context, value)
+        guard status == KSBONJSON_ENCODE_OK else {
+            throw BONJSONEncodingError.encodingFailed(
+                ksbonjson_describeEncodeStatus(status).map { String(cString: $0) } ?? "Unknown error"
+            )
         }
     }
 
     /// Converts a key according to the key encoding strategy.
     func convertedKey(_ key: CodingKey) -> String {
-        switch keyEncodingStrategy {
+        switch state.keyEncodingStrategy {
+        case .useDefaultKeys:
+            return key.stringValue
+        case .convertToSnakeCase:
+            return key.stringValue.convertToSnakeCase()
+        case .custom(let converter):
+            return converter(codingPath + [key]).stringValue
+        }
+    }
+}
+
+// MARK: - Keyed Encoding Container
+
+struct _StreamingKeyedEncodingContainer<Key: CodingKey>: KeyedEncodingContainerProtocol {
+    let state: _EncoderState
+    let codingPath: [CodingKey]
+
+    /// The depth when this container was created.
+    let containerDepth: Int
+
+    init(state: _EncoderState, codingPath: [CodingKey]) {
+        self.state = state
+        self.codingPath = codingPath
+
+        // Begin object in C encoder
+        let status = ksbonjson_beginObject(&state.context)
+        assert(status == KSBONJSON_ENCODE_OK, "Failed to begin object")
+
+        self.containerDepth = state.currentDepth
+    }
+
+    /// Ensures we're at the right depth before encoding a value.
+    /// Closes any nested containers that were left open.
+    private func prepareToEncode() throws {
+        try state.closeContainersToDepth(containerDepth)
+    }
+
+    private func encodeKey(_ key: Key) throws {
+        let keyString = convertedKey(key)
+        let status = keyString.withCString { cString in
+            ksbonjson_addString(&state.context, cString, strlen(cString))
+        }
+        guard status == KSBONJSON_ENCODE_OK else {
+            throw BONJSONEncodingError.encodingFailed(
+                ksbonjson_describeEncodeStatus(status).map { String(cString: $0) } ?? "Unknown error"
+            )
+        }
+    }
+
+    func convertedKey(_ key: Key) -> String {
+        switch state.keyEncodingStrategy {
         case .useDefaultKeys:
             return key.stringValue
         case .convertToSnakeCase:
@@ -297,146 +402,200 @@ final class _BONJSONEncoder: Encoder {
         }
     }
 
-    /// Encodes a floating-point value, handling non-conforming values.
-    func encodeFloat(_ value: Double) throws -> _EncodedValue {
-        if value.isFinite {
-            return .float(value)
-        }
-
-        switch nonConformingFloatEncodingStrategy {
-        case .throw:
-            throw BONJSONEncodingError.invalidFloat(value)
-        case .convertToString(let posInf, let negInf, let nan):
-            if value.isNaN {
-                return .string(nan)
-            } else if value == .infinity {
-                return .string(posInf)
-            } else {
-                return .string(negInf)
-            }
-        }
-    }
-}
-
-// MARK: - Keyed Encoding Container
-
-struct _BONJSONKeyedEncodingContainer<Key: CodingKey>: KeyedEncodingContainerProtocol {
-    let encoder: _BONJSONEncoder
-    let codingPath: [CodingKey]
-
-    /// The accumulated key-value pairs.
-    fileprivate let pairs: _ObjectPairs
-
-    init(encoder: _BONJSONEncoder, codingPath: [CodingKey]) {
-        self.encoder = encoder
-        self.codingPath = codingPath
-        self.pairs = _ObjectPairs()
-        encoder.value = .object([])
-    }
-
-    private func append(key: String, value: _EncodedValue) {
-        pairs.append((key, value))
-        encoder.value = .object(pairs.pairs)
-    }
-
     mutating func encodeNil(forKey key: Key) throws {
-        append(key: encoder.convertedKey(key), value: .null)
+        try prepareToEncode()
+        try encodeKey(key)
+        let status = ksbonjson_addNull(&state.context)
+        guard status == KSBONJSON_ENCODE_OK else {
+            throw BONJSONEncodingError.encodingFailed(
+                ksbonjson_describeEncodeStatus(status).map { String(cString: $0) } ?? "Unknown error"
+            )
+        }
     }
 
     mutating func encode(_ value: Bool, forKey key: Key) throws {
-        append(key: encoder.convertedKey(key), value: .bool(value))
+        try prepareToEncode()
+        try encodeKey(key)
+        let status = ksbonjson_addBoolean(&state.context, value)
+        guard status == KSBONJSON_ENCODE_OK else {
+            throw BONJSONEncodingError.encodingFailed(
+                ksbonjson_describeEncodeStatus(status).map { String(cString: $0) } ?? "Unknown error"
+            )
+        }
     }
 
     mutating func encode(_ value: String, forKey key: Key) throws {
-        append(key: encoder.convertedKey(key), value: .string(value))
+        try prepareToEncode()
+        try encodeKey(key)
+        let status = value.withCString { cString in
+            ksbonjson_addString(&state.context, cString, strlen(cString))
+        }
+        guard status == KSBONJSON_ENCODE_OK else {
+            throw BONJSONEncodingError.encodingFailed(
+                ksbonjson_describeEncodeStatus(status).map { String(cString: $0) } ?? "Unknown error"
+            )
+        }
     }
 
     mutating func encode(_ value: Double, forKey key: Key) throws {
-        let encoded = try encoder.encodeFloat(value)
-        append(key: encoder.convertedKey(key), value: encoded)
+        try prepareToEncode()
+        try encodeKey(key)
+        let encoder = _StreamingEncoder(state: state, codingPath: codingPath + [key])
+        try encoder.encodeFloat(value)
     }
 
     mutating func encode(_ value: Float, forKey key: Key) throws {
-        let encoded = try encoder.encodeFloat(Double(value))
-        append(key: encoder.convertedKey(key), value: encoded)
+        try encode(Double(value), forKey: key)
     }
 
     mutating func encode(_ value: Int, forKey key: Key) throws {
-        append(key: encoder.convertedKey(key), value: .int(Int64(value)))
+        try prepareToEncode()
+        try encodeKey(key)
+        let status = ksbonjson_addSignedInteger(&state.context, Int64(value))
+        guard status == KSBONJSON_ENCODE_OK else {
+            throw BONJSONEncodingError.encodingFailed(
+                ksbonjson_describeEncodeStatus(status).map { String(cString: $0) } ?? "Unknown error"
+            )
+        }
     }
 
     mutating func encode(_ value: Int8, forKey key: Key) throws {
-        append(key: encoder.convertedKey(key), value: .int(Int64(value)))
+        try prepareToEncode()
+        try encodeKey(key)
+        let status = ksbonjson_addSignedInteger(&state.context, Int64(value))
+        guard status == KSBONJSON_ENCODE_OK else {
+            throw BONJSONEncodingError.encodingFailed(
+                ksbonjson_describeEncodeStatus(status).map { String(cString: $0) } ?? "Unknown error"
+            )
+        }
     }
 
     mutating func encode(_ value: Int16, forKey key: Key) throws {
-        append(key: encoder.convertedKey(key), value: .int(Int64(value)))
+        try prepareToEncode()
+        try encodeKey(key)
+        let status = ksbonjson_addSignedInteger(&state.context, Int64(value))
+        guard status == KSBONJSON_ENCODE_OK else {
+            throw BONJSONEncodingError.encodingFailed(
+                ksbonjson_describeEncodeStatus(status).map { String(cString: $0) } ?? "Unknown error"
+            )
+        }
     }
 
     mutating func encode(_ value: Int32, forKey key: Key) throws {
-        append(key: encoder.convertedKey(key), value: .int(Int64(value)))
+        try prepareToEncode()
+        try encodeKey(key)
+        let status = ksbonjson_addSignedInteger(&state.context, Int64(value))
+        guard status == KSBONJSON_ENCODE_OK else {
+            throw BONJSONEncodingError.encodingFailed(
+                ksbonjson_describeEncodeStatus(status).map { String(cString: $0) } ?? "Unknown error"
+            )
+        }
     }
 
     mutating func encode(_ value: Int64, forKey key: Key) throws {
-        append(key: encoder.convertedKey(key), value: .int(value))
+        try prepareToEncode()
+        try encodeKey(key)
+        let status = ksbonjson_addSignedInteger(&state.context, value)
+        guard status == KSBONJSON_ENCODE_OK else {
+            throw BONJSONEncodingError.encodingFailed(
+                ksbonjson_describeEncodeStatus(status).map { String(cString: $0) } ?? "Unknown error"
+            )
+        }
     }
 
     mutating func encode(_ value: UInt, forKey key: Key) throws {
-        append(key: encoder.convertedKey(key), value: .uint(UInt64(value)))
+        try prepareToEncode()
+        try encodeKey(key)
+        let status = ksbonjson_addUnsignedInteger(&state.context, UInt64(value))
+        guard status == KSBONJSON_ENCODE_OK else {
+            throw BONJSONEncodingError.encodingFailed(
+                ksbonjson_describeEncodeStatus(status).map { String(cString: $0) } ?? "Unknown error"
+            )
+        }
     }
 
     mutating func encode(_ value: UInt8, forKey key: Key) throws {
-        append(key: encoder.convertedKey(key), value: .uint(UInt64(value)))
+        try prepareToEncode()
+        try encodeKey(key)
+        let status = ksbonjson_addUnsignedInteger(&state.context, UInt64(value))
+        guard status == KSBONJSON_ENCODE_OK else {
+            throw BONJSONEncodingError.encodingFailed(
+                ksbonjson_describeEncodeStatus(status).map { String(cString: $0) } ?? "Unknown error"
+            )
+        }
     }
 
     mutating func encode(_ value: UInt16, forKey key: Key) throws {
-        append(key: encoder.convertedKey(key), value: .uint(UInt64(value)))
+        try prepareToEncode()
+        try encodeKey(key)
+        let status = ksbonjson_addUnsignedInteger(&state.context, UInt64(value))
+        guard status == KSBONJSON_ENCODE_OK else {
+            throw BONJSONEncodingError.encodingFailed(
+                ksbonjson_describeEncodeStatus(status).map { String(cString: $0) } ?? "Unknown error"
+            )
+        }
     }
 
     mutating func encode(_ value: UInt32, forKey key: Key) throws {
-        append(key: encoder.convertedKey(key), value: .uint(UInt64(value)))
+        try prepareToEncode()
+        try encodeKey(key)
+        let status = ksbonjson_addUnsignedInteger(&state.context, UInt64(value))
+        guard status == KSBONJSON_ENCODE_OK else {
+            throw BONJSONEncodingError.encodingFailed(
+                ksbonjson_describeEncodeStatus(status).map { String(cString: $0) } ?? "Unknown error"
+            )
+        }
     }
 
     mutating func encode(_ value: UInt64, forKey key: Key) throws {
-        append(key: encoder.convertedKey(key), value: .uint(value))
+        try prepareToEncode()
+        try encodeKey(key)
+        let status = ksbonjson_addUnsignedInteger(&state.context, value)
+        guard status == KSBONJSON_ENCODE_OK else {
+            throw BONJSONEncodingError.encodingFailed(
+                ksbonjson_describeEncodeStatus(status).map { String(cString: $0) } ?? "Unknown error"
+            )
+        }
     }
 
     mutating func encode<T: Encodable>(_ value: T, forKey key: Key) throws {
-        let nestedEncoder = createNestedEncoder(forKey: key)
-        try nestedEncoder.encodeValue(value)
-        if let encodedValue = nestedEncoder.value {
-            append(key: encoder.convertedKey(key), value: encodedValue)
-        }
+        try prepareToEncode()
+        try encodeKey(key)
+        let encoder = _StreamingEncoder(state: state, codingPath: codingPath + [key])
+        try encoder.encodeValue(value)
     }
 
     mutating func nestedContainer<NestedKey: CodingKey>(
         keyedBy keyType: NestedKey.Type,
         forKey key: Key
     ) -> KeyedEncodingContainer<NestedKey> {
-        let nestedEncoder = createNestedEncoder(forKey: key)
-        let container = _BONJSONKeyedEncodingContainer<NestedKey>(
-            encoder: nestedEncoder,
+        do {
+            try prepareToEncode()
+            try encodeKey(key)
+        } catch {
+            // Container creation shouldn't fail, but if it does we'll get an error later
+            assertionFailure("Failed to prepare nested container: \(error)")
+        }
+
+        let container = _StreamingKeyedEncodingContainer<NestedKey>(
+            state: state,
             codingPath: codingPath + [key]
         )
-
-        // Store a reference to update when container is done
-        let nestedPairs = container.pairs
-        pairs.addNested(key: encoder.convertedKey(key), pairs: nestedPairs, encoder: encoder)
-
         return KeyedEncodingContainer(container)
     }
 
     mutating func nestedUnkeyedContainer(forKey key: Key) -> UnkeyedEncodingContainer {
-        let nestedEncoder = createNestedEncoder(forKey: key)
-        let container = _BONJSONUnkeyedEncodingContainer(
-            encoder: nestedEncoder,
+        do {
+            try prepareToEncode()
+            try encodeKey(key)
+        } catch {
+            assertionFailure("Failed to prepare nested container: \(error)")
+        }
+
+        return _StreamingUnkeyedEncodingContainer(
+            state: state,
             codingPath: codingPath + [key]
         )
-
-        // Store a reference to update when container is done
-        pairs.addNestedArray(key: encoder.convertedKey(key), elements: container.elements, encoder: encoder)
-
-        return container
     }
 
     mutating func superEncoder() -> Encoder {
@@ -444,334 +603,374 @@ struct _BONJSONKeyedEncodingContainer<Key: CodingKey>: KeyedEncodingContainerPro
     }
 
     mutating func superEncoder(forKey key: Key) -> Encoder {
-        let nestedEncoder = createNestedEncoder(forKey: key)
-        pairs.addNestedEncoder(key: encoder.convertedKey(key), nestedEncoder: nestedEncoder, encoder: encoder)
-        return nestedEncoder
-    }
-
-    private func createNestedEncoder(forKey key: Key) -> _BONJSONEncoder {
-        return _BONJSONEncoder(
-            codingPath: codingPath + [key],
-            userInfo: encoder.userInfo,
-            dateEncodingStrategy: encoder.dateEncodingStrategy,
-            dataEncodingStrategy: encoder.dataEncodingStrategy,
-            nonConformingFloatEncodingStrategy: encoder.nonConformingFloatEncodingStrategy,
-            keyEncodingStrategy: encoder.keyEncodingStrategy
-        )
-    }
-}
-
-/// Helper class to accumulate object pairs with reference semantics.
-fileprivate final class _ObjectPairs {
-    var pairs: [(String, _EncodedValue)] = []
-    private var nestedContainers: [() -> Void] = []
-
-    func append(_ pair: (String, _EncodedValue)) {
-        // Finalize any pending nested containers
-        for finalizer in nestedContainers {
-            finalizer()
+        do {
+            try prepareToEncode()
+            try encodeKey(key)
+        } catch {
+            assertionFailure("Failed to prepare super encoder: \(error)")
         }
-        nestedContainers.removeAll()
-        pairs.append(pair)
-    }
 
-    func addNested(key: String, pairs nestedPairs: _ObjectPairs, encoder: _BONJSONEncoder) {
-        let index = pairs.count
-        pairs.append((key, .object([])))
-        nestedContainers.append { [weak self] in
-            self?.pairs[index] = (key, .object(nestedPairs.pairs))
-            encoder.value = .object(self?.pairs ?? [])
-        }
-    }
-
-    func addNestedArray(key: String, elements: _ArrayElements, encoder: _BONJSONEncoder) {
-        let index = pairs.count
-        pairs.append((key, .array([])))
-        nestedContainers.append { [weak self] in
-            self?.pairs[index] = (key, .array(elements.elements))
-            encoder.value = .object(self?.pairs ?? [])
-        }
-    }
-
-    func addNestedEncoder(key: String, nestedEncoder: _BONJSONEncoder, encoder: _BONJSONEncoder) {
-        let index = pairs.count
-        pairs.append((key, .null))
-        nestedContainers.append { [weak self] in
-            self?.pairs[index] = (key, nestedEncoder.value ?? .null)
-            encoder.value = .object(self?.pairs ?? [])
-        }
-    }
-
-    func finalize(encoder: _BONJSONEncoder) {
-        for finalizer in nestedContainers {
-            finalizer()
-        }
-        nestedContainers.removeAll()
-        encoder.value = .object(pairs)
+        return _StreamingEncoder(state: state, codingPath: codingPath + [key])
     }
 }
 
 // MARK: - Unkeyed Encoding Container
 
-struct _BONJSONUnkeyedEncodingContainer: UnkeyedEncodingContainer {
-    let encoder: _BONJSONEncoder
+struct _StreamingUnkeyedEncodingContainer: UnkeyedEncodingContainer {
+    let state: _EncoderState
     let codingPath: [CodingKey]
 
-    /// The accumulated elements.
-    fileprivate let elements: _ArrayElements
+    /// The depth when this container was created.
+    let containerDepth: Int
 
-    var count: Int { elements.count }
+    private(set) var count: Int = 0
 
-    init(encoder: _BONJSONEncoder, codingPath: [CodingKey]) {
-        self.encoder = encoder
+    init(state: _EncoderState, codingPath: [CodingKey]) {
+        self.state = state
         self.codingPath = codingPath
-        self.elements = _ArrayElements()
-        encoder.value = .array([])
+
+        // Begin array in C encoder
+        let status = ksbonjson_beginArray(&state.context)
+        assert(status == KSBONJSON_ENCODE_OK, "Failed to begin array")
+
+        self.containerDepth = state.currentDepth
     }
 
-    private func append(_ value: _EncodedValue) {
-        elements.append(value)
-        encoder.value = .array(elements.elements)
+    /// Ensures we're at the right depth before encoding a value.
+    private mutating func prepareToEncode() throws {
+        try state.closeContainersToDepth(containerDepth)
+        count += 1
     }
 
     mutating func encodeNil() throws {
-        append(.null)
+        try prepareToEncode()
+        let status = ksbonjson_addNull(&state.context)
+        guard status == KSBONJSON_ENCODE_OK else {
+            throw BONJSONEncodingError.encodingFailed(
+                ksbonjson_describeEncodeStatus(status).map { String(cString: $0) } ?? "Unknown error"
+            )
+        }
     }
 
     mutating func encode(_ value: Bool) throws {
-        append(.bool(value))
+        try prepareToEncode()
+        let status = ksbonjson_addBoolean(&state.context, value)
+        guard status == KSBONJSON_ENCODE_OK else {
+            throw BONJSONEncodingError.encodingFailed(
+                ksbonjson_describeEncodeStatus(status).map { String(cString: $0) } ?? "Unknown error"
+            )
+        }
     }
 
     mutating func encode(_ value: String) throws {
-        append(.string(value))
+        try prepareToEncode()
+        let status = value.withCString { cString in
+            ksbonjson_addString(&state.context, cString, strlen(cString))
+        }
+        guard status == KSBONJSON_ENCODE_OK else {
+            throw BONJSONEncodingError.encodingFailed(
+                ksbonjson_describeEncodeStatus(status).map { String(cString: $0) } ?? "Unknown error"
+            )
+        }
     }
 
     mutating func encode(_ value: Double) throws {
-        let encoded = try encoder.encodeFloat(value)
-        append(encoded)
+        try prepareToEncode()
+        let encoder = _StreamingEncoder(state: state, codingPath: codingPath + [_BONJSONIndexKey(index: count - 1)])
+        try encoder.encodeFloat(value)
     }
 
     mutating func encode(_ value: Float) throws {
-        let encoded = try encoder.encodeFloat(Double(value))
-        append(encoded)
+        try encode(Double(value))
     }
 
     mutating func encode(_ value: Int) throws {
-        append(.int(Int64(value)))
+        try prepareToEncode()
+        let status = ksbonjson_addSignedInteger(&state.context, Int64(value))
+        guard status == KSBONJSON_ENCODE_OK else {
+            throw BONJSONEncodingError.encodingFailed(
+                ksbonjson_describeEncodeStatus(status).map { String(cString: $0) } ?? "Unknown error"
+            )
+        }
     }
 
     mutating func encode(_ value: Int8) throws {
-        append(.int(Int64(value)))
+        try prepareToEncode()
+        let status = ksbonjson_addSignedInteger(&state.context, Int64(value))
+        guard status == KSBONJSON_ENCODE_OK else {
+            throw BONJSONEncodingError.encodingFailed(
+                ksbonjson_describeEncodeStatus(status).map { String(cString: $0) } ?? "Unknown error"
+            )
+        }
     }
 
     mutating func encode(_ value: Int16) throws {
-        append(.int(Int64(value)))
+        try prepareToEncode()
+        let status = ksbonjson_addSignedInteger(&state.context, Int64(value))
+        guard status == KSBONJSON_ENCODE_OK else {
+            throw BONJSONEncodingError.encodingFailed(
+                ksbonjson_describeEncodeStatus(status).map { String(cString: $0) } ?? "Unknown error"
+            )
+        }
     }
 
     mutating func encode(_ value: Int32) throws {
-        append(.int(Int64(value)))
+        try prepareToEncode()
+        let status = ksbonjson_addSignedInteger(&state.context, Int64(value))
+        guard status == KSBONJSON_ENCODE_OK else {
+            throw BONJSONEncodingError.encodingFailed(
+                ksbonjson_describeEncodeStatus(status).map { String(cString: $0) } ?? "Unknown error"
+            )
+        }
     }
 
     mutating func encode(_ value: Int64) throws {
-        append(.int(value))
+        try prepareToEncode()
+        let status = ksbonjson_addSignedInteger(&state.context, value)
+        guard status == KSBONJSON_ENCODE_OK else {
+            throw BONJSONEncodingError.encodingFailed(
+                ksbonjson_describeEncodeStatus(status).map { String(cString: $0) } ?? "Unknown error"
+            )
+        }
     }
 
     mutating func encode(_ value: UInt) throws {
-        append(.uint(UInt64(value)))
+        try prepareToEncode()
+        let status = ksbonjson_addUnsignedInteger(&state.context, UInt64(value))
+        guard status == KSBONJSON_ENCODE_OK else {
+            throw BONJSONEncodingError.encodingFailed(
+                ksbonjson_describeEncodeStatus(status).map { String(cString: $0) } ?? "Unknown error"
+            )
+        }
     }
 
     mutating func encode(_ value: UInt8) throws {
-        append(.uint(UInt64(value)))
+        try prepareToEncode()
+        let status = ksbonjson_addUnsignedInteger(&state.context, UInt64(value))
+        guard status == KSBONJSON_ENCODE_OK else {
+            throw BONJSONEncodingError.encodingFailed(
+                ksbonjson_describeEncodeStatus(status).map { String(cString: $0) } ?? "Unknown error"
+            )
+        }
     }
 
     mutating func encode(_ value: UInt16) throws {
-        append(.uint(UInt64(value)))
+        try prepareToEncode()
+        let status = ksbonjson_addUnsignedInteger(&state.context, UInt64(value))
+        guard status == KSBONJSON_ENCODE_OK else {
+            throw BONJSONEncodingError.encodingFailed(
+                ksbonjson_describeEncodeStatus(status).map { String(cString: $0) } ?? "Unknown error"
+            )
+        }
     }
 
     mutating func encode(_ value: UInt32) throws {
-        append(.uint(UInt64(value)))
+        try prepareToEncode()
+        let status = ksbonjson_addUnsignedInteger(&state.context, UInt64(value))
+        guard status == KSBONJSON_ENCODE_OK else {
+            throw BONJSONEncodingError.encodingFailed(
+                ksbonjson_describeEncodeStatus(status).map { String(cString: $0) } ?? "Unknown error"
+            )
+        }
     }
 
     mutating func encode(_ value: UInt64) throws {
-        append(.uint(value))
+        try prepareToEncode()
+        let status = ksbonjson_addUnsignedInteger(&state.context, value)
+        guard status == KSBONJSON_ENCODE_OK else {
+            throw BONJSONEncodingError.encodingFailed(
+                ksbonjson_describeEncodeStatus(status).map { String(cString: $0) } ?? "Unknown error"
+            )
+        }
     }
 
     mutating func encode<T: Encodable>(_ value: T) throws {
-        let nestedEncoder = createNestedEncoder()
-        try nestedEncoder.encodeValue(value)
-        if let encodedValue = nestedEncoder.value {
-            append(encodedValue)
-        }
+        try prepareToEncode()
+        let encoder = _StreamingEncoder(state: state, codingPath: codingPath + [_BONJSONIndexKey(index: count - 1)])
+        try encoder.encodeValue(value)
     }
 
     mutating func nestedContainer<NestedKey: CodingKey>(
         keyedBy keyType: NestedKey.Type
     ) -> KeyedEncodingContainer<NestedKey> {
-        let nestedEncoder = createNestedEncoder()
-        let container = _BONJSONKeyedEncodingContainer<NestedKey>(
-            encoder: nestedEncoder,
-            codingPath: codingPath + [_BONJSONIndexKey(index: count)]
+        do {
+            try prepareToEncode()
+        } catch {
+            assertionFailure("Failed to prepare nested container: \(error)")
+        }
+
+        let container = _StreamingKeyedEncodingContainer<NestedKey>(
+            state: state,
+            codingPath: codingPath + [_BONJSONIndexKey(index: count - 1)]
         )
-
-        elements.addNested(pairs: container.pairs, encoder: encoder)
-
         return KeyedEncodingContainer(container)
     }
 
     mutating func nestedUnkeyedContainer() -> UnkeyedEncodingContainer {
-        let nestedEncoder = createNestedEncoder()
-        let container = _BONJSONUnkeyedEncodingContainer(
-            encoder: nestedEncoder,
-            codingPath: codingPath + [_BONJSONIndexKey(index: count)]
+        do {
+            try prepareToEncode()
+        } catch {
+            assertionFailure("Failed to prepare nested container: \(error)")
+        }
+
+        return _StreamingUnkeyedEncodingContainer(
+            state: state,
+            codingPath: codingPath + [_BONJSONIndexKey(index: count - 1)]
         )
-
-        elements.addNestedArray(nestedElements: container.elements, encoder: encoder)
-
-        return container
     }
 
     mutating func superEncoder() -> Encoder {
-        let nestedEncoder = createNestedEncoder()
-        elements.addNestedEncoder(nestedEncoder: nestedEncoder, encoder: encoder)
-        return nestedEncoder
-    }
-
-    private func createNestedEncoder() -> _BONJSONEncoder {
-        return _BONJSONEncoder(
-            codingPath: codingPath + [_BONJSONIndexKey(index: count)],
-            userInfo: encoder.userInfo,
-            dateEncodingStrategy: encoder.dateEncodingStrategy,
-            dataEncodingStrategy: encoder.dataEncodingStrategy,
-            nonConformingFloatEncodingStrategy: encoder.nonConformingFloatEncodingStrategy,
-            keyEncodingStrategy: encoder.keyEncodingStrategy
-        )
-    }
-}
-
-/// Helper class to accumulate array elements with reference semantics.
-fileprivate final class _ArrayElements {
-    var elements: [_EncodedValue] = []
-    private var nestedContainers: [() -> Void] = []
-
-    var count: Int { elements.count }
-
-    func append(_ value: _EncodedValue) {
-        // Finalize any pending nested containers
-        for finalizer in nestedContainers {
-            finalizer()
+        do {
+            try prepareToEncode()
+        } catch {
+            assertionFailure("Failed to prepare super encoder: \(error)")
         }
-        nestedContainers.removeAll()
-        elements.append(value)
-    }
 
-    func addNested(pairs: _ObjectPairs, encoder: _BONJSONEncoder) {
-        let index = elements.count
-        elements.append(.object([]))
-        nestedContainers.append { [weak self] in
-            self?.elements[index] = .object(pairs.pairs)
-            encoder.value = .array(self?.elements ?? [])
-        }
-    }
-
-    func addNestedArray(nestedElements: _ArrayElements, encoder: _BONJSONEncoder) {
-        let index = elements.count
-        elements.append(.array([]))
-        nestedContainers.append { [weak self] in
-            self?.elements[index] = .array(nestedElements.elements)
-            encoder.value = .array(self?.elements ?? [])
-        }
-    }
-
-    func addNestedEncoder(nestedEncoder: _BONJSONEncoder, encoder: _BONJSONEncoder) {
-        let index = elements.count
-        elements.append(.null)
-        nestedContainers.append { [weak self] in
-            self?.elements[index] = nestedEncoder.value ?? .null
-            encoder.value = .array(self?.elements ?? [])
-        }
-    }
-
-    func finalize(encoder: _BONJSONEncoder) {
-        for finalizer in nestedContainers {
-            finalizer()
-        }
-        nestedContainers.removeAll()
-        encoder.value = .array(elements)
+        return _StreamingEncoder(state: state, codingPath: codingPath + [_BONJSONIndexKey(index: count - 1)])
     }
 }
 
 // MARK: - Single Value Encoding Container
 
-struct _BONJSONSingleValueEncodingContainer: SingleValueEncodingContainer {
-    let encoder: _BONJSONEncoder
+struct _StreamingSingleValueEncodingContainer: SingleValueEncodingContainer {
+    let state: _EncoderState
     let codingPath: [CodingKey]
 
-    init(encoder: _BONJSONEncoder, codingPath: [CodingKey]) {
-        self.encoder = encoder
+    init(state: _EncoderState, codingPath: [CodingKey]) {
+        self.state = state
         self.codingPath = codingPath
     }
 
     mutating func encodeNil() throws {
-        encoder.value = .null
+        let status = ksbonjson_addNull(&state.context)
+        guard status == KSBONJSON_ENCODE_OK else {
+            throw BONJSONEncodingError.encodingFailed(
+                ksbonjson_describeEncodeStatus(status).map { String(cString: $0) } ?? "Unknown error"
+            )
+        }
     }
 
     mutating func encode(_ value: Bool) throws {
-        encoder.value = .bool(value)
+        let status = ksbonjson_addBoolean(&state.context, value)
+        guard status == KSBONJSON_ENCODE_OK else {
+            throw BONJSONEncodingError.encodingFailed(
+                ksbonjson_describeEncodeStatus(status).map { String(cString: $0) } ?? "Unknown error"
+            )
+        }
     }
 
     mutating func encode(_ value: String) throws {
-        encoder.value = .string(value)
+        let status = value.withCString { cString in
+            ksbonjson_addString(&state.context, cString, strlen(cString))
+        }
+        guard status == KSBONJSON_ENCODE_OK else {
+            throw BONJSONEncodingError.encodingFailed(
+                ksbonjson_describeEncodeStatus(status).map { String(cString: $0) } ?? "Unknown error"
+            )
+        }
     }
 
     mutating func encode(_ value: Double) throws {
-        encoder.value = try encoder.encodeFloat(value)
+        let encoder = _StreamingEncoder(state: state, codingPath: codingPath)
+        try encoder.encodeFloat(value)
     }
 
     mutating func encode(_ value: Float) throws {
-        encoder.value = try encoder.encodeFloat(Double(value))
+        try encode(Double(value))
     }
 
     mutating func encode(_ value: Int) throws {
-        encoder.value = .int(Int64(value))
+        let status = ksbonjson_addSignedInteger(&state.context, Int64(value))
+        guard status == KSBONJSON_ENCODE_OK else {
+            throw BONJSONEncodingError.encodingFailed(
+                ksbonjson_describeEncodeStatus(status).map { String(cString: $0) } ?? "Unknown error"
+            )
+        }
     }
 
     mutating func encode(_ value: Int8) throws {
-        encoder.value = .int(Int64(value))
+        let status = ksbonjson_addSignedInteger(&state.context, Int64(value))
+        guard status == KSBONJSON_ENCODE_OK else {
+            throw BONJSONEncodingError.encodingFailed(
+                ksbonjson_describeEncodeStatus(status).map { String(cString: $0) } ?? "Unknown error"
+            )
+        }
     }
 
     mutating func encode(_ value: Int16) throws {
-        encoder.value = .int(Int64(value))
+        let status = ksbonjson_addSignedInteger(&state.context, Int64(value))
+        guard status == KSBONJSON_ENCODE_OK else {
+            throw BONJSONEncodingError.encodingFailed(
+                ksbonjson_describeEncodeStatus(status).map { String(cString: $0) } ?? "Unknown error"
+            )
+        }
     }
 
     mutating func encode(_ value: Int32) throws {
-        encoder.value = .int(Int64(value))
+        let status = ksbonjson_addSignedInteger(&state.context, Int64(value))
+        guard status == KSBONJSON_ENCODE_OK else {
+            throw BONJSONEncodingError.encodingFailed(
+                ksbonjson_describeEncodeStatus(status).map { String(cString: $0) } ?? "Unknown error"
+            )
+        }
     }
 
     mutating func encode(_ value: Int64) throws {
-        encoder.value = .int(value)
+        let status = ksbonjson_addSignedInteger(&state.context, value)
+        guard status == KSBONJSON_ENCODE_OK else {
+            throw BONJSONEncodingError.encodingFailed(
+                ksbonjson_describeEncodeStatus(status).map { String(cString: $0) } ?? "Unknown error"
+            )
+        }
     }
 
     mutating func encode(_ value: UInt) throws {
-        encoder.value = .uint(UInt64(value))
+        let status = ksbonjson_addUnsignedInteger(&state.context, UInt64(value))
+        guard status == KSBONJSON_ENCODE_OK else {
+            throw BONJSONEncodingError.encodingFailed(
+                ksbonjson_describeEncodeStatus(status).map { String(cString: $0) } ?? "Unknown error"
+            )
+        }
     }
 
     mutating func encode(_ value: UInt8) throws {
-        encoder.value = .uint(UInt64(value))
+        let status = ksbonjson_addUnsignedInteger(&state.context, UInt64(value))
+        guard status == KSBONJSON_ENCODE_OK else {
+            throw BONJSONEncodingError.encodingFailed(
+                ksbonjson_describeEncodeStatus(status).map { String(cString: $0) } ?? "Unknown error"
+            )
+        }
     }
 
     mutating func encode(_ value: UInt16) throws {
-        encoder.value = .uint(UInt64(value))
+        let status = ksbonjson_addUnsignedInteger(&state.context, UInt64(value))
+        guard status == KSBONJSON_ENCODE_OK else {
+            throw BONJSONEncodingError.encodingFailed(
+                ksbonjson_describeEncodeStatus(status).map { String(cString: $0) } ?? "Unknown error"
+            )
+        }
     }
 
     mutating func encode(_ value: UInt32) throws {
-        encoder.value = .uint(UInt64(value))
+        let status = ksbonjson_addUnsignedInteger(&state.context, UInt64(value))
+        guard status == KSBONJSON_ENCODE_OK else {
+            throw BONJSONEncodingError.encodingFailed(
+                ksbonjson_describeEncodeStatus(status).map { String(cString: $0) } ?? "Unknown error"
+            )
+        }
     }
 
     mutating func encode(_ value: UInt64) throws {
-        encoder.value = .uint(value)
+        let status = ksbonjson_addUnsignedInteger(&state.context, value)
+        guard status == KSBONJSON_ENCODE_OK else {
+            throw BONJSONEncodingError.encodingFailed(
+                ksbonjson_describeEncodeStatus(status).map { String(cString: $0) } ?? "Unknown error"
+            )
+        }
     }
 
     mutating func encode<T: Encodable>(_ value: T) throws {
+        let encoder = _StreamingEncoder(state: state, codingPath: codingPath)
         try encoder.encodeValue(value)
     }
 }

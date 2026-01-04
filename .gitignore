@@ -31,3 +31,4 @@ DerivedData/
 
 # Test output
 .testoutput/
+.vscode

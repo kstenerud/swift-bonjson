@@ -16,7 +16,11 @@ let package = Package(
     ],
     targets: [
         .target(
-            name: "BONJSON"),
+            name: "CKSBonjson",
+            publicHeadersPath: "include"),
+        .target(
+            name: "BONJSON",
+            dependencies: ["CKSBonjson"]),
         .executableTarget(
             name: "BONJSONBenchmark",
             dependencies: ["BONJSON"]),
