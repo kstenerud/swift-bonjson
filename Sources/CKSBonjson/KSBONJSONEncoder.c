@@ -192,15 +192,24 @@ static inline void bufferWriteByte(KSBONJSONBufferEncodeContext* ctx, uint8_t by
     ctx->buffer[ctx->position++] = byte;
 }
 
-void ksbonjson_encodeToBuffer_begin(KSBONJSONBufferEncodeContext* ctx,
-                                    uint8_t* buffer,
-                                    size_t capacity)
+void ksbonjson_encodeToBuffer_beginWithFlags(KSBONJSONBufferEncodeContext* ctx,
+                                              uint8_t* buffer,
+                                              size_t capacity,
+                                              KSBONJSONEncodeFlags flags)
 {
     memset(ctx, 0, sizeof(*ctx));
     ctx->buffer = buffer;
     ctx->capacity = capacity;
     ctx->position = 0;
     ctx->containerDepth = 0;
+    ctx->flags = flags;
+}
+
+void ksbonjson_encodeToBuffer_begin(KSBONJSONBufferEncodeContext* ctx,
+                                    uint8_t* buffer,
+                                    size_t capacity)
+{
+    ksbonjson_encodeToBuffer_beginWithFlags(ctx, buffer, capacity, ksbonjson_defaultEncodeFlags());
 }
 
 void ksbonjson_encodeToBuffer_setBuffer(KSBONJSONBufferEncodeContext* ctx,
@@ -417,6 +426,18 @@ ssize_t ksbonjson_encodeToBuffer_string(KSBONJSONBufferEncodeContext* ctx,
     unlikely_if(!value || container->isChunkingString)
     {
         return container->isChunkingString ? -KSBONJSON_ENCODE_CHUNKING_STRING : -KSBONJSON_ENCODE_NULL_POINTER;
+    }
+
+    // Check for NUL characters if required
+    if (ctx->flags.rejectNUL)
+    {
+        for (size_t i = 0; i < length; i++)
+        {
+            unlikely_if(value[i] == '\0')
+            {
+                return -KSBONJSON_ENCODE_NUL_CHARACTER;
+            }
+        }
     }
 
     // String can be a name or value, so flip expectation
@@ -666,6 +687,23 @@ ssize_t ksbonjson_encodeToBuffer_stringArray(
         return container->isChunkingString ? -KSBONJSON_ENCODE_CHUNKING_STRING : -KSBONJSON_ENCODE_EXPECTED_OBJECT_NAME;
     }
     container->isExpectingName = true;
+
+    // Check for NUL characters in all strings if required
+    if (ctx->flags.rejectNUL)
+    {
+        for (size_t i = 0; i < count; i++)
+        {
+            const char* str = strings[i];
+            size_t len = lengths[i];
+            for (size_t j = 0; j < len; j++)
+            {
+                unlikely_if(str[j] == '\0')
+                {
+                    return -KSBONJSON_ENCODE_NUL_CHARACTER;
+                }
+            }
+        }
+    }
 
     size_t totalBytes = 0;
 
@@ -1065,6 +1103,8 @@ const char* ksbonjson_describeEncodeStatus(const ksbonjson_encodeStatus status)
             return "Passed in data was too big or long";
         case KSBONJSON_ENCODE_BUFFER_TOO_SMALL:
             return "Buffer is too small for the encoded data";
+        case KSBONJSON_ENCODE_NUL_CHARACTER:
+            return "A string value contained a NUL character";
         case KSBONJSON_ENCODE_COULD_NOT_ADD_DATA:
             return "addEncodedBytes() failed to process the passed in data";
         default:

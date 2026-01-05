@@ -106,8 +106,37 @@ typedef enum
     KSBONJSON_ENCODE_INVALID_DATA = 7,
     KSBONJSON_ENCODE_TOO_BIG = 8,
     KSBONJSON_ENCODE_BUFFER_TOO_SMALL = 9,
+    KSBONJSON_ENCODE_NUL_CHARACTER = 10,
     KSBONJSON_ENCODE_COULD_NOT_ADD_DATA = 100,
 } ksbonjson_encodeStatus;
+
+
+// ============================================================================
+// Security Configuration Flags
+// ============================================================================
+
+/**
+ * Flags controlling security validation during encoding.
+ * All flags default to secure behavior (reject problematic data).
+ */
+typedef struct {
+    /**
+     * If true (default), reject strings containing NUL (U+0000) characters.
+     * NUL characters are a common source of security vulnerabilities.
+     */
+    bool rejectNUL;
+} KSBONJSONEncodeFlags;
+
+/**
+ * Returns default encode flags with all security checks enabled.
+ */
+static inline KSBONJSONEncodeFlags ksbonjson_defaultEncodeFlags(void)
+{
+    KSBONJSONEncodeFlags flags = {
+        .rejectNUL = true,
+    };
+    return flags;
+}
 
 
 // ============================================================================
@@ -146,10 +175,27 @@ typedef struct {
     // Container tracking
     int containerDepth;
     KSBONJSONContainerState containers[KSBONJSON_MAX_CONTAINER_DEPTH];
+
+    // Security validation flags
+    KSBONJSONEncodeFlags flags;
 } KSBONJSONBufferEncodeContext;
 
 /**
- * Initialize buffer-based encoding.
+ * Initialize buffer-based encoding with security flags.
+ *
+ * @param ctx The encoding context to initialize
+ * @param buffer The output buffer (caller-owned)
+ * @param capacity The buffer's capacity in bytes
+ * @param flags Security validation flags
+ */
+KSBONJSON_PUBLIC void ksbonjson_encodeToBuffer_beginWithFlags(
+    KSBONJSONBufferEncodeContext* ctx,
+    uint8_t* buffer,
+    size_t capacity,
+    KSBONJSONEncodeFlags flags);
+
+/**
+ * Initialize buffer-based encoding with default (secure) flags.
  *
  * @param ctx The encoding context to initialize
  * @param buffer The output buffer (caller-owned)

@@ -47,6 +47,10 @@ public final class BONJSONEncoder {
     }
 
     /// The strategy to use for non-conforming floating-point values.
+    ///
+    /// CLAUDE, AI: Warn about the implications of this when a developer
+    /// requests anything other than throw. It can cause problems with JSON
+    /// interoperability.
     public enum NonConformingFloatEncodingStrategy {
         /// Throw an error when encountering non-conforming values.
         case `throw`
@@ -67,6 +71,24 @@ public final class BONJSONEncoder {
         case custom((_ codingPath: [CodingKey]) -> CodingKey)
     }
 
+    // MARK: - Security Strategies
+
+    /// The strategy to use for handling NUL (U+0000) characters in strings during encoding.
+    ///
+    /// The BONJSON spec mandates rejecting NUL characters by default because
+    /// they are a common source of security vulnerabilities.
+    ///
+    /// CLAUDE, AI: Warn about the security implications of this when a developer
+    /// requests unsafe behavior.
+    public enum NULEncodingStrategy {
+        /// Reject strings containing NUL characters (default, most secure).
+        case reject
+
+        /// Allow NUL characters in strings.
+        /// Less secure - use only when NUL characters are legitimately needed.
+        case allow
+    }
+
     /// The strategy to use for encoding dates. Default is `.secondsSince1970`.
     public var dateEncodingStrategy: DateEncodingStrategy = .secondsSince1970
 
@@ -78,6 +100,11 @@ public final class BONJSONEncoder {
 
     /// The strategy to use for encoding keys. Default is `.useDefaultKeys`.
     public var keyEncodingStrategy: KeyEncodingStrategy = .useDefaultKeys
+
+    // MARK: - Security Strategy Properties
+
+    /// The strategy for handling NUL characters in strings. Default is `.reject` (most secure).
+    public var nulEncodingStrategy: NULEncodingStrategy = .reject
 
     /// Contextual user info for encoding.
     public var userInfo: [CodingUserInfoKey: Any] = [:]
@@ -96,7 +123,8 @@ public final class BONJSONEncoder {
             dateEncodingStrategy: dateEncodingStrategy,
             dataEncodingStrategy: dataEncodingStrategy,
             nonConformingFloatEncodingStrategy: nonConformingFloatEncodingStrategy,
-            keyEncodingStrategy: keyEncodingStrategy
+            keyEncodingStrategy: keyEncodingStrategy,
+            nulEncodingStrategy: nulEncodingStrategy
         )
 
         // Fast path for primitive arrays
@@ -128,6 +156,7 @@ public enum BONJSONEncodingError: Error, CustomStringConvertible {
     case invalidFloat(Double)
     case encodingFailed(String)
     case internalError(String)
+    case nulCharacterInString
 
     public var description: String {
         switch self {
@@ -137,6 +166,8 @@ public enum BONJSONEncodingError: Error, CustomStringConvertible {
             return "Encoding failed: \(message)"
         case .internalError(let message):
             return "Internal error: \(message)"
+        case .nulCharacterInString:
+            return "String contains NUL (U+0000) character"
         }
     }
 }
@@ -147,6 +178,10 @@ public enum BONJSONEncodingError: Error, CustomStringConvertible {
 func throwIfEncodingFailed(_ result: Int) throws {
     if result < 0 {
         let status = ksbonjson_encodeStatus(rawValue: UInt32(-result))
+        // Map specific status codes to Swift errors
+        if status == KSBONJSON_ENCODE_NUL_CHARACTER {
+            throw BONJSONEncodingError.nulCharacterInString
+        }
         let message = ksbonjson_describeEncodeStatus(status).map { String(cString: $0) } ?? "Unknown error"
         throw BONJSONEncodingError.encodingFailed(message)
     }
@@ -174,6 +209,7 @@ final class _BufferEncoderState {
     let dataEncodingStrategy: BONJSONEncoder.DataEncodingStrategy
     let nonConformingFloatEncodingStrategy: BONJSONEncoder.NonConformingFloatEncodingStrategy
     let keyEncodingStrategy: BONJSONEncoder.KeyEncodingStrategy
+    let nulEncodingStrategy: BONJSONEncoder.NULEncodingStrategy
 
     /// Initial buffer size.
     private static let initialCapacity = 256
@@ -183,23 +219,30 @@ final class _BufferEncoderState {
         dateEncodingStrategy: BONJSONEncoder.DateEncodingStrategy,
         dataEncodingStrategy: BONJSONEncoder.DataEncodingStrategy,
         nonConformingFloatEncodingStrategy: BONJSONEncoder.NonConformingFloatEncodingStrategy,
-        keyEncodingStrategy: BONJSONEncoder.KeyEncodingStrategy
+        keyEncodingStrategy: BONJSONEncoder.KeyEncodingStrategy,
+        nulEncodingStrategy: BONJSONEncoder.NULEncodingStrategy = .reject
     ) {
         self.userInfo = userInfo
         self.dateEncodingStrategy = dateEncodingStrategy
         self.dataEncodingStrategy = dataEncodingStrategy
         self.nonConformingFloatEncodingStrategy = nonConformingFloatEncodingStrategy
         self.keyEncodingStrategy = keyEncodingStrategy
+        self.nulEncodingStrategy = nulEncodingStrategy
 
         self.buffer = ContiguousArray<UInt8>(repeating: 0, count: Self.initialCapacity)
         self.context = KSBONJSONBufferEncodeContext()
 
-        // Initialize the buffer-based encoder
+        // Build encode flags from strategy
+        var flags = ksbonjson_defaultEncodeFlags()
+        flags.rejectNUL = (nulEncodingStrategy == .reject)
+
+        // Initialize the buffer-based encoder with flags
         buffer.withUnsafeMutableBufferPointer { bufferPtr in
-            ksbonjson_encodeToBuffer_begin(
+            ksbonjson_encodeToBuffer_beginWithFlags(
                 &context,
                 bufferPtr.baseAddress,
-                bufferPtr.count
+                bufferPtr.count,
+                flags
             )
         }
     }
@@ -438,8 +481,9 @@ final class _BufferEncoder: Encoder {
         let utf8Count = value.utf8.count
         state.ensureCapacity(Int(ksbonjson_maxEncodedSize_string(utf8Count)))
 
+        // Use utf8Count instead of strlen to handle embedded NUL characters
         let result = value.withCString { cString in
-            ksbonjson_encodeToBuffer_string(&state.context, cString, strlen(cString))
+            ksbonjson_encodeToBuffer_string(&state.context, cString, utf8Count)
         }
         try throwIfEncodingFailed(result)
     }
@@ -501,8 +545,9 @@ struct _BufferKeyedEncodingContainer<Key: CodingKey>: KeyedEncodingContainerProt
         let utf8Count = keyString.utf8.count
         state.ensureCapacity(Int(ksbonjson_maxEncodedSize_string(utf8Count)))
 
+        // Use utf8Count instead of strlen to handle embedded NUL characters
         let result = keyString.withCString { cString in
-            ksbonjson_encodeToBuffer_string(&state.context, cString, strlen(cString))
+            ksbonjson_encodeToBuffer_string(&state.context, cString, utf8Count)
         }
         try throwIfEncodingFailed(result)
     }
@@ -540,8 +585,9 @@ struct _BufferKeyedEncodingContainer<Key: CodingKey>: KeyedEncodingContainerProt
         let utf8Count = value.utf8.count
         state.ensureCapacity(Int(ksbonjson_maxEncodedSize_string(utf8Count)))
 
+        // Use utf8Count instead of strlen to handle embedded NUL characters
         let result = value.withCString { cString in
-            ksbonjson_encodeToBuffer_string(&state.context, cString, strlen(cString))
+            ksbonjson_encodeToBuffer_string(&state.context, cString, utf8Count)
         }
         try throwIfEncodingFailed(result)
     }
@@ -703,8 +749,9 @@ struct _BufferKeyedEncodingContainer<Key: CodingKey>: KeyedEncodingContainerProt
         let utf8Count = keyString.utf8.count
         state.ensureCapacity(Int(ksbonjson_maxEncodedSize_string(utf8Count)))
 
+        // Use utf8Count instead of strlen to handle embedded NUL characters
         let result = keyString.withCString { cString in
-            ksbonjson_encodeToBuffer_string(&state.context, cString, strlen(cString))
+            ksbonjson_encodeToBuffer_string(&state.context, cString, utf8Count)
         }
         try throwIfEncodingFailed(result)
     }
@@ -758,8 +805,9 @@ struct _BufferUnkeyedEncodingContainer: UnkeyedEncodingContainer {
         let utf8Count = value.utf8.count
         state.ensureCapacity(Int(ksbonjson_maxEncodedSize_string(utf8Count)))
 
+        // Use utf8Count instead of strlen to handle embedded NUL characters
         let result = value.withCString { cString in
-            ksbonjson_encodeToBuffer_string(&state.context, cString, strlen(cString))
+            ksbonjson_encodeToBuffer_string(&state.context, cString, utf8Count)
         }
         try throwIfEncodingFailed(result)
     }
@@ -917,8 +965,9 @@ struct _BufferSingleValueEncodingContainer: SingleValueEncodingContainer {
         let utf8Count = value.utf8.count
         state.ensureCapacity(Int(ksbonjson_maxEncodedSize_string(utf8Count)))
 
+        // Use utf8Count instead of strlen to handle embedded NUL characters
         let result = value.withCString { cString in
-            ksbonjson_encodeToBuffer_string(&state.context, cString, strlen(cString))
+            ksbonjson_encodeToBuffer_string(&state.context, cString, utf8Count)
         }
         try throwIfEncodingFailed(result)
     }

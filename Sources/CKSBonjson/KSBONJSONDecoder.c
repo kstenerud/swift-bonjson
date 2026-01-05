@@ -36,6 +36,150 @@
 
 
 // ============================================================================
+// UTF-8 Validation
+// ============================================================================
+
+/**
+ * Validate a UTF-8 string, checking for the requested issues:
+ * - If rejectInvalidUTF8: Well-formed sequences, no overlong, no surrogates, no >U+10FFFF
+ * - If rejectNUL: No NUL characters
+ *
+ * @param data The UTF-8 data to validate
+ * @param length Length of data in bytes
+ * @param rejectNUL If true, NUL characters cause validation failure
+ * @param rejectInvalidUTF8 If true, invalid UTF-8 sequences cause validation failure
+ * @return KSBONJSON_DECODE_OK if valid, error code otherwise
+ */
+static ksbonjson_decodeStatus validateString(const uint8_t* data, size_t length, bool rejectNUL, bool rejectInvalidUTF8)
+{
+    // Fast path: if only checking NUL, just scan for 0x00
+    if (rejectNUL && !rejectInvalidUTF8)
+    {
+        for (size_t i = 0; i < length; i++)
+        {
+            unlikely_if(data[i] == 0x00)
+            {
+                return KSBONJSON_DECODE_NUL_CHARACTER;
+            }
+        }
+        return KSBONJSON_DECODE_OK;
+    }
+
+    // Full UTF-8 validation (with optional NUL check)
+    const uint8_t* end = data + length;
+
+    while (data < end)
+    {
+        uint8_t b0 = *data;
+
+        // ASCII (0x00-0x7F)
+        if (b0 < 0x80)
+        {
+            // Check for NUL
+            unlikely_if(rejectNUL && b0 == 0x00)
+            {
+                return KSBONJSON_DECODE_NUL_CHARACTER;
+            }
+            data++;
+            continue;
+        }
+
+        // Invalid: continuation byte without leading byte (0x80-0xBF)
+        unlikely_if(b0 < 0xC0)
+        {
+            return KSBONJSON_DECODE_INVALID_UTF8;
+        }
+
+        // Invalid: 0xC0 and 0xC1 are overlong encodings of ASCII
+        unlikely_if(b0 < 0xC2)
+        {
+            return KSBONJSON_DECODE_INVALID_UTF8;
+        }
+
+        // 2-byte sequence (0xC2-0xDF)
+        if (b0 < 0xE0)
+        {
+            unlikely_if(data + 1 >= end)
+            {
+                return KSBONJSON_DECODE_INVALID_UTF8;
+            }
+            uint8_t b1 = data[1];
+            // Check continuation byte
+            unlikely_if((b1 & 0xC0) != 0x80)
+            {
+                return KSBONJSON_DECODE_INVALID_UTF8;
+            }
+            data += 2;
+            continue;
+        }
+
+        // 3-byte sequence (0xE0-0xEF)
+        if (b0 < 0xF0)
+        {
+            unlikely_if(data + 2 >= end)
+            {
+                return KSBONJSON_DECODE_INVALID_UTF8;
+            }
+            uint8_t b1 = data[1];
+            uint8_t b2 = data[2];
+            // Check continuation bytes
+            unlikely_if((b1 & 0xC0) != 0x80 || (b2 & 0xC0) != 0x80)
+            {
+                return KSBONJSON_DECODE_INVALID_UTF8;
+            }
+            // Check for overlong encoding (codepoint < 0x800)
+            unlikely_if(b0 == 0xE0 && b1 < 0xA0)
+            {
+                return KSBONJSON_DECODE_INVALID_UTF8;
+            }
+            // Check for surrogates (U+D800-U+DFFF)
+            // Encoded as 0xED 0xA0-0xBF 0x80-0xBF
+            unlikely_if(b0 == 0xED && b1 >= 0xA0)
+            {
+                return KSBONJSON_DECODE_INVALID_UTF8;
+            }
+            data += 3;
+            continue;
+        }
+
+        // 4-byte sequence (0xF0-0xF4)
+        if (b0 < 0xF5)
+        {
+            unlikely_if(data + 3 >= end)
+            {
+                return KSBONJSON_DECODE_INVALID_UTF8;
+            }
+            uint8_t b1 = data[1];
+            uint8_t b2 = data[2];
+            uint8_t b3 = data[3];
+            // Check continuation bytes
+            unlikely_if((b1 & 0xC0) != 0x80 || (b2 & 0xC0) != 0x80 || (b3 & 0xC0) != 0x80)
+            {
+                return KSBONJSON_DECODE_INVALID_UTF8;
+            }
+            // Check for overlong encoding (codepoint < 0x10000)
+            unlikely_if(b0 == 0xF0 && b1 < 0x90)
+            {
+                return KSBONJSON_DECODE_INVALID_UTF8;
+            }
+            // Check for codepoint > U+10FFFF
+            unlikely_if(b0 == 0xF4 && b1 > 0x8F)
+            {
+                return KSBONJSON_DECODE_INVALID_UTF8;
+            }
+            data += 4;
+            continue;
+        }
+
+        // Invalid: bytes 0xF5-0xFF are not valid UTF-8 leading bytes
+        return KSBONJSON_DECODE_INVALID_UTF8;
+    }
+
+    return KSBONJSON_DECODE_OK;
+}
+
+
+// ============================================================================
 // Types
 // ============================================================================
 
@@ -526,6 +670,10 @@ const char* ksbonjson_describeDecodeStatus(const ksbonjson_decodeStatus status)
             return "The value is out of range and cannot be stored without data loss";
         case KSBONJSON_DECODE_MAP_FULL:
             return "The position map entry buffer is full";
+        case KSBONJSON_DECODE_INVALID_UTF8:
+            return "A string contained invalid UTF-8 (malformed sequence, surrogate, or overlong encoding)";
+        case KSBONJSON_DECODE_TOO_MANY_KEYS:
+            return "Object has more keys than the duplicate detection limit (256)";
         default:
             return "(unknown status - was it a user-defined status code?)";
     }
@@ -641,6 +789,19 @@ static ksbonjson_decodeStatus mapScanShortString(KSBONJSONMapContext* ctx, uint8
     size_t offset = ctx->position;
 
     MAP_SHOULD_HAVE_ROOM_FOR_BYTES(length);
+
+    // Validate string if required
+    if (ctx->flags.rejectInvalidUTF8 || ctx->flags.rejectNUL)
+    {
+        ksbonjson_decodeStatus status = validateString(ctx->input + offset, length,
+                                                        ctx->flags.rejectNUL,
+                                                        ctx->flags.rejectInvalidUTF8);
+        unlikely_if(status != KSBONJSON_DECODE_OK)
+        {
+            return status;
+        }
+    }
+
     ctx->position += length;
 
     KSBONJSONMapEntry entry = {
@@ -663,6 +824,7 @@ static ksbonjson_decodeStatus mapScanLongString(KSBONJSONMapContext* ctx, size_t
     size_t firstOffset = 0;
     size_t totalLength = 0;
     bool firstChunk = true;
+    bool needsValidation = ctx->flags.rejectInvalidUTF8 || ctx->flags.rejectNUL;
 
     bool moreChunksFollow = true;
     while (moreChunksFollow)
@@ -681,6 +843,18 @@ static ksbonjson_decodeStatus mapScanLongString(KSBONJSONMapContext* ctx, size_t
         }
 
         MAP_SHOULD_HAVE_ROOM_FOR_BYTES(chunkLength);
+
+        // Validate string per chunk if required
+        if (needsValidation)
+        {
+            status = validateString(ctx->input + ctx->position, (size_t)chunkLength,
+                                    ctx->flags.rejectNUL, ctx->flags.rejectInvalidUTF8);
+            unlikely_if(status != KSBONJSON_DECODE_OK)
+            {
+                return status;
+            }
+        }
+
         totalLength += (size_t)chunkLength;
         ctx->position += (size_t)chunkLength;
     }
@@ -901,6 +1075,30 @@ static ksbonjson_decodeStatus mapScanObjectName(KSBONJSONMapContext* ctx, size_t
     }
 }
 
+/**
+ * Compare two string entries for equality.
+ * Returns true if the strings are identical.
+ */
+static inline bool stringsEqual(
+    KSBONJSONMapContext* ctx,
+    const KSBONJSONMapEntry* a,
+    const KSBONJSONMapEntry* b)
+{
+    if (a->data.string.length != b->data.string.length)
+    {
+        return false;
+    }
+    return memcmp(
+        ctx->input + a->data.string.offset,
+        ctx->input + b->data.string.offset,
+        a->data.string.length
+    ) == 0;
+}
+
+// Maximum number of keys we can track for duplicate detection per object.
+// Objects with more keys than this will cause an error if duplicate detection is enabled.
+#define MAX_TRACKED_KEYS 256
+
 // Scan an object container
 static ksbonjson_decodeStatus mapScanObject(KSBONJSONMapContext* ctx, size_t* outIndex)
 {
@@ -926,6 +1124,11 @@ static ksbonjson_decodeStatus mapScanObject(KSBONJSONMapContext* ctx, size_t* ou
     // The first child will be the next entry
     size_t firstChild = ctx->entriesCount;
     uint32_t count = 0; // counts key-value pairs (so 2 entries per pair)
+    bool checkDuplicates = ctx->flags.rejectDuplicateKeys;
+
+    // Track key indices for duplicate detection
+    size_t keyIndices[MAX_TRACKED_KEYS];
+    size_t keyCount = 0;
 
     // Scan key-value pairs until we hit TYPE_END
     while (ctx->position < ctx->inputLength)
@@ -942,6 +1145,28 @@ static ksbonjson_decodeStatus mapScanObject(KSBONJSONMapContext* ctx, size_t* ou
         size_t keyIndex;
         ksbonjson_decodeStatus status = mapScanObjectName(ctx, &keyIndex);
         unlikely_if(status != KSBONJSON_DECODE_OK) return status;
+
+        // Check for duplicate keys if required
+        if (checkDuplicates)
+        {
+            // Error if object has more keys than we can track
+            unlikely_if(keyCount >= MAX_TRACKED_KEYS)
+            {
+                return KSBONJSON_DECODE_TOO_MANY_KEYS;
+            }
+
+            const KSBONJSONMapEntry* newKey = &ctx->entries[keyIndex];
+            // Check against all previous keys in this object
+            for (size_t i = 0; i < keyCount; i++)
+            {
+                const KSBONJSONMapEntry* existingKey = &ctx->entries[keyIndices[i]];
+                unlikely_if(stringsEqual(ctx, newKey, existingKey))
+                {
+                    return KSBONJSON_DECODE_DUPLICATE_OBJECT_NAME;
+                }
+            }
+            keyIndices[keyCount++] = keyIndex;
+        }
 
         // Scan value
         size_t valueIndex;
@@ -1042,12 +1267,13 @@ static ksbonjson_decodeStatus mapScanValue(KSBONJSONMapContext* ctx, size_t* out
 // Position Map Public API
 // ============================================================================
 
-void ksbonjson_map_begin(
+void ksbonjson_map_beginWithFlags(
     KSBONJSONMapContext* ctx,
     const uint8_t* input,
     size_t inputLength,
     KSBONJSONMapEntry* entries,
-    size_t entriesCapacity)
+    size_t entriesCapacity,
+    KSBONJSONDecodeFlags flags)
 {
     ctx->input = input;
     ctx->inputLength = inputLength;
@@ -1057,6 +1283,17 @@ void ksbonjson_map_begin(
     ctx->rootIndex = 0;
     ctx->position = 0;
     ctx->containerDepth = 0;
+    ctx->flags = flags;
+}
+
+void ksbonjson_map_begin(
+    KSBONJSONMapContext* ctx,
+    const uint8_t* input,
+    size_t inputLength,
+    KSBONJSONMapEntry* entries,
+    size_t entriesCapacity)
+{
+    ksbonjson_map_beginWithFlags(ctx, input, inputLength, entries, entriesCapacity, ksbonjson_defaultDecodeFlags());
 }
 
 ksbonjson_decodeStatus ksbonjson_map_scan(KSBONJSONMapContext* ctx)

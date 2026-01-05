@@ -105,8 +105,53 @@ typedef enum
     KSBONJSON_DECODE_VALUE_OUT_OF_RANGE = 9,
     KSBONJSON_DECODE_NUL_CHARACTER = 10,
     KSBONJSON_DECODE_MAP_FULL = 11,
+    KSBONJSON_DECODE_INVALID_UTF8 = 12,
+    KSBONJSON_DECODE_TOO_MANY_KEYS = 13,
     KSBONJSON_DECODE_COULD_NOT_PROCESS_DATA = 100,
 } ksbonjson_decodeStatus;
+
+
+// ============================================================================
+// Security Configuration Flags
+// ============================================================================
+
+/**
+ * Flags controlling security validation during decoding.
+ * All flags default to secure behavior (reject invalid data).
+ */
+typedef struct {
+    /**
+     * If true (default), reject strings containing NUL (U+0000) characters.
+     * NUL characters are a common source of security vulnerabilities.
+     */
+    bool rejectNUL;
+
+    /**
+     * If true (default), reject strings containing invalid UTF-8 sequences.
+     * Invalid UTF-8 includes: malformed sequences, surrogates (U+D800-U+DFFF),
+     * overlong encodings, and codepoints above U+10FFFF.
+     */
+    bool rejectInvalidUTF8;
+
+    /**
+     * If true (default), reject objects with duplicate keys.
+     * Duplicate keys are a security risk and explicitly forbidden by the spec.
+     */
+    bool rejectDuplicateKeys;
+} KSBONJSONDecodeFlags;
+
+/**
+ * Returns default decode flags with all security checks enabled.
+ */
+static inline KSBONJSONDecodeFlags ksbonjson_defaultDecodeFlags(void)
+{
+    KSBONJSONDecodeFlags flags = {
+        .rejectNUL = true,
+        .rejectInvalidUTF8 = true,
+        .rejectDuplicateKeys = true,
+    };
+    return flags;
+}
 
 
 // ============================================================================
@@ -182,10 +227,31 @@ typedef struct {
     // Container stack for parsing
     int containerDepth;
     size_t containerStack[KSBONJSON_MAX_CONTAINER_DEPTH];
+
+    // Security validation flags
+    KSBONJSONDecodeFlags flags;
 } KSBONJSONMapContext;
 
 /**
- * Initialize position map decoding.
+ * Initialize position map decoding with security flags.
+ *
+ * @param ctx The context to initialize
+ * @param input The BONJSON input buffer (must remain valid)
+ * @param inputLength Length of input in bytes
+ * @param entries Caller-provided entry buffer
+ * @param entriesCapacity Size of entry buffer
+ * @param flags Security validation flags
+ */
+KSBONJSON_PUBLIC void ksbonjson_map_beginWithFlags(
+    KSBONJSONMapContext* ctx,
+    const uint8_t* input,
+    size_t inputLength,
+    KSBONJSONMapEntry* entries,
+    size_t entriesCapacity,
+    KSBONJSONDecodeFlags flags);
+
+/**
+ * Initialize position map decoding with default (secure) flags.
  *
  * @param ctx The context to initialize
  * @param input The BONJSON input buffer (must remain valid)

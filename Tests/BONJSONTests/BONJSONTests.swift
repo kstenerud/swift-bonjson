@@ -2866,3 +2866,282 @@ final class BONJSONBigNumberTests: XCTestCase {
         XCTAssertEqual(decoded.timeIntervalSince1970, 1000000.0)
     }
 }
+
+// MARK: - Security Tests
+
+final class BONJSONSecurityTests: XCTestCase {
+
+    // MARK: - NUL Character Tests (Decoder)
+
+    func testDecoderRejectsNULByDefault() throws {
+        // String "a\0b" with NUL character
+        let bonjsonData = Data([
+            0x83,                           // Short string, length 3
+            0x61, 0x00, 0x62                // "a\0b"
+        ])
+
+        let decoder = BONJSONDecoder()
+        XCTAssertThrowsError(try decoder.decode(String.self, from: bonjsonData)) { error in
+            XCTAssertTrue(error is BONJSONDecodingError)
+            if case BONJSONDecodingError.nulCharacterInString = error {
+                // Expected
+            } else {
+                XCTFail("Expected nulCharacterInString error, got \(error)")
+            }
+        }
+    }
+
+    func testDecoderAllowsNULWhenConfigured() throws {
+        // String "a\0b" with NUL character
+        let bonjsonData = Data([
+            0x83,                           // Short string, length 3
+            0x61, 0x00, 0x62                // "a\0b"
+        ])
+
+        let decoder = BONJSONDecoder()
+        decoder.nulDecodingStrategy = .allow
+        let decoded = try decoder.decode(String.self, from: bonjsonData)
+        XCTAssertEqual(decoded, "a\0b")
+    }
+
+    // MARK: - NUL Character Tests (Encoder)
+
+    func testEncoderRejectsNULByDefault() throws {
+        let encoder = BONJSONEncoder()
+        let stringWithNUL = "a\0b"
+        XCTAssertThrowsError(try encoder.encode(stringWithNUL)) { error in
+            XCTAssertTrue(error is BONJSONEncodingError)
+            if case BONJSONEncodingError.nulCharacterInString = error {
+                // Expected
+            } else {
+                XCTFail("Expected nulCharacterInString error, got \(error)")
+            }
+        }
+    }
+
+    func testEncoderAllowsNULWhenConfigured() throws {
+        let encoder = BONJSONEncoder()
+        encoder.nulEncodingStrategy = .allow
+        let stringWithNUL = "a\0b"
+        let data = try encoder.encode(stringWithNUL)
+        XCTAssertNotNil(data)
+
+        // Verify round-trip
+        let decoder = BONJSONDecoder()
+        decoder.nulDecodingStrategy = .allow
+        let decoded = try decoder.decode(String.self, from: data)
+        XCTAssertEqual(decoded, stringWithNUL)
+    }
+
+    // MARK: - Invalid UTF-8 Tests
+
+    func testDecoderRejectsInvalidUTF8ByDefault() throws {
+        // String with invalid UTF-8: 0x80 is a continuation byte without a leading byte
+        let bonjsonData = Data([
+            0x83,                           // Short string, length 3
+            0x61, 0x80, 0x62                // "a" + invalid + "b"
+        ])
+
+        let decoder = BONJSONDecoder()
+        XCTAssertThrowsError(try decoder.decode(String.self, from: bonjsonData)) { error in
+            XCTAssertTrue(error is BONJSONDecodingError)
+            if case BONJSONDecodingError.invalidUTF8Sequence = error {
+                // Expected
+            } else {
+                XCTFail("Expected invalidUTF8Sequence error, got \(error)")
+            }
+        }
+    }
+
+    func testDecoderRejectsSurrogates() throws {
+        // Surrogate encoded as UTF-8: U+D800 = 0xED 0xA0 0x80
+        let bonjsonData = Data([
+            0x83,                           // Short string, length 3
+            0xED, 0xA0, 0x80                // Invalid: surrogate U+D800
+        ])
+
+        let decoder = BONJSONDecoder()
+        XCTAssertThrowsError(try decoder.decode(String.self, from: bonjsonData)) { error in
+            if case BONJSONDecodingError.invalidUTF8Sequence = error {
+                // Expected
+            } else {
+                XCTFail("Expected invalidUTF8Sequence error, got \(error)")
+            }
+        }
+    }
+
+    func testDecoderRejectsOverlongEncoding() throws {
+        // Overlong encoding of 'a' (0x61): 0xC1 0xA1 instead of just 0x61
+        let bonjsonData = Data([
+            0x82,                           // Short string, length 2
+            0xC1, 0xA1                      // Invalid: overlong encoding
+        ])
+
+        let decoder = BONJSONDecoder()
+        XCTAssertThrowsError(try decoder.decode(String.self, from: bonjsonData)) { error in
+            if case BONJSONDecodingError.invalidUTF8Sequence = error {
+                // Expected
+            } else {
+                XCTFail("Expected invalidUTF8Sequence error, got \(error)")
+            }
+        }
+    }
+
+    func testDecoderReplacesInvalidUTF8WhenConfigured() throws {
+        // String with invalid UTF-8: 0x80 is a continuation byte without a leading byte
+        let bonjsonData = Data([
+            0x83,                           // Short string, length 3
+            0x61, 0x80, 0x62                // "a" + invalid + "b"
+        ])
+
+        let decoder = BONJSONDecoder()
+        decoder.unicodeDecodingStrategy = .replace
+        let decoded = try decoder.decode(String.self, from: bonjsonData)
+        // Invalid byte 0x80 should be replaced with U+FFFD
+        XCTAssertEqual(decoded, "a\u{FFFD}b")
+    }
+
+    func testDecoderDeletesInvalidUTF8WhenConfigured() throws {
+        // String with invalid UTF-8: 0x80 is a continuation byte without a leading byte
+        let bonjsonData = Data([
+            0x83,                           // Short string, length 3
+            0x61, 0x80, 0x62                // "a" + invalid + "b"
+        ])
+
+        let decoder = BONJSONDecoder()
+        decoder.unicodeDecodingStrategy = .delete
+        let decoded = try decoder.decode(String.self, from: bonjsonData)
+        // Invalid byte 0x80 should be deleted
+        XCTAssertEqual(decoded, "ab")
+    }
+
+    // MARK: - Duplicate Key Tests
+
+    func testDecoderRejectsDuplicateKeysByDefault() throws {
+        // Object with duplicate "a" key: {"a": 1, "a": 2}
+        let bonjsonData = Data([
+            0x9a,                           // Object start
+            0x81, 0x61,                     // Key "a" (short string length 1)
+            0x01,                           // Value 1
+            0x81, 0x61,                     // Key "a" again
+            0x02,                           // Value 2
+            0x9b                            // Object end
+        ])
+
+        let decoder = BONJSONDecoder()
+        XCTAssertThrowsError(try decoder.decode([String: Int].self, from: bonjsonData)) { error in
+            if case BONJSONDecodingError.duplicateObjectKey = error {
+                // Expected
+            } else {
+                XCTFail("Expected duplicateObjectKey error, got \(error)")
+            }
+        }
+    }
+
+    func testDecoderKeepsFirstDuplicateKeyWhenConfigured() throws {
+        // Object with duplicate "a" key: {"a": 1, "a": 2}
+        let bonjsonData = Data([
+            0x9a,                           // Object start
+            0x81, 0x61,                     // Key "a" (short string length 1)
+            0x01,                           // Value 1
+            0x81, 0x61,                     // Key "a" again
+            0x02,                           // Value 2
+            0x9b                            // Object end
+        ])
+
+        let decoder = BONJSONDecoder()
+        decoder.duplicateKeyDecodingStrategy = .keepFirst
+        let decoded = try decoder.decode([String: Int].self, from: bonjsonData)
+        XCTAssertEqual(decoded["a"], 1) // First value kept
+    }
+
+    func testDecoderKeepsLastDuplicateKeyWhenConfigured() throws {
+        // Object with duplicate "a" key: {"a": 1, "a": 2}
+        let bonjsonData = Data([
+            0x9a,                           // Object start
+            0x81, 0x61,                     // Key "a" (short string length 1)
+            0x01,                           // Value 1
+            0x81, 0x61,                     // Key "a" again
+            0x02,                           // Value 2
+            0x9b                            // Object end
+        ])
+
+        let decoder = BONJSONDecoder()
+        decoder.duplicateKeyDecodingStrategy = .keepLast
+        let decoded = try decoder.decode([String: Int].self, from: bonjsonData)
+        XCTAssertEqual(decoded["a"], 2) // Last value kept
+    }
+
+    // MARK: - Valid UTF-8 Tests (ensure normal strings still work)
+
+    func testValidUTF8WorksWithAllStrategies() throws {
+        let validString = "Hello, 世界! 🌍"
+        let encoder = BONJSONEncoder()
+        let data = try encoder.encode(validString)
+
+        // Test with reject (default)
+        let decoder1 = BONJSONDecoder()
+        let decoded1 = try decoder1.decode(String.self, from: data)
+        XCTAssertEqual(decoded1, validString)
+
+        // Test with replace
+        let decoder2 = BONJSONDecoder()
+        decoder2.unicodeDecodingStrategy = .replace
+        let decoded2 = try decoder2.decode(String.self, from: data)
+        XCTAssertEqual(decoded2, validString)
+
+        // Test with delete
+        let decoder3 = BONJSONDecoder()
+        decoder3.unicodeDecodingStrategy = .delete
+        let decoded3 = try decoder3.decode(String.self, from: data)
+        XCTAssertEqual(decoded3, validString)
+    }
+
+    // MARK: - Too Many Keys Tests
+
+    func testDecoderRejectsTooManyKeysWhenDuplicateCheckEnabled() throws {
+        // Build an object with more than 256 keys
+        // Object format: 0x9a (object start), then key-value pairs, then 0x9b (end)
+        var bonjsonData = Data([0x9a]) // Object start
+
+        for i in 0..<257 {
+            let key = "key\(i)"
+            let keyBytes = Array(key.utf8)
+            // Short string type code: 0x80 | length
+            bonjsonData.append(UInt8(0x80 | keyBytes.count))
+            bonjsonData.append(contentsOf: keyBytes)
+            // Value: small integer (0)
+            bonjsonData.append(0x00)
+        }
+        bonjsonData.append(0x9b) // Object end
+
+        // Default duplicate detection should fail with too many keys
+        let decoder = BONJSONDecoder()
+        XCTAssertThrowsError(try decoder.decode([String: Int].self, from: bonjsonData)) { error in
+            guard case BONJSONDecodingError.tooManyKeys = error else {
+                XCTFail("Expected tooManyKeys error, got \(error)")
+                return
+            }
+        }
+    }
+
+    func testDecoderAllowsManyKeysWhenDuplicateCheckDisabled() throws {
+        // Build an object with more than 256 keys
+        var bonjsonData = Data([0x9a]) // Object start
+
+        for i in 0..<300 {
+            let key = "key\(i)"
+            let keyBytes = Array(key.utf8)
+            bonjsonData.append(UInt8(0x80 | keyBytes.count))
+            bonjsonData.append(contentsOf: keyBytes)
+            bonjsonData.append(0x00) // Value: 0
+        }
+        bonjsonData.append(0x9b) // Object end
+
+        // With keepFirst, duplicate checking is disabled so many keys should work
+        let decoder = BONJSONDecoder()
+        decoder.duplicateKeyDecodingStrategy = .keepFirst
+        let decoded = try decoder.decode([String: Int].self, from: bonjsonData)
+        XCTAssertEqual(decoded.count, 300)
+    }
+}

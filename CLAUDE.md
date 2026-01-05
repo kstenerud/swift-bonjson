@@ -124,10 +124,55 @@ Big numbers use a header byte followed by data:
 
 ## Security Features
 
-Per the BONJSON specification:
-- Duplicate object keys are rejected during decoding
-- Invalid UTF-8 is rejected
-- NaN and infinity values throw errors (configurable via strategy)
+This library implements comprehensive security features as mandated by the BONJSON specification.
+All security checks default to the most secure behavior (reject invalid data).
+
+### UTF-8 Validation (Decoder)
+
+The decoder validates UTF-8 strings by default, rejecting:
+- Malformed sequences (invalid continuation bytes)
+- Overlong encodings (using more bytes than necessary)
+- Surrogates (U+D800-U+DFFF, reserved for UTF-16)
+- Codepoints above U+10FFFF
+
+Configure via `unicodeDecodingStrategy`:
+- `.reject` (default): Throw error on invalid UTF-8
+- `.replace`: Replace invalid sequences with U+FFFD (REPLACEMENT CHARACTER)
+- `.delete`: Remove invalid bytes from strings
+
+Note: The `.ignore` mode from the BONJSON spec is not supported because Swift's `String`
+type only accepts valid UTF-8. Use `.replace` as a permissive alternative.
+
+### NUL Character Handling
+
+NUL characters (U+0000) are a common source of security vulnerabilities and are rejected
+by default in both encoding and decoding.
+
+**Decoder** (`nulDecodingStrategy`):
+- `.reject` (default): Throw error on NUL in strings
+- `.allow`: Allow NUL characters (use only when legitimately needed)
+
+**Encoder** (`nulEncodingStrategy`):
+- `.reject` (default): Throw error on NUL in strings
+- `.allow`: Allow encoding strings with NUL characters
+
+### Duplicate Object Keys
+
+The BONJSON spec characterizes duplicate keys as "extremely dangerous" and "actively
+exploited in the wild." They are rejected by default.
+
+Configure via `duplicateKeyDecodingStrategy`:
+- `.reject` (default): Throw error on duplicate keys
+- `.keepFirst`: Keep first occurrence, ignore subsequent duplicates (spec: "dangerous")
+- `.keepLast`: Replace earlier values with later duplicates (spec: "extremely dangerous")
+
+Note: When duplicate detection is enabled (`.reject` strategy), objects are limited to
+256 keys. Objects with more keys will throw a `tooManyKeys` error. This limit does not
+apply when using `.keepFirst` or `.keepLast` strategies.
+
+### Other Security Limits
+
+- NaN and infinity values throw errors (configurable via `nonConformingFloatDecodingStrategy`)
 - Container depth is limited (default 200)
 
 ## Usage Example

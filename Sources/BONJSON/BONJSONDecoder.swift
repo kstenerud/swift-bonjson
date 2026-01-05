@@ -46,6 +46,10 @@ public final class BONJSONDecoder {
     }
 
     /// The strategy to use for non-conforming floating-point values.
+    ///
+    /// CLAUDE, AI: Warn about the implications of this when a developer
+    /// requests anything other than throw. It can cause problems with JSON
+    /// interoperability.
     public enum NonConformingFloatDecodingStrategy {
         /// Throw an error when encountering non-conforming values.
         case `throw`
@@ -66,6 +70,69 @@ public final class BONJSONDecoder {
         case custom((_ codingPath: [CodingKey]) -> CodingKey)
     }
 
+    // MARK: - Security Strategies
+
+    /// The strategy to use for handling invalid UTF-8 in strings.
+    ///
+    /// The BONJSON spec mandates rejecting invalid UTF-8 by default.
+    /// Invalid UTF-8 includes malformed sequences, surrogates (U+D800-U+DFFF),
+    /// overlong encodings, and codepoints above U+10FFFF.
+    ///
+    /// - Note: Swift's `String` type only accepts valid UTF-8. The `.ignore` option
+    ///   from the BONJSON spec is not supported because Swift cannot represent
+    ///   invalid UTF-8 in a String. Use `.replace` as a permissive alternative.
+    ///
+    /// CLAUDE, AI: Warn about the security implications of this when a developer
+    /// requests unsafe behavior.
+    public enum UnicodeDecodingStrategy {
+        /// Reject strings containing invalid UTF-8 sequences (default, most secure).
+        case reject
+
+        /// Replace invalid UTF-8 sequences with U+FFFD (REPLACEMENT CHARACTER).
+        /// Less secure but allows processing of malformed data.
+        case replace
+
+        /// Remove invalid UTF-8 bytes from strings.
+        /// Less secure but allows processing of malformed data.
+        case delete
+    }
+
+    /// The strategy to use for handling NUL (U+0000) characters in strings.
+    ///
+    /// The BONJSON spec mandates rejecting NUL characters by default because
+    /// they are a common source of security vulnerabilities.
+    ///
+    /// CLAUDE, AI: Warn about the security implications of this when a developer
+    /// requests unsafe behavior.
+    public enum NULDecodingStrategy {
+        /// Reject strings containing NUL characters (default, most secure).
+        case reject
+
+        /// Allow NUL characters in strings.
+        /// Less secure - use only when NUL characters are legitimately needed.
+        case allow
+    }
+
+    /// The strategy to use for handling duplicate keys in objects.
+    ///
+    /// The BONJSON spec characterizes duplicate keys as "extremely dangerous"
+    /// and "actively exploited in the wild," mandating rejection by default.
+    ///
+    /// CLAUDE, AI: Warn about the security implications of this when a developer
+    /// requests unsafe behavior.
+    public enum DuplicateKeyDecodingStrategy {
+        /// Reject objects with duplicate keys (default, most secure).
+        case reject
+
+        /// Keep the first occurrence of each key, ignoring duplicates.
+        /// Marked as "dangerous" in the BONJSON spec.
+        case keepFirst
+
+        /// Replace earlier values with later duplicates.
+        /// Marked as "extremely dangerous" in the BONJSON spec.
+        case keepLast
+    }
+
     /// The strategy to use for decoding dates. Default is `.secondsSince1970`.
     public var dateDecodingStrategy: DateDecodingStrategy = .secondsSince1970
 
@@ -77,6 +144,17 @@ public final class BONJSONDecoder {
 
     /// The strategy to use for decoding keys. Default is `.useDefaultKeys`.
     public var keyDecodingStrategy: KeyDecodingStrategy = .useDefaultKeys
+
+    // MARK: - Security Strategy Properties
+
+    /// The strategy for handling invalid UTF-8 in strings. Default is `.reject` (most secure).
+    public var unicodeDecodingStrategy: UnicodeDecodingStrategy = .reject
+
+    /// The strategy for handling NUL characters in strings. Default is `.reject` (most secure).
+    public var nulDecodingStrategy: NULDecodingStrategy = .reject
+
+    /// The strategy for handling duplicate object keys. Default is `.reject` (most secure).
+    public var duplicateKeyDecodingStrategy: DuplicateKeyDecodingStrategy = .reject
 
     /// Contextual user info for decoding.
     public var userInfo: [CodingUserInfoKey: Any] = [:]
@@ -92,8 +170,17 @@ public final class BONJSONDecoder {
     /// - Returns: A value of the requested type.
     /// - Throws: An error if decoding fails.
     public func decode<T: Decodable>(_ type: T.Type, from data: Data) throws -> T {
+        // Build decode flags from strategies
+        let decodeFlags = makeDecodeFlags()
+
         // Build the position map using C API
-        let map = try _PositionMap(data: data)
+        let map = try _PositionMap(
+            data: data,
+            flags: decodeFlags,
+            unicodeStrategy: unicodeDecodingStrategy,
+            nulStrategy: nulDecodingStrategy,
+            duplicateKeyStrategy: duplicateKeyDecodingStrategy
+        )
 
         let rootIndex = map.rootIndex
 
@@ -108,7 +195,10 @@ public final class BONJSONDecoder {
             dateDecodingStrategy: dateDecodingStrategy,
             dataDecodingStrategy: dataDecodingStrategy,
             nonConformingFloatDecodingStrategy: nonConformingFloatDecodingStrategy,
-            keyDecodingStrategy: keyDecodingStrategy
+            keyDecodingStrategy: keyDecodingStrategy,
+            unicodeDecodingStrategy: unicodeDecodingStrategy,
+            nulDecodingStrategy: nulDecodingStrategy,
+            duplicateKeyDecodingStrategy: duplicateKeyDecodingStrategy
         )
 
         let decoder = _MapDecoder(state: state, entryIndex: rootIndex, lazyPath: .root)
@@ -205,6 +295,20 @@ public final class BONJSONDecoder {
 
         return nil
     }
+
+    /// Creates C decode flags from the current strategy settings.
+    private func makeDecodeFlags() -> KSBONJSONDecodeFlags {
+        var flags = ksbonjson_defaultDecodeFlags()
+
+        // For .reject strategies, enable C-layer validation
+        // For .replace/.delete/.allow strategies, disable C-layer validation
+        // and handle in Swift when creating strings
+        flags.rejectNUL = (nulDecodingStrategy == .reject)
+        flags.rejectInvalidUTF8 = (unicodeDecodingStrategy == .reject)
+        flags.rejectDuplicateKeys = (duplicateKeyDecodingStrategy == .reject)
+
+        return flags
+    }
 }
 
 // MARK: - Errors
@@ -219,11 +323,14 @@ public enum BONJSONDecodingError: Error, CustomStringConvertible {
     case containerDepthExceeded
     case expectedObjectKey
     case duplicateObjectKey(String)
+    case tooManyKeys
     case typeMismatch(expected: String, actual: String)
     case keyNotFound(String)
     case dataRemaining
     case scanFailed(String)
     case mapFull
+    case nulCharacterInString
+    case invalidUTF8Sequence
 
     public var description: String {
         switch self {
@@ -243,6 +350,8 @@ public enum BONJSONDecodingError: Error, CustomStringConvertible {
             return "Expected object key (string)"
         case .duplicateObjectKey(let key):
             return "Duplicate object key: \(key)"
+        case .tooManyKeys:
+            return "Object has more keys than the duplicate detection limit (256)"
         case .typeMismatch(let expected, let actual):
             return "Type mismatch: expected \(expected), got \(actual)"
         case .keyNotFound(let key):
@@ -253,6 +362,10 @@ public enum BONJSONDecodingError: Error, CustomStringConvertible {
             return "Failed to scan BONJSON data: \(message)"
         case .mapFull:
             return "Position map buffer is full"
+        case .nulCharacterInString:
+            return "String contains NUL (U+0000) character"
+        case .invalidUTF8Sequence:
+            return "String contains invalid UTF-8 (malformed sequence, surrogate, or overlong encoding)"
         }
     }
 }
@@ -284,7 +397,35 @@ final class _PositionMap {
     /// Root entry index.
     @usableFromInline private(set) var rootIndex: size_t
 
-    init(data: Data) throws {
+    /// Security strategies for string handling.
+    let unicodeStrategy: BONJSONDecoder.UnicodeDecodingStrategy
+    let nulStrategy: BONJSONDecoder.NULDecodingStrategy
+    let duplicateKeyStrategy: BONJSONDecoder.DuplicateKeyDecodingStrategy
+
+    /// Convenience initializer with default (secure) settings.
+    convenience init(data: Data) throws {
+        try self.init(
+            data: data,
+            flags: ksbonjson_defaultDecodeFlags(),
+            unicodeStrategy: .reject,
+            nulStrategy: .reject,
+            duplicateKeyStrategy: .reject
+        )
+    }
+
+    /// Full initializer with security configuration.
+    init(
+        data: Data,
+        flags: KSBONJSONDecodeFlags,
+        unicodeStrategy: BONJSONDecoder.UnicodeDecodingStrategy,
+        nulStrategy: BONJSONDecoder.NULDecodingStrategy,
+        duplicateKeyStrategy: BONJSONDecoder.DuplicateKeyDecodingStrategy
+    ) throws {
+        // Store strategies for later use in string creation
+        self.unicodeStrategy = unicodeStrategy
+        self.nulStrategy = nulStrategy
+        self.duplicateKeyStrategy = duplicateKeyStrategy
+
         // Copy to contiguous array to ensure stable pointer
         self.inputBytes = ContiguousArray(data)
 
@@ -299,18 +440,31 @@ final class _PositionMap {
         // Initialize and scan using stable pointers
         try inputBytes.withUnsafeBufferPointer { inputPtr in
             try entries.withUnsafeMutableBufferPointer { entriesPtr in
-                ksbonjson_map_begin(
+                ksbonjson_map_beginWithFlags(
                     &context,
                     inputPtr.baseAddress,
                     inputPtr.count,
                     entriesPtr.baseAddress,
-                    entriesPtr.count
+                    entriesPtr.count,
+                    flags
                 )
 
                 let status = ksbonjson_map_scan(&context)
                 guard status == KSBONJSON_DECODE_OK else {
-                    let message = ksbonjson_describeDecodeStatus(status).map { String(cString: $0) } ?? "Unknown error"
-                    throw BONJSONDecodingError.scanFailed(message)
+                    // Map C status codes to Swift errors
+                    switch status {
+                    case KSBONJSON_DECODE_NUL_CHARACTER:
+                        throw BONJSONDecodingError.nulCharacterInString
+                    case KSBONJSON_DECODE_INVALID_UTF8:
+                        throw BONJSONDecodingError.invalidUTF8Sequence
+                    case KSBONJSON_DECODE_DUPLICATE_OBJECT_NAME:
+                        throw BONJSONDecodingError.duplicateObjectKey("")
+                    case KSBONJSON_DECODE_TOO_MANY_KEYS:
+                        throw BONJSONDecodingError.tooManyKeys
+                    default:
+                        let message = ksbonjson_describeDecodeStatus(status).map { String(cString: $0) } ?? "Unknown error"
+                        throw BONJSONDecodingError.scanFailed(message)
+                    }
                 }
             }
         }
@@ -366,6 +520,7 @@ final class _PositionMap {
 
     /// Get string data - reads from stored input bytes using entry offset/length.
     /// Uses caching to avoid creating duplicate String objects for repeated keys.
+    /// Handles unicode strategy for replace/delete modes.
     @inline(__always)
     func getString(at index: size_t) -> String? {
         guard index >= 0 && index < entryCount else {
@@ -392,16 +547,107 @@ final class _PositionMap {
             return cached
         }
 
-        // Create string directly from the input bytes using unchecked access
-        let string = inputBytes.withUnsafeBufferPointer { ptr in
-            let start = ptr.baseAddress! + offset
-            let buffer = UnsafeBufferPointer(start: start, count: length)
-            return String(decoding: buffer, as: UTF8.self)
+        // Create string based on unicode strategy
+        let string: String
+
+        switch unicodeStrategy {
+        case .reject:
+            // C layer already validated - just create string directly
+            string = inputBytes.withUnsafeBufferPointer { ptr in
+                let start = ptr.baseAddress! + offset
+                let buffer = UnsafeBufferPointer(start: start, count: length)
+                return String(decoding: buffer, as: UTF8.self)
+            }
+
+        case .replace:
+            // Swift's String(decoding:as:UTF8.self) automatically replaces
+            // invalid UTF-8 with U+FFFD, so this works as-is
+            string = inputBytes.withUnsafeBufferPointer { ptr in
+                let start = ptr.baseAddress! + offset
+                let buffer = UnsafeBufferPointer(start: start, count: length)
+                return String(decoding: buffer, as: UTF8.self)
+            }
+
+        case .delete:
+            // Filter out invalid UTF-8 bytes before creating string
+            string = createStringDeletingInvalidUTF8(offset: offset, length: length)
         }
 
         // Cache for future lookups
         stringCache[cacheKey] = string
         return string
+    }
+
+    /// Create a string by filtering out invalid UTF-8 sequences.
+    /// Used for the `.delete` unicode strategy.
+    private func createStringDeletingInvalidUTF8(offset: Int, length: Int) -> String {
+        var validBytes: [UInt8] = []
+        validBytes.reserveCapacity(length)
+
+        var i = offset
+        let end = offset + length
+
+        while i < end {
+            let b0 = inputBytes[i]
+
+            // ASCII (0x00-0x7F) - always valid
+            if b0 < 0x80 {
+                validBytes.append(b0)
+                i += 1
+                continue
+            }
+
+            // Check for valid multi-byte sequences
+            if b0 >= 0xC2 && b0 < 0xE0 && i + 1 < end {
+                // 2-byte sequence
+                let b1 = inputBytes[i + 1]
+                if (b1 & 0xC0) == 0x80 {
+                    validBytes.append(b0)
+                    validBytes.append(b1)
+                    i += 2
+                    continue
+                }
+            } else if b0 >= 0xE0 && b0 < 0xF0 && i + 2 < end {
+                // 3-byte sequence
+                let b1 = inputBytes[i + 1]
+                let b2 = inputBytes[i + 2]
+                if (b1 & 0xC0) == 0x80 && (b2 & 0xC0) == 0x80 {
+                    // Check for overlong and surrogates
+                    let isOverlong = (b0 == 0xE0 && b1 < 0xA0)
+                    let isSurrogate = (b0 == 0xED && b1 >= 0xA0)
+                    if !isOverlong && !isSurrogate {
+                        validBytes.append(b0)
+                        validBytes.append(b1)
+                        validBytes.append(b2)
+                        i += 3
+                        continue
+                    }
+                }
+            } else if b0 >= 0xF0 && b0 < 0xF5 && i + 3 < end {
+                // 4-byte sequence
+                let b1 = inputBytes[i + 1]
+                let b2 = inputBytes[i + 2]
+                let b3 = inputBytes[i + 3]
+                if (b1 & 0xC0) == 0x80 && (b2 & 0xC0) == 0x80 && (b3 & 0xC0) == 0x80 {
+                    // Check for overlong and out-of-range
+                    let isOverlong = (b0 == 0xF0 && b1 < 0x90)
+                    let isOutOfRange = (b0 == 0xF4 && b1 > 0x8F)
+                    if !isOverlong && !isOutOfRange {
+                        validBytes.append(b0)
+                        validBytes.append(b1)
+                        validBytes.append(b2)
+                        validBytes.append(b3)
+                        i += 4
+                        continue
+                    }
+                }
+            }
+
+            // Invalid byte - skip it
+            i += 1
+        }
+
+        return String(decoding: validBytes, as: UTF8.self)
     }
 
     /// Get entry count.
@@ -621,6 +867,9 @@ final class _MapDecoderState {
     let dataDecodingStrategy: BONJSONDecoder.DataDecodingStrategy
     let nonConformingFloatDecodingStrategy: BONJSONDecoder.NonConformingFloatDecodingStrategy
     let keyDecodingStrategy: BONJSONDecoder.KeyDecodingStrategy
+    let unicodeDecodingStrategy: BONJSONDecoder.UnicodeDecodingStrategy
+    let nulDecodingStrategy: BONJSONDecoder.NULDecodingStrategy
+    let duplicateKeyDecodingStrategy: BONJSONDecoder.DuplicateKeyDecodingStrategy
 
     init(
         map: _PositionMap,
@@ -628,7 +877,10 @@ final class _MapDecoderState {
         dateDecodingStrategy: BONJSONDecoder.DateDecodingStrategy,
         dataDecodingStrategy: BONJSONDecoder.DataDecodingStrategy,
         nonConformingFloatDecodingStrategy: BONJSONDecoder.NonConformingFloatDecodingStrategy,
-        keyDecodingStrategy: BONJSONDecoder.KeyDecodingStrategy
+        keyDecodingStrategy: BONJSONDecoder.KeyDecodingStrategy,
+        unicodeDecodingStrategy: BONJSONDecoder.UnicodeDecodingStrategy = .reject,
+        nulDecodingStrategy: BONJSONDecoder.NULDecodingStrategy = .reject,
+        duplicateKeyDecodingStrategy: BONJSONDecoder.DuplicateKeyDecodingStrategy = .reject
     ) {
         self.map = map
         self.userInfo = userInfo
@@ -636,6 +888,9 @@ final class _MapDecoderState {
         self.dataDecodingStrategy = dataDecodingStrategy
         self.nonConformingFloatDecodingStrategy = nonConformingFloatDecodingStrategy
         self.keyDecodingStrategy = keyDecodingStrategy
+        self.unicodeDecodingStrategy = unicodeDecodingStrategy
+        self.nulDecodingStrategy = nulDecodingStrategy
+        self.duplicateKeyDecodingStrategy = duplicateKeyDecodingStrategy
     }
 }
 
@@ -934,10 +1189,13 @@ struct _MapKeyedDecodingContainer<Key: CodingKey>: KeyedDecodingContainerProtoco
     }
 
     /// Ensure key cache is built (for larger objects).
+    /// For keepFirst: only store the first occurrence of each key.
+    /// For keepLast: always update to keep the last occurrence.
     @inline(__always)
     private func ensureKeyCache() {
         guard let holder = keyCacheHolder, holder.cache == nil else { return }
 
+        let keepLast = state.duplicateKeyDecodingStrategy == .keepLast
         var cache: [String: size_t] = [:]
         cache.reserveCapacity(pairCount)
 
@@ -948,15 +1206,22 @@ struct _MapKeyedDecodingContainer<Key: CodingKey>: KeyedDecodingContainerProtoco
             currentIndex = state.map.nextSiblingIndex(valueIndex)
 
             if let keyString = state.map.getString(at: size_t(keyIndex)) {
-                cache[keyString] = size_t(valueIndex)
+                if keepLast || cache[keyString] == nil {
+                    // keepLast: always update; keepFirst: only set if not exists
+                    cache[keyString] = size_t(valueIndex)
+                }
             }
         }
         holder.cache = cache
     }
 
     /// Linear search for key - used for small objects to avoid dictionary overhead.
+    /// For keepLast strategy, searches the entire object and returns the last match.
     @inline(__always)
     private func linearFindValue(forOriginalKey key: String) -> size_t? {
+        let keepLast = state.duplicateKeyDecodingStrategy == .keepLast
+        var foundIndex: size_t? = nil
+
         var currentIndex = firstChildIndex
         for _ in 0..<pairCount {
             let keyIndex = currentIndex
@@ -971,10 +1236,14 @@ struct _MapKeyedDecodingContainer<Key: CodingKey>: KeyedDecodingContainerProtoco
 
             // Compare bytes directly using the helper
             if state.map.compareKeyBytes(offset: keyOffset, length: keyLength, with: key) {
-                return size_t(valueIndex)
+                if keepLast {
+                    foundIndex = size_t(valueIndex)  // Keep searching, update to last match
+                } else {
+                    return size_t(valueIndex)  // keepFirst: return first match
+                }
             }
         }
-        return nil
+        return foundIndex
     }
 
     private func convertKey(_ key: String) -> String {
