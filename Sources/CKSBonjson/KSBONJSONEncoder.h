@@ -125,6 +125,11 @@ typedef struct {
      * NUL characters are a common source of security vulnerabilities.
      */
     bool rejectNUL;
+    /**
+     * If true (default), reject NaN and infinity float values.
+     * These values cannot be represented in JSON.
+     */
+    bool rejectNonFiniteFloat;
 } KSBONJSONEncodeFlags;
 
 /**
@@ -134,6 +139,7 @@ static inline KSBONJSONEncodeFlags ksbonjson_defaultEncodeFlags(void)
 {
     KSBONJSONEncodeFlags flags = {
         .rejectNUL = true,
+        .rejectNonFiniteFloat = true,
     };
     return flags;
 }

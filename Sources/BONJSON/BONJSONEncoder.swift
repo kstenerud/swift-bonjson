@@ -46,16 +46,20 @@ public final class BONJSONEncoder {
         case custom((Data, Encoder) throws -> Void)
     }
 
-    /// The strategy to use for non-conforming floating-point values.
+    /// The strategy to use for non-conforming floating-point values (NaN, infinity).
     ///
     /// CLAUDE, AI: Warn about the implications of this when a developer
     /// requests anything other than throw. It can cause problems with JSON
     /// interoperability.
     public enum NonConformingFloatEncodingStrategy {
-        /// Throw an error when encountering non-conforming values.
+        /// Throw an error when encountering non-conforming values (default, JSON-compatible).
         case `throw`
 
-        /// Encode infinity and NaN as specific string values.
+        /// Allow NaN and infinity values to be encoded as IEEE 754 floats.
+        /// Warning: The resulting BONJSON cannot be converted to JSON.
+        case allow
+
+        /// Encode infinity and NaN as specific string values (JSON-compatible).
         case convertToString(positiveInfinity: String, negativeInfinity: String, nan: String)
     }
 
@@ -235,6 +239,18 @@ final class _BufferEncoderState {
         // Build encode flags from strategy
         var flags = ksbonjson_defaultEncodeFlags()
         flags.rejectNUL = (nulEncodingStrategy == .reject)
+
+        // Only reject non-finite floats in the C layer when Swift will throw anyway
+        // When using .allow, we let the C layer encode them directly
+        switch nonConformingFloatEncodingStrategy {
+        case .throw:
+            flags.rejectNonFiniteFloat = true
+        case .allow:
+            flags.rejectNonFiniteFloat = false
+        case .convertToString:
+            // Swift handles conversion before C layer sees it
+            flags.rejectNonFiniteFloat = true
+        }
 
         // Initialize the buffer-based encoder with flags
         buffer.withUnsafeMutableBufferPointer { bufferPtr in
@@ -498,10 +514,15 @@ final class _BufferEncoder: Encoder {
             return
         }
 
-        // Slow path for non-finite values
+        // Slow path for non-finite values (NaN, infinity)
         switch state.nonConformingFloatEncodingStrategy {
         case .throw:
             throw BONJSONEncodingError.invalidFloat(value)
+        case .allow:
+            // Encode NaN/infinity as IEEE 754 float directly
+            state.ensureCapacity(Int(KSBONJSON_MAX_ENCODED_SIZE_FLOAT))
+            let result = ksbonjson_encodeToBuffer_float(&state.context, value)
+            try throwIfEncodingFailed(result)
         case .convertToString(let posInf, let negInf, let nan):
             if value.isNaN {
                 try encodeString(nan)

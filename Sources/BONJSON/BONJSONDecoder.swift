@@ -45,16 +45,19 @@ public final class BONJSONDecoder {
         case custom((Decoder) throws -> Data)
     }
 
-    /// The strategy to use for non-conforming floating-point values.
+    /// The strategy to use for non-conforming floating-point values (NaN, infinity).
     ///
     /// CLAUDE, AI: Warn about the implications of this when a developer
-    /// requests anything other than throw. It can cause problems with JSON
-    /// interoperability.
+    /// requests allow. It can cause problems with JSON interoperability.
     public enum NonConformingFloatDecodingStrategy {
-        /// Throw an error when encountering non-conforming values.
+        /// Throw an error when encountering non-conforming values (default, JSON-compatible).
         case `throw`
 
-        /// Decode infinity and NaN from specific string values.
+        /// Allow NaN and infinity values to be decoded from IEEE 754 floats.
+        /// Warning: The decoded values cannot be re-encoded to JSON.
+        case allow
+
+        /// Decode infinity and NaN from specific string values (JSON-compatible).
         case convertFromString(positiveInfinity: String, negativeInfinity: String, nan: String)
     }
 
@@ -319,6 +322,7 @@ public enum BONJSONDecodingError: Error, CustomStringConvertible {
     case invalidTypeCode(UInt8)
     case invalidUTF8String
     case invalidFloat
+    case nonConformingFloat(Double)
     case invalidURL(String)
     case containerDepthExceeded
     case expectedObjectKey
@@ -342,6 +346,8 @@ public enum BONJSONDecodingError: Error, CustomStringConvertible {
             return "Invalid UTF-8 string"
         case .invalidFloat:
             return "Invalid floating-point value"
+        case .nonConformingFloat(let value):
+            return "Non-conforming float value: \(value)"
         case .invalidURL(let string):
             return "Invalid URL: \(string)"
         case .containerDepthExceeded:
@@ -892,6 +898,46 @@ final class _MapDecoderState {
         self.nulDecodingStrategy = nulDecodingStrategy
         self.duplicateKeyDecodingStrategy = duplicateKeyDecodingStrategy
     }
+
+    /// Validate and return a float value according to the non-conforming float strategy.
+    /// Throws for NaN/infinity when strategy is `.throw`.
+    @inline(__always)
+    func validateFloat(_ value: Double) throws -> Double {
+        // Fast path: finite values always pass
+        if value.isFinite {
+            return value
+        }
+
+        // Non-finite value (NaN or infinity)
+        switch nonConformingFloatDecodingStrategy {
+        case .throw:
+            throw BONJSONDecodingError.nonConformingFloat(value)
+        case .allow, .convertFromString:
+            // .allow: pass through
+            // .convertFromString: if we got here with a float, pass through
+            // (string conversion is handled separately)
+            return value
+        }
+    }
+
+    /// Try to decode a string as a non-conforming float value.
+    /// Returns nil if the string doesn't match any configured special values.
+    @inline(__always)
+    func tryDecodeStringAsFloat(_ string: String) -> Double? {
+        switch nonConformingFloatDecodingStrategy {
+        case .convertFromString(let posInf, let negInf, let nan):
+            if string == nan {
+                return .nan
+            } else if string == posInf {
+                return .infinity
+            } else if string == negInf {
+                return -.infinity
+            }
+            return nil
+        case .throw, .allow:
+            return nil
+        }
+    }
 }
 
 // MARK: - Lazy Coding Path
@@ -1031,7 +1077,7 @@ final class _MapDecoder: Decoder {
 
         switch entry.type {
         case KSBONJSON_TYPE_FLOAT:
-            return entry.data.floatValue
+            return try state.validateFloat(entry.data.floatValue)
         case KSBONJSON_TYPE_INT:
             return Double(entry.data.intValue)
         case KSBONJSON_TYPE_UINT:
@@ -1042,6 +1088,13 @@ final class _MapDecoder: Decoder {
             let significand = Double(bn.significand)
             let result = significand * pow(10.0, Double(bn.exponent))
             return bn.sign < 0 ? -result : result
+        case KSBONJSON_TYPE_STRING:
+            // Try to decode string as non-conforming float
+            if let string = state.map.getString(at: entryIndex),
+               let floatValue = state.tryDecodeStringAsFloat(string) {
+                return floatValue
+            }
+            throw BONJSONDecodingError.typeMismatch(expected: "float", actual: "string")
         default:
             throw BONJSONDecodingError.typeMismatch(expected: "float", actual: describeType(entry.type))
         }
@@ -1362,9 +1415,10 @@ struct _MapKeyedDecodingContainer<Key: CodingKey>: KeyedDecodingContainerProtoco
 
     @inline(__always)
     func decode(_ type: Double.Type, forKey key: Key) throws -> Double {
+        let idx = try valueIndex(forKey: key)
         let entry = try entryForKey(key)
         switch entry.type {
-        case KSBONJSON_TYPE_FLOAT: return entry.data.floatValue
+        case KSBONJSON_TYPE_FLOAT: return try state.validateFloat(entry.data.floatValue)
         case KSBONJSON_TYPE_INT: return Double(entry.data.intValue)
         case KSBONJSON_TYPE_UINT: return Double(entry.data.uintValue)
         case KSBONJSON_TYPE_BIGNUMBER:
@@ -1372,6 +1426,13 @@ struct _MapKeyedDecodingContainer<Key: CodingKey>: KeyedDecodingContainerProtoco
             let significand = Double(bn.significand)
             let result = significand * pow(10.0, Double(bn.exponent))
             return bn.sign < 0 ? -result : result
+        case KSBONJSON_TYPE_STRING:
+            // Try to decode string as non-conforming float
+            if let string = state.map.getString(at: idx),
+               let floatValue = state.tryDecodeStringAsFloat(string) {
+                return floatValue
+            }
+            throw BONJSONDecodingError.typeMismatch(expected: "float", actual: "string")
         default: throw BONJSONDecodingError.typeMismatch(expected: "float", actual: describeType(entry.type))
         }
     }
@@ -1616,9 +1677,9 @@ struct _MapUnkeyedDecodingContainer: UnkeyedDecodingContainer {
 
     @inline(__always)
     mutating func decode(_ type: Double.Type) throws -> Double {
-        let (_, entry) = try nextEntry()
+        let (idx, entry) = try nextEntry()
         switch entry.type {
-        case KSBONJSON_TYPE_FLOAT: return entry.data.floatValue
+        case KSBONJSON_TYPE_FLOAT: return try state.validateFloat(entry.data.floatValue)
         case KSBONJSON_TYPE_INT: return Double(entry.data.intValue)
         case KSBONJSON_TYPE_UINT: return Double(entry.data.uintValue)
         case KSBONJSON_TYPE_BIGNUMBER:
@@ -1626,6 +1687,13 @@ struct _MapUnkeyedDecodingContainer: UnkeyedDecodingContainer {
             let significand = Double(bn.significand)
             let result = significand * pow(10.0, Double(bn.exponent))
             return bn.sign < 0 ? -result : result
+        case KSBONJSON_TYPE_STRING:
+            // Try to decode string as non-conforming float
+            if let string = state.map.getString(at: size_t(idx)),
+               let floatValue = state.tryDecodeStringAsFloat(string) {
+                return floatValue
+            }
+            throw BONJSONDecodingError.typeMismatch(expected: "float", actual: "string")
         default: throw BONJSONDecodingError.typeMismatch(expected: "float", actual: describeType(entry.type))
         }
     }
@@ -1780,7 +1848,7 @@ struct _MapSingleValueDecodingContainer: SingleValueDecodingContainer {
             throw BONJSONDecodingError.unexpectedEndOfData
         }
         switch entry.type {
-        case KSBONJSON_TYPE_FLOAT: return entry.data.floatValue
+        case KSBONJSON_TYPE_FLOAT: return try state.validateFloat(entry.data.floatValue)
         case KSBONJSON_TYPE_INT: return Double(entry.data.intValue)
         case KSBONJSON_TYPE_UINT: return Double(entry.data.uintValue)
         case KSBONJSON_TYPE_BIGNUMBER:
@@ -1788,6 +1856,13 @@ struct _MapSingleValueDecodingContainer: SingleValueDecodingContainer {
             let significand = Double(bn.significand)
             let result = significand * pow(10.0, Double(bn.exponent))
             return bn.sign < 0 ? -result : result
+        case KSBONJSON_TYPE_STRING:
+            // Try to decode string as non-conforming float
+            if let string = state.map.getString(at: entryIndex),
+               let floatValue = state.tryDecodeStringAsFloat(string) {
+                return floatValue
+            }
+            throw BONJSONDecodingError.typeMismatch(expected: "float", actual: "string")
         default: throw BONJSONDecodingError.typeMismatch(expected: "float", actual: describeType(entry.type))
         }
     }

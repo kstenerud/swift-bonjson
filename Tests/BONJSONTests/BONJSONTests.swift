@@ -633,6 +633,162 @@ final class BONJSONStrategyTests: XCTestCase {
             }
         }
     }
+
+    // MARK: - Non-Conforming Float Allow Strategy
+
+    func testNonConformingFloatEncodingAllow() throws {
+        // Test that non-conforming floats can be encoded as IEEE 754 values
+        let encoder = BONJSONEncoder()
+        encoder.nonConformingFloatEncodingStrategy = .allow
+
+        let decoder = BONJSONDecoder()
+        decoder.nonConformingFloatDecodingStrategy = .allow
+
+        // Test infinity round-trip
+        let infData = try encoder.encode(Double.infinity)
+        let decodedInf = try decoder.decode(Double.self, from: infData)
+        XCTAssertEqual(decodedInf, .infinity)
+
+        // Test negative infinity round-trip
+        let negInfData = try encoder.encode(-Double.infinity)
+        let decodedNegInf = try decoder.decode(Double.self, from: negInfData)
+        XCTAssertEqual(decodedNegInf, -.infinity)
+
+        // Test NaN round-trip
+        let nanData = try encoder.encode(Double.nan)
+        let decodedNan = try decoder.decode(Double.self, from: nanData)
+        XCTAssertTrue(decodedNan.isNaN)
+    }
+
+    func testNonConformingFloatDecodingThrowsForNaN() throws {
+        // Encode with allow, decode with throw should reject
+        let encoder = BONJSONEncoder()
+        encoder.nonConformingFloatEncodingStrategy = .allow
+
+        let decoder = BONJSONDecoder()
+        // Default is .throw
+
+        let nanData = try encoder.encode(Double.nan)
+        XCTAssertThrowsError(try decoder.decode(Double.self, from: nanData)) { error in
+            if let decodingError = error as? BONJSONDecodingError,
+               case .nonConformingFloat = decodingError {
+                // Expected
+            } else {
+                XCTFail("Expected nonConformingFloat error, got \(error)")
+            }
+        }
+
+        let infData = try encoder.encode(Double.infinity)
+        XCTAssertThrowsError(try decoder.decode(Double.self, from: infData)) { error in
+            if let decodingError = error as? BONJSONDecodingError,
+               case .nonConformingFloat = decodingError {
+                // Expected
+            } else {
+                XCTFail("Expected nonConformingFloat error, got \(error)")
+            }
+        }
+    }
+
+    func testNonConformingFloatConvertFromString() throws {
+        // Encode as strings, decode back to floats
+        let encoder = BONJSONEncoder()
+        encoder.nonConformingFloatEncodingStrategy = .convertToString(
+            positiveInfinity: "+Inf",
+            negativeInfinity: "-Inf",
+            nan: "NaN"
+        )
+
+        let decoder = BONJSONDecoder()
+        decoder.nonConformingFloatDecodingStrategy = .convertFromString(
+            positiveInfinity: "+Inf",
+            negativeInfinity: "-Inf",
+            nan: "NaN"
+        )
+
+        // Test infinity round-trip via string
+        let infData = try encoder.encode(Double.infinity)
+        let decodedInf = try decoder.decode(Double.self, from: infData)
+        XCTAssertEqual(decodedInf, .infinity)
+
+        // Test negative infinity round-trip via string
+        let negInfData = try encoder.encode(-Double.infinity)
+        let decodedNegInf = try decoder.decode(Double.self, from: negInfData)
+        XCTAssertEqual(decodedNegInf, -.infinity)
+
+        // Test NaN round-trip via string
+        let nanData = try encoder.encode(Double.nan)
+        let decodedNan = try decoder.decode(Double.self, from: nanData)
+        XCTAssertTrue(decodedNan.isNaN)
+    }
+
+    func testNonConformingFloatInKeyedContainer() throws {
+        struct Container: Codable, Equatable {
+            var value: Double
+        }
+
+        let encoder = BONJSONEncoder()
+        encoder.nonConformingFloatEncodingStrategy = .allow
+
+        let decoder = BONJSONDecoder()
+        decoder.nonConformingFloatDecodingStrategy = .allow
+
+        // Test infinity in keyed container
+        let infContainer = Container(value: .infinity)
+        let infData = try encoder.encode(infContainer)
+        let decodedInf = try decoder.decode(Container.self, from: infData)
+        XCTAssertEqual(decodedInf.value, .infinity)
+
+        // Test NaN in keyed container
+        let nanContainer = Container(value: .nan)
+        let nanData = try encoder.encode(nanContainer)
+        let decodedNan = try decoder.decode(Container.self, from: nanData)
+        XCTAssertTrue(decodedNan.value.isNaN)
+    }
+
+    func testNonConformingFloatInUnkeyedContainer() throws {
+        let encoder = BONJSONEncoder()
+        encoder.nonConformingFloatEncodingStrategy = .allow
+
+        let decoder = BONJSONDecoder()
+        decoder.nonConformingFloatDecodingStrategy = .allow
+
+        // Test array containing non-conforming floats
+        let values: [Double] = [1.0, .infinity, -.infinity, .nan, 2.0]
+        let data = try encoder.encode(values)
+        let decoded = try decoder.decode([Double].self, from: data)
+
+        XCTAssertEqual(decoded[0], 1.0)
+        XCTAssertEqual(decoded[1], .infinity)
+        XCTAssertEqual(decoded[2], -.infinity)
+        XCTAssertTrue(decoded[3].isNaN)
+        XCTAssertEqual(decoded[4], 2.0)
+    }
+
+    func testNonConformingFloatConvertFromStringInKeyedContainer() throws {
+        struct Container: Codable {
+            var value: Double
+        }
+
+        let encoder = BONJSONEncoder()
+        encoder.nonConformingFloatEncodingStrategy = .convertToString(
+            positiveInfinity: "Infinity",
+            negativeInfinity: "-Infinity",
+            nan: "NaN"
+        )
+
+        let decoder = BONJSONDecoder()
+        decoder.nonConformingFloatDecodingStrategy = .convertFromString(
+            positiveInfinity: "Infinity",
+            negativeInfinity: "-Infinity",
+            nan: "NaN"
+        )
+
+        // Test round-trip in keyed container
+        let container = Container(value: .infinity)
+        let data = try encoder.encode(container)
+        let decoded = try decoder.decode(Container.self, from: data)
+        XCTAssertEqual(decoded.value, .infinity)
+    }
 }
 
 // Helper key for custom key strategy tests

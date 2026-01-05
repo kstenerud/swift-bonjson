@@ -170,9 +170,26 @@ Note: When duplicate detection is enabled (`.reject` strategy), objects are limi
 256 keys. Objects with more keys will throw a `tooManyKeys` error. This limit does not
 apply when using `.keepFirst` or `.keepLast` strategies.
 
+### NaN and Infinity Handling
+
+NaN and infinity are valid IEEE 754 floating-point values but cannot be represented in JSON.
+The BONJSON spec provides three options for handling these values, all supported by this library.
+
+**Encoder** (`nonConformingFloatEncodingStrategy`):
+- `.throw` (default): Throw error when encoding NaN or infinity (JSON-compatible)
+- `.allow`: Encode as IEEE 754 float values directly (warning: not JSON-convertible)
+- `.convertToString(positiveInfinity:negativeInfinity:nan:)`: Encode as string representations
+
+**Decoder** (`nonConformingFloatDecodingStrategy`):
+- `.throw` (default): Throw error when decoding NaN or infinity values
+- `.allow`: Allow NaN and infinity values to pass through
+- `.convertFromString(positiveInfinity:negativeInfinity:nan:)`: Decode matching strings as floats
+
+Note: Using `.allow` creates BONJSON data that cannot be converted to JSON. The `.convertToString`
+and `.convertFromString` strategies maintain JSON compatibility by using string representations.
+
 ### Other Security Limits
 
-- NaN and infinity values throw errors (configurable via `nonConformingFloatDecodingStrategy`)
 - Container depth is limited (default 200)
 
 ## Usage Example

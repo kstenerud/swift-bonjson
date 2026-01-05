@@ -353,7 +353,7 @@ ssize_t ksbonjson_encodeToBuffer_float(KSBONJSONBufferEncodeContext* ctx, double
     }
 
     union num64_bits b64 = {.f64 = value};
-    unlikely_if((b64.u64 & 0x7ff0000000000000ULL) == 0x7ff0000000000000ULL)
+    unlikely_if(ctx->flags.rejectNonFiniteFloat && (b64.u64 & 0x7ff0000000000000ULL) == 0x7ff0000000000000ULL)
     {
         return -KSBONJSON_ENCODE_INVALID_DATA;
     }
