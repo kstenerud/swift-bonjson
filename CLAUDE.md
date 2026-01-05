@@ -6,6 +6,8 @@ This is a Swift library implementing a BONJSON codec - a binary drop-in replacem
 
 BONJSON is a binary format offering 1:1 JSON compatibility with faster processing and enhanced security. It maintains the same type support as JSON: strings, numbers, arrays, objects, booleans, and null.
 
+The BONJSON spec is available at https://raw.githubusercontent.com/kstenerud/bonjson/refs/heads/main/bonjson.md
+
 ## Architecture
 
 This library uses two different approaches optimized for their respective tasks:
