@@ -1928,6 +1928,55 @@ final class BONJSONRoundTripTests: XCTestCase {
         try assertRoundTrip(veryLongString)
     }
 
+    func testLongStringLengthFieldEncoding() throws {
+        let encoder = BONJSONEncoder()
+
+        // Test 20-character string: length=20, continuation=0
+        // payload = 20 << 1 = 40
+        // 1-byte encoding: 40 << 1 = 80 = 0x50
+        let str20 = String(repeating: "a", count: 20)
+        let data20 = try encoder.encode(str20)
+        XCTAssertEqual(data20[0], 0x68, "First byte should be long string type")
+        XCTAssertEqual(data20[1], 0x50, "Length field for 20 chars should be 0x50")
+
+        // Test 64-character string: length=64, continuation=0
+        // payload = 64 << 1 = 128
+        // 128 > 127, so 2-byte encoding needed
+        // extraBytes = 1, count = 2
+        // encoded = (128 << 2) | ((1 << 1) - 1) = 512 | 1 = 513 = 0x0201
+        // In little-endian: 0x01, 0x02
+        let str64 = String(repeating: "b", count: 64)
+        let data64 = try encoder.encode(str64)
+        XCTAssertEqual(data64[0], 0x68, "First byte should be long string type")
+        XCTAssertEqual(data64[1], 0x01, "First byte of length field for 64 chars should be 0x01")
+        XCTAssertEqual(data64[2], 0x02, "Second byte of length field for 64 chars should be 0x02")
+
+        // Test empty long string encoding (if encoder uses long string for empty)
+        // Actually, empty string uses short string encoding (0x80), so skip this
+
+        // Verify the string content follows the length field
+        XCTAssertEqual(data20[2], UInt8(ascii: "a"), "String content should follow length field")
+        XCTAssertEqual(data64[3], UInt8(ascii: "b"), "String content should follow 2-byte length field")
+    }
+
+    func testLongStringDecodeSpecificBytes() throws {
+        let decoder = BONJSONDecoder()
+
+        // Decode a long string with specific byte encoding
+        // 0x68 = long string type
+        // 0x50 = length field (20 chars, no continuation): payload=40, 40<<1=80=0x50
+        var data = Data([0x68, 0x50])
+        data.append(contentsOf: [UInt8](repeating: UInt8(ascii: "x"), count: 20))
+
+        let decoded = try decoder.decode(String.self, from: data)
+        XCTAssertEqual(decoded, String(repeating: "x", count: 20))
+
+        // Test decoding empty long string (length=0, continuation=0 = 0x00)
+        let emptyData = Data([0x68, 0x00])
+        let emptyDecoded = try decoder.decode(String.self, from: emptyData)
+        XCTAssertEqual(emptyDecoded, "")
+    }
+
     // MARK: - Helper
 
     private func assertRoundTrip<T: Codable & Equatable>(_ value: T, file: StaticString = #file, line: UInt = #line) throws {
