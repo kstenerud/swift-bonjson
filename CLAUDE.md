@@ -228,12 +228,35 @@ Run tests with:
 swift test
 ```
 
+### Unit Tests (BONJSONTests.swift)
+
 Tests cover:
 - Round-trip encoding/decoding for all primitive types
 - Container types (arrays, objects)
 - Special types (Date, Data, URL)
 - Edge cases (empty containers, large strings)
 - Error handling (type mismatches)
+
+### Conformance Tests (ConformanceTests.swift)
+
+Universal cross-implementation tests from `../bonjson/tests/`. These verify correct BONJSON behavior across all implementations.
+
+The conformance test runner:
+- Parses test specification JSON files (type `bonjson-test`)
+- Handles test types: `encode`, `decode`, `roundtrip`, `encode_error`, `decode_error`
+- Supports `$number` marker for special values (NaN, Infinity, hex floats, big integers)
+- Maps library errors to standardized error types
+- Supports options: `allow_nul`, `allow_nan_infinity`
+
+**Important**: The `runner/` directory contains tests to validate the test runner itself. See `Tests/README.md`.
+
+Run conformance tests only:
+```bash
+swift test --filter Conformance
+```
+
+Known limitations (options not yet supported):
+- `max_depth`, `max_container_size`, `max_string_length`, `max_chunks`, `max_document_size`
 
 ## Build Commands
 

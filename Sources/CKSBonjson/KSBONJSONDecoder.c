@@ -677,6 +677,10 @@ const char* ksbonjson_describeDecodeStatus(const ksbonjson_decodeStatus status)
             return "A string contained invalid UTF-8 (malformed sequence, surrogate, or overlong encoding)";
         case KSBONJSON_DECODE_TOO_MANY_KEYS:
             return "Object has more keys than the duplicate detection limit (256)";
+        case KSBONJSON_DECODE_TRAILING_BYTES:
+            return "Document has trailing bytes after the root value";
+        case KSBONJSON_DECODE_NON_CANONICAL_LENGTH:
+            return "Length field uses non-canonical encoding (more bytes than necessary)";
         default:
             return "(unknown status - was it a user-defined status code?)";
     }
@@ -705,6 +709,20 @@ static inline size_t mapAddEntry(KSBONJSONMapContext* ctx, KSBONJSONMapEntry ent
     return index;
 }
 
+// Maximum payload that fits in N bytes: (1 << (7*N)) - 1
+// Precomputed for common sizes to avoid overflow
+static const uint64_t maxPayloadForBytes[] = {
+    0,                     // 0 bytes: not applicable
+    0x7FULL,              // 1 byte: 127
+    0x3FFFULL,            // 2 bytes: 16383
+    0x1FFFFFULL,          // 3 bytes: 2097151
+    0x0FFFFFFFULL,        // 4 bytes: 268435455
+    0x07FFFFFFFFULL,      // 5 bytes
+    0x03FFFFFFFFFFULL,    // 6 bytes
+    0x01FFFFFFFFFFFFULL,  // 7 bytes
+    0x00FFFFFFFFFFFFFFULL // 8 bytes
+};
+
 // Decode a length payload for the position map
 static ksbonjson_decodeStatus mapDecodeLengthPayload(KSBONJSONMapContext* ctx, uint64_t* payloadBuffer)
 {
@@ -718,7 +736,14 @@ static ksbonjson_decodeStatus mapDecodeLengthPayload(KSBONJSONMapContext* ctx, u
         union number_bits bits;
         memcpy(bits.b, ctx->input + ctx->position, 8);
         ctx->position += 8;
-        *payloadBuffer = fromLittleEndian(bits.u64);
+        uint64_t payload = fromLittleEndian(bits.u64);
+        *payloadBuffer = payload;
+
+        // Check for non-canonical: 9-byte encoding only if payload > max for 8 bytes
+        unlikely_if(ctx->flags.rejectNonCanonicalLengths && payload <= maxPayloadForBytes[8])
+        {
+            return KSBONJSON_DECODE_NON_CANONICAL_LENGTH;
+        }
         return KSBONJSON_DECODE_OK;
     }
 
@@ -727,7 +752,15 @@ static ksbonjson_decodeStatus mapDecodeLengthPayload(KSBONJSONMapContext* ctx, u
     union number_bits bits = {0};
     memcpy(bits.b, ctx->input + ctx->position, count);
     ctx->position += count;
-    *payloadBuffer = fromLittleEndian(bits.u64 >> count);
+    uint64_t payload = fromLittleEndian(bits.u64 >> count);
+    *payloadBuffer = payload;
+
+    // Check for non-canonical length: could the payload fit in fewer bytes?
+    unlikely_if(ctx->flags.rejectNonCanonicalLengths && count > 1 && payload <= maxPayloadForBytes[count - 1])
+    {
+        return KSBONJSON_DECODE_NON_CANONICAL_LENGTH;
+    }
+
     return KSBONJSON_DECODE_OK;
 }
 
@@ -818,14 +851,20 @@ static ksbonjson_decodeStatus mapScanShortString(KSBONJSONMapContext* ctx, uint8
     return KSBONJSON_DECODE_OK;
 }
 
+// Flag bit to indicate a chunked string that needs re-assembly
+// This is set in the high bit of the offset field
+#define CHUNKED_STRING_FLAG 0x80000000u
+
 // Scan a long string (length in payload)
 static ksbonjson_decodeStatus mapScanLongString(KSBONJSONMapContext* ctx, size_t* outIndex)
 {
     MAP_SHOULD_HAVE_ENTRY_SPACE();
 
-    // We'll store the position of the first chunk, and the total length
-    size_t firstOffset = 0;
+    // Store position before first length payload for potential re-assembly
+    size_t startOffset = ctx->position;
+    size_t firstDataOffset = 0;
     size_t totalLength = 0;
+    bool isChunked = false;
     bool firstChunk = true;
     bool needsValidation = ctx->flags.rejectInvalidUTF8 || ctx->flags.rejectNUL;
 
@@ -841,8 +880,12 @@ static ksbonjson_decodeStatus mapScanLongString(KSBONJSONMapContext* ctx, size_t
 
         if (firstChunk)
         {
-            firstOffset = ctx->position;
+            firstDataOffset = ctx->position;
             firstChunk = false;
+            if (moreChunksFollow)
+            {
+                isChunked = true;
+            }
         }
 
         MAP_SHOULD_HAVE_ROOM_FOR_BYTES(chunkLength);
@@ -862,16 +905,25 @@ static ksbonjson_decodeStatus mapScanLongString(KSBONJSONMapContext* ctx, size_t
         ctx->position += (size_t)chunkLength;
     }
 
-    // Note: For chunked strings, we store only the first chunk's offset
-    // and total length. The caller would need to handle re-assembly if
-    // the string was actually chunked (rare case).
-    KSBONJSONMapEntry entry = {
-        .type = KSBONJSON_TYPE_STRING,
-        .data.string = {
-            .offset = (uint32_t)firstOffset,
-            .length = (uint32_t)totalLength
-        }
-    };
+    KSBONJSONMapEntry entry;
+    entry.type = KSBONJSON_TYPE_STRING;
+
+    if (isChunked)
+    {
+        // For chunked strings, store the start offset (before first length payload)
+        // with the CHUNKED_STRING_FLAG set, and the raw byte count including all
+        // length fields. Swift will re-parse this to assemble the string.
+        size_t rawByteCount = ctx->position - startOffset;
+        entry.data.string.offset = (uint32_t)(startOffset | CHUNKED_STRING_FLAG);
+        entry.data.string.length = (uint32_t)rawByteCount;
+    }
+    else
+    {
+        // Single chunk - store data offset and decoded length directly
+        entry.data.string.offset = (uint32_t)firstDataOffset;
+        entry.data.string.length = (uint32_t)totalLength;
+    }
+
     *outIndex = mapAddEntry(ctx, entry);
     return KSBONJSON_DECODE_OK;
 }
@@ -977,17 +1029,17 @@ static ksbonjson_decodeStatus mapScanBigNumber(KSBONJSONMapContext* ctx, size_t*
         return KSBONJSON_DECODE_VALUE_OUT_OF_RANGE;
     }
 
+    // Special BigNumber encodings (NaN/Infinity): significandLength == 0 with non-zero exponentLength
+    unlikely_if(significandLength == 0 && exponentLength != 0)
+    {
+        return KSBONJSON_DECODE_INVALID_DATA;
+    }
+
     int32_t exponent = 0;
     uint64_t significand = 0;
 
     if (significandLength > 0)
     {
-        unlikely_if(significandLength == 0 && exponentLength != 0)
-        {
-            // Special BigNumber encodings: Inf or NaN
-            return KSBONJSON_DECODE_INVALID_DATA;
-        }
-
         MAP_SHOULD_HAVE_ROOM_FOR_BYTES(exponentLength + significandLength);
         exponent = (int32_t)mapDecodeSignedInt(ctx, exponentLength);
         significand = mapDecodeUnsignedInt(ctx, significandLength);
@@ -1030,6 +1082,7 @@ static ksbonjson_decodeStatus mapScanArray(KSBONJSONMapContext* ctx, size_t* out
     // The first child will be the next entry
     size_t firstChild = ctx->entriesCount;
     uint32_t count = 0;
+    bool foundEndMarker = false;
 
     // Scan children until we hit TYPE_END
     while (ctx->position < ctx->inputLength)
@@ -1038,6 +1091,7 @@ static ksbonjson_decodeStatus mapScanArray(KSBONJSONMapContext* ctx, size_t* out
         if (typeCode == TYPE_END)
         {
             ctx->position++; // consume end marker
+            foundEndMarker = true;
             break;
         }
 
@@ -1045,6 +1099,12 @@ static ksbonjson_decodeStatus mapScanArray(KSBONJSONMapContext* ctx, size_t* out
         ksbonjson_decodeStatus status = mapScanValue(ctx, &childIndex);
         unlikely_if(status != KSBONJSON_DECODE_OK) return status;
         count++;
+    }
+
+    // Check if we ran out of data without finding the end marker
+    unlikely_if(!foundEndMarker)
+    {
+        return KSBONJSON_DECODE_UNCLOSED_CONTAINERS;
     }
 
     // Update the array entry with child info
@@ -1128,6 +1188,7 @@ static ksbonjson_decodeStatus mapScanObject(KSBONJSONMapContext* ctx, size_t* ou
     size_t firstChild = ctx->entriesCount;
     uint32_t count = 0; // counts key-value pairs (so 2 entries per pair)
     bool checkDuplicates = ctx->flags.rejectDuplicateKeys;
+    bool foundEndMarker = false;
 
     // Track key indices for duplicate detection
     size_t keyIndices[MAX_TRACKED_KEYS];
@@ -1141,6 +1202,7 @@ static ksbonjson_decodeStatus mapScanObject(KSBONJSONMapContext* ctx, size_t* ou
         if (typeCode == TYPE_END)
         {
             ctx->position++; // consume end marker
+            foundEndMarker = true;
             break;
         }
 
@@ -1177,6 +1239,12 @@ static ksbonjson_decodeStatus mapScanObject(KSBONJSONMapContext* ctx, size_t* ou
         unlikely_if(status != KSBONJSON_DECODE_OK) return status;
 
         count += 2; // key + value
+    }
+
+    // Check if we ran out of data without finding the end marker
+    unlikely_if(!foundEndMarker)
+    {
+        return KSBONJSON_DECODE_UNCLOSED_CONTAINERS;
     }
 
     // Update the object entry with child info
@@ -1321,6 +1389,12 @@ ksbonjson_decodeStatus ksbonjson_map_scan(KSBONJSONMapContext* ctx)
     unlikely_if(ctx->containerDepth > 0)
     {
         return KSBONJSON_DECODE_UNCLOSED_CONTAINERS;
+    }
+
+    // Check for trailing bytes
+    unlikely_if(ctx->flags.rejectTrailingBytes && ctx->position < ctx->inputLength)
+    {
+        return KSBONJSON_DECODE_TRAILING_BYTES;
     }
 
     return KSBONJSON_DECODE_OK;

@@ -107,6 +107,8 @@ typedef enum
     KSBONJSON_DECODE_MAP_FULL = 11,
     KSBONJSON_DECODE_INVALID_UTF8 = 12,
     KSBONJSON_DECODE_TOO_MANY_KEYS = 13,
+    KSBONJSON_DECODE_TRAILING_BYTES = 14,
+    KSBONJSON_DECODE_NON_CANONICAL_LENGTH = 15,
     KSBONJSON_DECODE_COULD_NOT_PROCESS_DATA = 100,
 } ksbonjson_decodeStatus;
 
@@ -138,6 +140,18 @@ typedef struct {
      * Duplicate keys are a security risk and explicitly forbidden by the spec.
      */
     bool rejectDuplicateKeys;
+
+    /**
+     * If true (default), reject documents with trailing bytes after the root value.
+     * Trailing bytes may indicate data corruption or an attempt to hide malicious content.
+     */
+    bool rejectTrailingBytes;
+
+    /**
+     * If true (default), reject length fields that use more bytes than necessary.
+     * Non-canonical encodings may be used to bypass security checks.
+     */
+    bool rejectNonCanonicalLengths;
 } KSBONJSONDecodeFlags;
 
 /**
@@ -149,6 +163,8 @@ static inline KSBONJSONDecodeFlags ksbonjson_defaultDecodeFlags(void)
         .rejectNUL = true,
         .rejectInvalidUTF8 = true,
         .rejectDuplicateKeys = true,
+        .rejectTrailingBytes = true,
+        .rejectNonCanonicalLengths = true,
     };
     return flags;
 }

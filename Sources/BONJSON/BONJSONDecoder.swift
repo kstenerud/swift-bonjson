@@ -136,6 +136,17 @@ public final class BONJSONDecoder {
         case keepLast
     }
 
+    /// The strategy to use for handling trailing bytes after the root value.
+    public enum TrailingBytesDecodingStrategy {
+        /// Reject documents with trailing bytes (default, most secure).
+        /// Trailing bytes may indicate data corruption or an attempt to hide malicious content.
+        case reject
+
+        /// Allow trailing bytes after the root value.
+        /// Use when reading from streams or when trailing data is expected.
+        case allow
+    }
+
     /// The strategy to use for decoding dates. Default is `.secondsSince1970`.
     public var dateDecodingStrategy: DateDecodingStrategy = .secondsSince1970
 
@@ -158,6 +169,9 @@ public final class BONJSONDecoder {
 
     /// The strategy for handling duplicate object keys. Default is `.reject` (most secure).
     public var duplicateKeyDecodingStrategy: DuplicateKeyDecodingStrategy = .reject
+
+    /// The strategy for handling trailing bytes after the root value. Default is `.reject` (most secure).
+    public var trailingBytesDecodingStrategy: TrailingBytesDecodingStrategy = .reject
 
     /// Contextual user info for decoding.
     public var userInfo: [CodingUserInfoKey: Any] = [:]
@@ -309,6 +323,7 @@ public final class BONJSONDecoder {
         flags.rejectNUL = (nulDecodingStrategy == .reject)
         flags.rejectInvalidUTF8 = (unicodeDecodingStrategy == .reject)
         flags.rejectDuplicateKeys = (duplicateKeyDecodingStrategy == .reject)
+        flags.rejectTrailingBytes = (trailingBytesDecodingStrategy == .reject)
 
         return flags
     }
@@ -524,9 +539,13 @@ final class _PositionMap {
         return entries[index]
     }
 
+    // Flag bit to indicate a chunked string (matches C decoder)
+    private static let chunkedStringFlag: UInt32 = 0x80000000
+
     /// Get string data - reads from stored input bytes using entry offset/length.
     /// Uses caching to avoid creating duplicate String objects for repeated keys.
     /// Handles unicode strategy for replace/delete modes.
+    /// Handles chunked strings by re-assembling from raw bytes.
     @inline(__always)
     func getString(at index: size_t) -> String? {
         guard index >= 0 && index < entryCount else {
@@ -538,37 +557,117 @@ final class _PositionMap {
             return nil
         }
 
-        let offset = Int(entry.data.string.offset)
+        let rawOffset = entry.data.string.offset
         let length = Int(entry.data.string.length)
+
+        // Check if this is a chunked string (high bit set in offset)
+        let isChunked = (rawOffset & Self.chunkedStringFlag) != 0
+        let offset = Int(rawOffset & ~Self.chunkedStringFlag)
 
         guard offset >= 0 && offset + length <= inputBytes.count else {
             return nil
         }
 
         // Pack offset and length into a single UInt64 key for cache lookup
-        let cacheKey = UInt64(offset) << 32 | UInt64(length)
+        let cacheKey = UInt64(rawOffset) << 32 | UInt64(length)
 
         // Check cache first
         if let cached = stringCache[cacheKey] {
             return cached
         }
 
-        // Create string based on unicode strategy
+        // For chunked strings, we need to re-parse and concatenate the chunks
         let string: String
+        if isChunked {
+            guard let assembled = assembleChunkedString(offset: offset, rawLength: length) else {
+                return nil
+            }
+            string = assembled
+        } else {
+            // Single-chunk string - create directly from contiguous bytes
+            string = createString(offset: offset, length: length)
+        }
 
-        switch unicodeStrategy {
-        case .reject:
-            // C layer already validated - just create string directly
-            string = inputBytes.withUnsafeBufferPointer { ptr in
-                let start = ptr.baseAddress! + offset
-                let buffer = UnsafeBufferPointer(start: start, count: length)
-                return String(decoding: buffer, as: UTF8.self)
+        // Cache for future lookups
+        stringCache[cacheKey] = string
+        return string
+    }
+
+    /// Assemble a chunked string by re-parsing the raw bytes.
+    private func assembleChunkedString(offset: Int, rawLength: Int) -> String? {
+        var chunks: [ArraySlice<UInt8>] = []
+        var pos = offset
+        let end = offset + rawLength
+
+        while pos < end {
+            // Decode length payload
+            guard let (payload, newPos) = decodeLengthPayload(at: pos, end: end) else {
+                return nil
+            }
+            pos = newPos
+
+            let chunkLength = Int(payload >> 1)
+            // continuation flag is payload & 1, but we don't need it here
+
+            guard pos + chunkLength <= end else {
+                return nil
             }
 
-        case .replace:
-            // Swift's String(decoding:as:UTF8.self) automatically replaces
-            // invalid UTF-8 with U+FFFD, so this works as-is
-            string = inputBytes.withUnsafeBufferPointer { ptr in
+            chunks.append(inputBytes[pos..<(pos + chunkLength)])
+            pos += chunkLength
+        }
+
+        // Concatenate all chunks
+        var allBytes: [UInt8] = []
+        let totalLength = chunks.reduce(0) { $0 + $1.count }
+        allBytes.reserveCapacity(totalLength)
+        for chunk in chunks {
+            allBytes.append(contentsOf: chunk)
+        }
+
+        return createStringFromBytes(allBytes)
+    }
+
+    /// Decode a BONJSON length payload at the given position.
+    /// Returns (payload, newPosition) or nil on error.
+    private func decodeLengthPayload(at pos: Int, end: Int) -> (UInt64, Int)? {
+        guard pos < end else { return nil }
+
+        let header = inputBytes[pos]
+
+        // Special case: 0xff means 8-byte payload follows
+        if header == 0xff {
+            guard pos + 9 <= end else { return nil }
+            var payload: UInt64 = 0
+            for i in 0..<8 {
+                payload |= UInt64(inputBytes[pos + 1 + i]) << (i * 8)
+            }
+            return (payload, pos + 9)
+        }
+
+        // Count trailing 1s in header (after bit inversion) to get byte count
+        let inverted = ~header
+        let trailingZeros = inverted.trailingZeroBitCount
+        let byteCount = trailingZeros + 1
+
+        guard pos + byteCount <= end else { return nil }
+
+        var bits: UInt64 = 0
+        for i in 0..<byteCount {
+            bits |= UInt64(inputBytes[pos + i]) << (i * 8)
+        }
+
+        // Shift right by byteCount to get the payload
+        let payload = bits >> byteCount
+        return (payload, pos + byteCount)
+    }
+
+    /// Create a string from contiguous bytes at the given offset/length.
+    private func createString(offset: Int, length: Int) -> String {
+        switch unicodeStrategy {
+        case .reject, .replace:
+            // C layer already validated for .reject; .replace uses Swift's behavior
+            return inputBytes.withUnsafeBufferPointer { ptr in
                 let start = ptr.baseAddress! + offset
                 let buffer = UnsafeBufferPointer(start: start, count: length)
                 return String(decoding: buffer, as: UTF8.self)
@@ -576,12 +675,76 @@ final class _PositionMap {
 
         case .delete:
             // Filter out invalid UTF-8 bytes before creating string
-            string = createStringDeletingInvalidUTF8(offset: offset, length: length)
+            return createStringDeletingInvalidUTF8(offset: offset, length: length)
+        }
+    }
+
+    /// Create a string from a byte array.
+    private func createStringFromBytes(_ bytes: [UInt8]) -> String {
+        switch unicodeStrategy {
+        case .reject, .replace:
+            return String(decoding: bytes, as: UTF8.self)
+
+        case .delete:
+            return createStringDeletingInvalidUTF8FromBytes(bytes)
+        }
+    }
+
+    /// Create a string by filtering out invalid UTF-8 sequences from a byte array.
+    private func createStringDeletingInvalidUTF8FromBytes(_ bytes: [UInt8]) -> String {
+        var validBytes: [UInt8] = []
+        validBytes.reserveCapacity(bytes.count)
+
+        var i = 0
+        let end = bytes.count
+
+        while i < end {
+            let b0 = bytes[i]
+
+            // ASCII (0x00-0x7F) - always valid
+            if b0 < 0x80 {
+                validBytes.append(b0)
+                i += 1
+                continue
+            }
+
+            // Determine expected sequence length and validate
+            let seqLen: Int
+            if b0 & 0xE0 == 0xC0 { seqLen = 2 }
+            else if b0 & 0xF0 == 0xE0 { seqLen = 3 }
+            else if b0 & 0xF8 == 0xF0 { seqLen = 4 }
+            else {
+                // Invalid start byte - skip
+                i += 1
+                continue
+            }
+
+            // Check we have enough bytes
+            guard i + seqLen <= end else {
+                i += 1
+                continue
+            }
+
+            // Validate continuation bytes
+            var valid = true
+            for j in 1..<seqLen {
+                if bytes[i + j] & 0xC0 != 0x80 {
+                    valid = false
+                    break
+                }
+            }
+
+            if valid {
+                for j in 0..<seqLen {
+                    validBytes.append(bytes[i + j])
+                }
+                i += seqLen
+            } else {
+                i += 1
+            }
         }
 
-        // Cache for future lookups
-        stringCache[cacheKey] = string
-        return string
+        return String(decoding: validBytes, as: UTF8.self)
     }
 
     /// Create a string by filtering out invalid UTF-8 sequences.
