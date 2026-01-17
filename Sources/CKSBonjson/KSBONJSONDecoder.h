@@ -41,8 +41,21 @@ extern "C" {
 // Compile-time Configuration
 // ============================================================================
 
+// BONJSON spec-recommended defaults
 #ifndef KSBONJSON_MAX_CONTAINER_DEPTH
-#   define KSBONJSON_MAX_CONTAINER_DEPTH 200
+#   define KSBONJSON_MAX_CONTAINER_DEPTH 512
+#endif
+#ifndef KSBONJSON_DEFAULT_MAX_STRING_LENGTH
+#   define KSBONJSON_DEFAULT_MAX_STRING_LENGTH 10000000
+#endif
+#ifndef KSBONJSON_DEFAULT_MAX_CONTAINER_SIZE
+#   define KSBONJSON_DEFAULT_MAX_CONTAINER_SIZE 1000000
+#endif
+#ifndef KSBONJSON_DEFAULT_MAX_DOCUMENT_SIZE
+#   define KSBONJSON_DEFAULT_MAX_DOCUMENT_SIZE 2000000000
+#endif
+#ifndef KSBONJSON_DEFAULT_MAX_CHUNKS
+#   define KSBONJSON_DEFAULT_MAX_CHUNKS 100
 #endif
 
 #ifndef KSBONJSON_RESTRICT
@@ -109,6 +122,11 @@ typedef enum
     KSBONJSON_DECODE_TOO_MANY_KEYS = 13,
     KSBONJSON_DECODE_TRAILING_BYTES = 14,
     KSBONJSON_DECODE_NON_CANONICAL_LENGTH = 15,
+    KSBONJSON_DECODE_MAX_DEPTH_EXCEEDED = 16,
+    KSBONJSON_DECODE_MAX_STRING_LENGTH_EXCEEDED = 17,
+    KSBONJSON_DECODE_MAX_CONTAINER_SIZE_EXCEEDED = 18,
+    KSBONJSON_DECODE_MAX_DOCUMENT_SIZE_EXCEEDED = 19,
+    KSBONJSON_DECODE_MAX_CHUNKS_EXCEEDED = 20,
     KSBONJSON_DECODE_COULD_NOT_PROCESS_DATA = 100,
 } ksbonjson_decodeStatus;
 
@@ -152,10 +170,36 @@ typedef struct {
      * Non-canonical encodings may be used to bypass security checks.
      */
     bool rejectNonCanonicalLengths;
+
+    /**
+     * Maximum container nesting depth (0 = use compile-time default).
+     */
+    size_t maxDepth;
+
+    /**
+     * Maximum string length in bytes (0 = no limit).
+     */
+    size_t maxStringLength;
+
+    /**
+     * Maximum number of elements in a container (0 = no limit).
+     */
+    size_t maxContainerSize;
+
+    /**
+     * Maximum document size in bytes (0 = no limit).
+     */
+    size_t maxDocumentSize;
+
+    /**
+     * Maximum number of string chunks (0 = no limit).
+     */
+    size_t maxChunks;
 } KSBONJSONDecodeFlags;
 
 /**
- * Returns default decode flags with all security checks enabled.
+ * Returns default decode flags with all security checks enabled and spec-recommended limits.
+ * SIZE_MAX tells the decoder to use the BONJSON spec-recommended defaults.
  */
 static inline KSBONJSONDecodeFlags ksbonjson_defaultDecodeFlags(void)
 {
@@ -165,6 +209,11 @@ static inline KSBONJSONDecodeFlags ksbonjson_defaultDecodeFlags(void)
         .rejectDuplicateKeys = true,
         .rejectTrailingBytes = true,
         .rejectNonCanonicalLengths = true,
+        .maxDepth = SIZE_MAX,           // Spec default: 512
+        .maxStringLength = SIZE_MAX,    // Spec default: 10,000,000
+        .maxContainerSize = SIZE_MAX,   // Spec default: 1,000,000
+        .maxDocumentSize = SIZE_MAX,    // Spec default: 2,000,000,000
+        .maxChunks = SIZE_MAX,          // Spec default: 100
     };
     return flags;
 }

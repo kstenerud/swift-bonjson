@@ -26,6 +26,7 @@
 
 #include "KSBONJSONEncoder.h"
 #include "KSBONJSONCommon.h"
+#include <math.h>
 #include <string.h>
 #ifdef _MSC_VER
 #include <intrin.h>
@@ -181,6 +182,13 @@ static inline KSBONJSONContainerState* getBufferContainer(KSBONJSONBufferEncodeC
     return &ctx->containers[ctx->containerDepth];
 }
 
+// Check if adding bytes would exceed document size limit (SIZE_MAX means use spec default)
+static inline bool bufferWouldExceedDocumentSize(KSBONJSONBufferEncodeContext* ctx, size_t length)
+{
+    size_t maxSize = ctx->flags.maxDocumentSize < SIZE_MAX ? ctx->flags.maxDocumentSize : KSBONJSON_DEFAULT_MAX_DOCUMENT_SIZE;
+    return (ctx->position + length) > maxSize;
+}
+
 // Write bytes directly to buffer - assumes capacity has been checked!
 static inline void bufferWriteBytes(KSBONJSONBufferEncodeContext* ctx,
                                     const uint8_t* data,
@@ -254,6 +262,10 @@ ssize_t ksbonjson_encodeToBuffer_null(KSBONJSONBufferEncodeContext* ctx)
     {
         return container->isChunkingString ? -KSBONJSON_ENCODE_CHUNKING_STRING : -KSBONJSON_ENCODE_EXPECTED_OBJECT_NAME;
     }
+    unlikely_if(bufferWouldExceedDocumentSize(ctx, 1))
+    {
+        return -KSBONJSON_ENCODE_MAX_DOCUMENT_SIZE_EXCEEDED;
+    }
     container->isExpectingName = true;
 
     bufferWriteByte(ctx, TYPE_NULL);
@@ -267,6 +279,10 @@ ssize_t ksbonjson_encodeToBuffer_bool(KSBONJSONBufferEncodeContext* ctx, bool va
     {
         return container->isChunkingString ? -KSBONJSON_ENCODE_CHUNKING_STRING : -KSBONJSON_ENCODE_EXPECTED_OBJECT_NAME;
     }
+    unlikely_if(bufferWouldExceedDocumentSize(ctx, 1))
+    {
+        return -KSBONJSON_ENCODE_MAX_DOCUMENT_SIZE_EXCEEDED;
+    }
     container->isExpectingName = true;
 
     bufferWriteByte(ctx, value ? TYPE_TRUE : TYPE_FALSE);
@@ -279,6 +295,10 @@ ssize_t ksbonjson_encodeToBuffer_int(KSBONJSONBufferEncodeContext* ctx, int64_t 
     unlikely_if((container->isObject & container->isExpectingName) | container->isChunkingString)
     {
         return container->isChunkingString ? -KSBONJSON_ENCODE_CHUNKING_STRING : -KSBONJSON_ENCODE_EXPECTED_OBJECT_NAME;
+    }
+    unlikely_if(bufferWouldExceedDocumentSize(ctx, 9)) // Max int size
+    {
+        return -KSBONJSON_ENCODE_MAX_DOCUMENT_SIZE_EXCEEDED;
     }
     container->isExpectingName = true;
 
@@ -315,6 +335,10 @@ ssize_t ksbonjson_encodeToBuffer_uint(KSBONJSONBufferEncodeContext* ctx, uint64_
     {
         return container->isChunkingString ? -KSBONJSON_ENCODE_CHUNKING_STRING : -KSBONJSON_ENCODE_EXPECTED_OBJECT_NAME;
     }
+    unlikely_if(bufferWouldExceedDocumentSize(ctx, 9)) // Max uint size
+    {
+        return -KSBONJSON_ENCODE_MAX_DOCUMENT_SIZE_EXCEEDED;
+    }
     container->isExpectingName = true;
 
     if (value <= SMALLINT_POSITIVE_EDGE)
@@ -343,7 +367,9 @@ ssize_t ksbonjson_encodeToBuffer_float(KSBONJSONBufferEncodeContext* ctx, double
 
 #pragma GCC diagnostic push
 #pragma GCC diagnostic ignored "-Wfloat-equal"
-    if ((double)asInt == value)
+    // Check if value can be exactly represented as integer.
+    // Exclude negative zero (-0.0) which must be encoded as a float to preserve the sign bit.
+    if ((double)asInt == value && !signbit(value))
     {
         return ksbonjson_encodeToBuffer_int(ctx, asInt);
     }
@@ -353,6 +379,10 @@ ssize_t ksbonjson_encodeToBuffer_float(KSBONJSONBufferEncodeContext* ctx, double
     unlikely_if((container->isObject & container->isExpectingName) | container->isChunkingString)
     {
         return container->isChunkingString ? -KSBONJSON_ENCODE_CHUNKING_STRING : -KSBONJSON_ENCODE_EXPECTED_OBJECT_NAME;
+    }
+    unlikely_if(bufferWouldExceedDocumentSize(ctx, 9)) // Max float size
+    {
+        return -KSBONJSON_ENCODE_MAX_DOCUMENT_SIZE_EXCEEDED;
     }
 
     union num64_bits b64 = {.f64 = value};
@@ -394,6 +424,10 @@ ssize_t ksbonjson_encodeToBuffer_bigNumber(KSBONJSONBufferEncodeContext* ctx, KS
     {
         return container->isChunkingString ? -KSBONJSON_ENCODE_CHUNKING_STRING : -KSBONJSON_ENCODE_EXPECTED_OBJECT_NAME;
     }
+    unlikely_if(bufferWouldExceedDocumentSize(ctx, 13)) // Max bignumber: type + header + 3 exp + 8 sig
+    {
+        return -KSBONJSON_ENCODE_MAX_DOCUMENT_SIZE_EXCEEDED;
+    }
 
     unlikely_if(value.exponent < -0x800000 || value.exponent > 0x7fffff)
     {
@@ -429,6 +463,20 @@ ssize_t ksbonjson_encodeToBuffer_string(KSBONJSONBufferEncodeContext* ctx,
     unlikely_if(!value || container->isChunkingString)
     {
         return container->isChunkingString ? -KSBONJSON_ENCODE_CHUNKING_STRING : -KSBONJSON_ENCODE_NULL_POINTER;
+    }
+
+    // Check max string length (SIZE_MAX means use spec default)
+    size_t maxLen = ctx->flags.maxStringLength < SIZE_MAX ? ctx->flags.maxStringLength : KSBONJSON_DEFAULT_MAX_STRING_LENGTH;
+    unlikely_if(length > maxLen)
+    {
+        return -KSBONJSON_ENCODE_MAX_STRING_LENGTH_EXCEEDED;
+    }
+
+    // Check max document size (type + length field + string data)
+    size_t maxEncodedSize = length <= 15 ? (1 + length) : (10 + length);
+    unlikely_if(bufferWouldExceedDocumentSize(ctx, maxEncodedSize))
+    {
+        return -KSBONJSON_ENCODE_MAX_DOCUMENT_SIZE_EXCEEDED;
     }
 
     // Check for NUL characters if required
@@ -472,6 +520,29 @@ ssize_t ksbonjson_encodeToBuffer_beginObject(KSBONJSONBufferEncodeContext* ctx)
     {
         return container->isChunkingString ? -KSBONJSON_ENCODE_CHUNKING_STRING : -KSBONJSON_ENCODE_EXPECTED_OBJECT_NAME;
     }
+    unlikely_if(bufferWouldExceedDocumentSize(ctx, 1))
+    {
+        return -KSBONJSON_ENCODE_MAX_DOCUMENT_SIZE_EXCEEDED;
+    }
+
+    // Check max depth (SIZE_MAX means use compile-time default)
+    size_t maxDepth = ctx->flags.maxDepth < SIZE_MAX ? ctx->flags.maxDepth : KSBONJSON_MAX_CONTAINER_DEPTH;
+    unlikely_if((size_t)(ctx->containerDepth + 1) > maxDepth)
+    {
+        return -KSBONJSON_ENCODE_MAX_DEPTH_EXCEEDED;
+    }
+
+    // Increment element count for parent container (SIZE_MAX means use spec default)
+    if (ctx->containerDepth >= 0)
+    {
+        ctx->containerElementCounts[ctx->containerDepth]++;
+        size_t maxSize = ctx->flags.maxContainerSize < SIZE_MAX ? ctx->flags.maxContainerSize : KSBONJSON_DEFAULT_MAX_CONTAINER_SIZE;
+        unlikely_if(ctx->containerElementCounts[ctx->containerDepth] > maxSize)
+        {
+            return -KSBONJSON_ENCODE_MAX_CONTAINER_SIZE_EXCEEDED;
+        }
+    }
+
     container->isExpectingName = true;
 
     ctx->containerDepth++;
@@ -479,6 +550,7 @@ ssize_t ksbonjson_encodeToBuffer_beginObject(KSBONJSONBufferEncodeContext* ctx)
         .isObject = true,
         .isExpectingName = true,
     };
+    ctx->containerElementCounts[ctx->containerDepth] = 0;
 
     bufferWriteByte(ctx, TYPE_OBJECT);
     return 1;
@@ -491,10 +563,34 @@ ssize_t ksbonjson_encodeToBuffer_beginArray(KSBONJSONBufferEncodeContext* ctx)
     {
         return container->isChunkingString ? -KSBONJSON_ENCODE_CHUNKING_STRING : -KSBONJSON_ENCODE_EXPECTED_OBJECT_NAME;
     }
+    unlikely_if(bufferWouldExceedDocumentSize(ctx, 1))
+    {
+        return -KSBONJSON_ENCODE_MAX_DOCUMENT_SIZE_EXCEEDED;
+    }
+
+    // Check max depth (SIZE_MAX means use compile-time default)
+    size_t maxDepth = ctx->flags.maxDepth < SIZE_MAX ? ctx->flags.maxDepth : KSBONJSON_MAX_CONTAINER_DEPTH;
+    unlikely_if((size_t)(ctx->containerDepth + 1) > maxDepth)
+    {
+        return -KSBONJSON_ENCODE_MAX_DEPTH_EXCEEDED;
+    }
+
+    // Increment element count for parent container (SIZE_MAX means use spec default)
+    if (ctx->containerDepth >= 0)
+    {
+        ctx->containerElementCounts[ctx->containerDepth]++;
+        size_t maxSize = ctx->flags.maxContainerSize < SIZE_MAX ? ctx->flags.maxContainerSize : KSBONJSON_DEFAULT_MAX_CONTAINER_SIZE;
+        unlikely_if(ctx->containerElementCounts[ctx->containerDepth] > maxSize)
+        {
+            return -KSBONJSON_ENCODE_MAX_CONTAINER_SIZE_EXCEEDED;
+        }
+    }
+
     container->isExpectingName = true;
 
     ctx->containerDepth++;
     ctx->containers[ctx->containerDepth] = (KSBONJSONContainerState){0};
+    ctx->containerElementCounts[ctx->containerDepth] = 0;
 
     bufferWriteByte(ctx, TYPE_ARRAY);
     return 1;
@@ -506,6 +602,10 @@ ssize_t ksbonjson_encodeToBuffer_endContainer(KSBONJSONBufferEncodeContext* ctx)
     unlikely_if((container->isObject & !container->isExpectingName) | container->isChunkingString)
     {
         return container->isChunkingString ? -KSBONJSON_ENCODE_CHUNKING_STRING : -KSBONJSON_ENCODE_EXPECTED_OBJECT_VALUE;
+    }
+    unlikely_if(bufferWouldExceedDocumentSize(ctx, 1))
+    {
+        return -KSBONJSON_ENCODE_MAX_DOCUMENT_SIZE_EXCEEDED;
     }
 
     unlikely_if(ctx->containerDepth <= 0)
@@ -1108,6 +1208,14 @@ const char* ksbonjson_describeEncodeStatus(const ksbonjson_encodeStatus status)
             return "Buffer is too small for the encoded data";
         case KSBONJSON_ENCODE_NUL_CHARACTER:
             return "A string value contained a NUL character";
+        case KSBONJSON_ENCODE_MAX_DEPTH_EXCEEDED:
+            return "Maximum container depth exceeded";
+        case KSBONJSON_ENCODE_MAX_STRING_LENGTH_EXCEEDED:
+            return "Maximum string length exceeded";
+        case KSBONJSON_ENCODE_MAX_CONTAINER_SIZE_EXCEEDED:
+            return "Maximum container size exceeded";
+        case KSBONJSON_ENCODE_MAX_DOCUMENT_SIZE_EXCEEDED:
+            return "Maximum document size exceeded";
         case KSBONJSON_ENCODE_COULD_NOT_ADD_DATA:
             return "addEncodedBytes() failed to process the passed in data";
         default:

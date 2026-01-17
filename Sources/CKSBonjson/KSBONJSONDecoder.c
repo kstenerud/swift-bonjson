@@ -681,6 +681,16 @@ const char* ksbonjson_describeDecodeStatus(const ksbonjson_decodeStatus status)
             return "Document has trailing bytes after the root value";
         case KSBONJSON_DECODE_NON_CANONICAL_LENGTH:
             return "Length field uses non-canonical encoding (more bytes than necessary)";
+        case KSBONJSON_DECODE_MAX_DEPTH_EXCEEDED:
+            return "Maximum container depth exceeded";
+        case KSBONJSON_DECODE_MAX_STRING_LENGTH_EXCEEDED:
+            return "Maximum string length exceeded";
+        case KSBONJSON_DECODE_MAX_CONTAINER_SIZE_EXCEEDED:
+            return "Maximum container size exceeded";
+        case KSBONJSON_DECODE_MAX_DOCUMENT_SIZE_EXCEEDED:
+            return "Maximum document size exceeded";
+        case KSBONJSON_DECODE_MAX_CHUNKS_EXCEEDED:
+            return "Maximum number of string chunks exceeded";
         default:
             return "(unknown status - was it a user-defined status code?)";
     }
@@ -824,6 +834,13 @@ static ksbonjson_decodeStatus mapScanShortString(KSBONJSONMapContext* ctx, uint8
     size_t length = (size_t)(typeCode - TYPE_STRING0);
     size_t offset = ctx->position;
 
+    // Check max string length (SIZE_MAX means use spec default)
+    size_t maxStrLen = ctx->flags.maxStringLength < SIZE_MAX ? ctx->flags.maxStringLength : KSBONJSON_DEFAULT_MAX_STRING_LENGTH;
+    unlikely_if(length > maxStrLen)
+    {
+        return KSBONJSON_DECODE_MAX_STRING_LENGTH_EXCEEDED;
+    }
+
     MAP_SHOULD_HAVE_ROOM_FOR_BYTES(length);
 
     // Validate string if required
@@ -867,10 +884,20 @@ static ksbonjson_decodeStatus mapScanLongString(KSBONJSONMapContext* ctx, size_t
     bool isChunked = false;
     bool firstChunk = true;
     bool needsValidation = ctx->flags.rejectInvalidUTF8 || ctx->flags.rejectNUL;
+    size_t chunkCount = 0;
 
     bool moreChunksFollow = true;
     while (moreChunksFollow)
     {
+        chunkCount++;
+
+        // Check max chunks (SIZE_MAX means use spec default)
+        size_t maxChunks = ctx->flags.maxChunks < SIZE_MAX ? ctx->flags.maxChunks : KSBONJSON_DEFAULT_MAX_CHUNKS;
+        unlikely_if(chunkCount > maxChunks)
+        {
+            return KSBONJSON_DECODE_MAX_CHUNKS_EXCEEDED;
+        }
+
         uint64_t lengthPayload;
         ksbonjson_decodeStatus status = mapDecodeLengthPayload(ctx, &lengthPayload);
         unlikely_if(status != KSBONJSON_DECODE_OK) return status;
@@ -903,6 +930,13 @@ static ksbonjson_decodeStatus mapScanLongString(KSBONJSONMapContext* ctx, size_t
 
         totalLength += (size_t)chunkLength;
         ctx->position += (size_t)chunkLength;
+
+        // Check max string length after accumulating total length (SIZE_MAX means use spec default)
+        size_t maxStrLen2 = ctx->flags.maxStringLength < SIZE_MAX ? ctx->flags.maxStringLength : KSBONJSON_DEFAULT_MAX_STRING_LENGTH;
+        unlikely_if(totalLength > maxStrLen2)
+        {
+            return KSBONJSON_DECODE_MAX_STRING_LENGTH_EXCEEDED;
+        }
     }
 
     KSBONJSONMapEntry entry;
@@ -1062,9 +1096,11 @@ static ksbonjson_decodeStatus mapScanArray(KSBONJSONMapContext* ctx, size_t* out
 {
     MAP_SHOULD_HAVE_ENTRY_SPACE();
 
-    unlikely_if(ctx->containerDepth >= KSBONJSON_MAX_CONTAINER_DEPTH)
+    // Check max depth (SIZE_MAX means use compile-time default)
+    size_t maxDepth = ctx->flags.maxDepth < SIZE_MAX ? ctx->flags.maxDepth : KSBONJSON_MAX_CONTAINER_DEPTH;
+    unlikely_if((size_t)ctx->containerDepth >= maxDepth)
     {
-        return KSBONJSON_DECODE_CONTAINER_DEPTH_EXCEEDED;
+        return KSBONJSON_DECODE_MAX_DEPTH_EXCEEDED;
     }
 
     // Reserve slot for array entry (we'll update it after scanning children)
@@ -1099,6 +1135,13 @@ static ksbonjson_decodeStatus mapScanArray(KSBONJSONMapContext* ctx, size_t* out
         ksbonjson_decodeStatus status = mapScanValue(ctx, &childIndex);
         unlikely_if(status != KSBONJSON_DECODE_OK) return status;
         count++;
+
+        // Check max container size (SIZE_MAX means use spec default)
+        size_t maxContSize = ctx->flags.maxContainerSize < SIZE_MAX ? ctx->flags.maxContainerSize : KSBONJSON_DEFAULT_MAX_CONTAINER_SIZE;
+        unlikely_if(count > maxContSize)
+        {
+            return KSBONJSON_DECODE_MAX_CONTAINER_SIZE_EXCEEDED;
+        }
     }
 
     // Check if we ran out of data without finding the end marker
@@ -1167,9 +1210,11 @@ static ksbonjson_decodeStatus mapScanObject(KSBONJSONMapContext* ctx, size_t* ou
 {
     MAP_SHOULD_HAVE_ENTRY_SPACE();
 
-    unlikely_if(ctx->containerDepth >= KSBONJSON_MAX_CONTAINER_DEPTH)
+    // Check max depth (SIZE_MAX means use compile-time default)
+    size_t maxDepth = ctx->flags.maxDepth < SIZE_MAX ? ctx->flags.maxDepth : KSBONJSON_MAX_CONTAINER_DEPTH;
+    unlikely_if((size_t)ctx->containerDepth >= maxDepth)
     {
-        return KSBONJSON_DECODE_CONTAINER_DEPTH_EXCEEDED;
+        return KSBONJSON_DECODE_MAX_DEPTH_EXCEEDED;
     }
 
     // Reserve slot for object entry
@@ -1239,6 +1284,13 @@ static ksbonjson_decodeStatus mapScanObject(KSBONJSONMapContext* ctx, size_t* ou
         unlikely_if(status != KSBONJSON_DECODE_OK) return status;
 
         count += 2; // key + value
+
+        // Check max container size (count/2 = number of key-value pairs, SIZE_MAX means use spec default)
+        size_t maxContSize = ctx->flags.maxContainerSize < SIZE_MAX ? ctx->flags.maxContainerSize : KSBONJSON_DEFAULT_MAX_CONTAINER_SIZE;
+        unlikely_if((count / 2) > maxContSize)
+        {
+            return KSBONJSON_DECODE_MAX_CONTAINER_SIZE_EXCEEDED;
+        }
     }
 
     // Check if we ran out of data without finding the end marker
@@ -1373,6 +1425,13 @@ ksbonjson_decodeStatus ksbonjson_map_scan(KSBONJSONMapContext* ctx)
     if (ctx->inputLength == 0)
     {
         return KSBONJSON_DECODE_INCOMPLETE;
+    }
+
+    // Check max document size (SIZE_MAX means use spec default)
+    size_t maxDocSize = ctx->flags.maxDocumentSize < SIZE_MAX ? ctx->flags.maxDocumentSize : KSBONJSON_DEFAULT_MAX_DOCUMENT_SIZE;
+    unlikely_if(ctx->inputLength > maxDocSize)
+    {
+        return KSBONJSON_DECODE_MAX_DOCUMENT_SIZE_EXCEEDED;
     }
 
     // Scan the root value

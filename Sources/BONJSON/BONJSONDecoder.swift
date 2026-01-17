@@ -173,6 +173,23 @@ public final class BONJSONDecoder {
     /// The strategy for handling trailing bytes after the root value. Default is `.reject` (most secure).
     public var trailingBytesDecodingStrategy: TrailingBytesDecodingStrategy = .reject
 
+    // MARK: - Limit Properties (defaults per BONJSON spec recommendations)
+
+    /// Maximum container nesting depth. Default is 512 (BONJSON spec recommendation).
+    public var maxDepth: Int = 512
+
+    /// Maximum string length in bytes. Default is 10,000,000 (BONJSON spec recommendation).
+    public var maxStringLength: Int = 10_000_000
+
+    /// Maximum number of elements in a container. Default is 1,000,000 (BONJSON spec recommendation).
+    public var maxContainerSize: Int = 1_000_000
+
+    /// Maximum document size in bytes. Default is 2,000,000,000 (BONJSON spec recommendation).
+    public var maxDocumentSize: Int = 2_000_000_000
+
+    /// Maximum number of string chunks. Default is 100 (BONJSON spec recommendation).
+    public var maxChunks: Int = 100
+
     /// Contextual user info for decoding.
     public var userInfo: [CodingUserInfoKey: Any] = [:]
 
@@ -325,6 +342,13 @@ public final class BONJSONDecoder {
         flags.rejectDuplicateKeys = (duplicateKeyDecodingStrategy == .reject)
         flags.rejectTrailingBytes = (trailingBytesDecodingStrategy == .reject)
 
+        // Set limit options
+        flags.maxDepth = maxDepth
+        flags.maxStringLength = maxStringLength
+        flags.maxContainerSize = maxContainerSize
+        flags.maxDocumentSize = maxDocumentSize
+        flags.maxChunks = maxChunks
+
         return flags
     }
 }
@@ -350,6 +374,11 @@ public enum BONJSONDecodingError: Error, CustomStringConvertible {
     case mapFull
     case nulCharacterInString
     case invalidUTF8Sequence
+    case maxDepthExceeded
+    case maxStringLengthExceeded
+    case maxContainerSizeExceeded
+    case maxDocumentSizeExceeded
+    case maxChunksExceeded
 
     public var description: String {
         switch self {
@@ -387,6 +416,16 @@ public enum BONJSONDecodingError: Error, CustomStringConvertible {
             return "String contains NUL (U+0000) character"
         case .invalidUTF8Sequence:
             return "String contains invalid UTF-8 (malformed sequence, surrogate, or overlong encoding)"
+        case .maxDepthExceeded:
+            return "Maximum container depth exceeded"
+        case .maxStringLengthExceeded:
+            return "Maximum string length exceeded"
+        case .maxContainerSizeExceeded:
+            return "Maximum container size exceeded"
+        case .maxDocumentSizeExceeded:
+            return "Maximum document size exceeded"
+        case .maxChunksExceeded:
+            return "Maximum number of string chunks exceeded"
         }
     }
 }
@@ -482,6 +521,16 @@ final class _PositionMap {
                         throw BONJSONDecodingError.duplicateObjectKey("")
                     case KSBONJSON_DECODE_TOO_MANY_KEYS:
                         throw BONJSONDecodingError.tooManyKeys
+                    case KSBONJSON_DECODE_MAX_DEPTH_EXCEEDED:
+                        throw BONJSONDecodingError.maxDepthExceeded
+                    case KSBONJSON_DECODE_MAX_STRING_LENGTH_EXCEEDED:
+                        throw BONJSONDecodingError.maxStringLengthExceeded
+                    case KSBONJSON_DECODE_MAX_CONTAINER_SIZE_EXCEEDED:
+                        throw BONJSONDecodingError.maxContainerSizeExceeded
+                    case KSBONJSON_DECODE_MAX_DOCUMENT_SIZE_EXCEEDED:
+                        throw BONJSONDecodingError.maxDocumentSizeExceeded
+                    case KSBONJSON_DECODE_MAX_CHUNKS_EXCEEDED:
+                        throw BONJSONDecodingError.maxChunksExceeded
                     default:
                         let message = ksbonjson_describeDecodeStatus(status).map { String(cString: $0) } ?? "Unknown error"
                         throw BONJSONDecodingError.scanFailed(message)

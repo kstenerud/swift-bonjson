@@ -110,6 +110,20 @@ public final class BONJSONEncoder {
     /// The strategy for handling NUL characters in strings. Default is `.reject` (most secure).
     public var nulEncodingStrategy: NULEncodingStrategy = .reject
 
+    // MARK: - Limit Properties (defaults per BONJSON spec recommendations)
+
+    /// Maximum container nesting depth. Default is 512 (BONJSON spec recommendation).
+    public var maxDepth: Int = 512
+
+    /// Maximum string length in bytes. Default is 10,000,000 (BONJSON spec recommendation).
+    public var maxStringLength: Int = 10_000_000
+
+    /// Maximum number of elements in a container. Default is 1,000,000 (BONJSON spec recommendation).
+    public var maxContainerSize: Int = 1_000_000
+
+    /// Maximum document size in bytes. Default is 2,000,000,000 (BONJSON spec recommendation).
+    public var maxDocumentSize: Int = 2_000_000_000
+
     /// Contextual user info for encoding.
     public var userInfo: [CodingUserInfoKey: Any] = [:]
 
@@ -128,7 +142,11 @@ public final class BONJSONEncoder {
             dataEncodingStrategy: dataEncodingStrategy,
             nonConformingFloatEncodingStrategy: nonConformingFloatEncodingStrategy,
             keyEncodingStrategy: keyEncodingStrategy,
-            nulEncodingStrategy: nulEncodingStrategy
+            nulEncodingStrategy: nulEncodingStrategy,
+            maxDepth: maxDepth,
+            maxStringLength: maxStringLength,
+            maxContainerSize: maxContainerSize,
+            maxDocumentSize: maxDocumentSize
         )
 
         // Fast path for primitive arrays
@@ -161,6 +179,10 @@ public enum BONJSONEncodingError: Error, CustomStringConvertible {
     case encodingFailed(String)
     case internalError(String)
     case nulCharacterInString
+    case maxDepthExceeded
+    case maxStringLengthExceeded
+    case maxContainerSizeExceeded
+    case maxDocumentSizeExceeded
 
     public var description: String {
         switch self {
@@ -172,6 +194,14 @@ public enum BONJSONEncodingError: Error, CustomStringConvertible {
             return "Internal error: \(message)"
         case .nulCharacterInString:
             return "String contains NUL (U+0000) character"
+        case .maxDepthExceeded:
+            return "Maximum container depth exceeded"
+        case .maxStringLengthExceeded:
+            return "Maximum string length exceeded"
+        case .maxContainerSizeExceeded:
+            return "Maximum container size exceeded"
+        case .maxDocumentSizeExceeded:
+            return "Maximum document size exceeded"
         }
     }
 }
@@ -183,11 +213,21 @@ func throwIfEncodingFailed(_ result: Int) throws {
     if result < 0 {
         let status = ksbonjson_encodeStatus(rawValue: UInt32(-result))
         // Map specific status codes to Swift errors
-        if status == KSBONJSON_ENCODE_NUL_CHARACTER {
+        switch status {
+        case KSBONJSON_ENCODE_NUL_CHARACTER:
             throw BONJSONEncodingError.nulCharacterInString
+        case KSBONJSON_ENCODE_MAX_DEPTH_EXCEEDED:
+            throw BONJSONEncodingError.maxDepthExceeded
+        case KSBONJSON_ENCODE_MAX_STRING_LENGTH_EXCEEDED:
+            throw BONJSONEncodingError.maxStringLengthExceeded
+        case KSBONJSON_ENCODE_MAX_CONTAINER_SIZE_EXCEEDED:
+            throw BONJSONEncodingError.maxContainerSizeExceeded
+        case KSBONJSON_ENCODE_MAX_DOCUMENT_SIZE_EXCEEDED:
+            throw BONJSONEncodingError.maxDocumentSizeExceeded
+        default:
+            let message = ksbonjson_describeEncodeStatus(status).map { String(cString: $0) } ?? "Unknown error"
+            throw BONJSONEncodingError.encodingFailed(message)
         }
-        let message = ksbonjson_describeEncodeStatus(status).map { String(cString: $0) } ?? "Unknown error"
-        throw BONJSONEncodingError.encodingFailed(message)
     }
 }
 
@@ -224,7 +264,11 @@ final class _BufferEncoderState {
         dataEncodingStrategy: BONJSONEncoder.DataEncodingStrategy,
         nonConformingFloatEncodingStrategy: BONJSONEncoder.NonConformingFloatEncodingStrategy,
         keyEncodingStrategy: BONJSONEncoder.KeyEncodingStrategy,
-        nulEncodingStrategy: BONJSONEncoder.NULEncodingStrategy = .reject
+        nulEncodingStrategy: BONJSONEncoder.NULEncodingStrategy = .reject,
+        maxDepth: Int = 0,
+        maxStringLength: Int = 0,
+        maxContainerSize: Int = 0,
+        maxDocumentSize: Int = 0
     ) {
         self.userInfo = userInfo
         self.dateEncodingStrategy = dateEncodingStrategy
@@ -251,6 +295,12 @@ final class _BufferEncoderState {
             // Swift handles conversion before C layer sees it
             flags.rejectNonFiniteFloat = true
         }
+
+        // Set limit options
+        flags.maxDepth = maxDepth
+        flags.maxStringLength = maxStringLength
+        flags.maxContainerSize = maxContainerSize
+        flags.maxDocumentSize = maxDocumentSize
 
         // Initialize the buffer-based encoder with flags
         buffer.withUnsafeMutableBufferPointer { bufferPtr in
@@ -544,20 +594,37 @@ struct _BufferKeyedEncodingContainer<Key: CodingKey>: KeyedEncodingContainerProt
     /// The depth when this container was created.
     let containerDepth: Int
 
+    /// Deferred error from container creation (thrown on first encode).
+    private let deferredError: Error?
+
     init(state: _BufferEncoderState, codingPath: [CodingKey]) {
         self.state = state
         self.codingPath = codingPath
 
-        // Begin object
+        // Begin object - store any error for deferred throwing
         state.ensureCapacity(Int(KSBONJSON_MAX_ENCODED_SIZE_CONTAINER_BEGIN))
         let result = ksbonjson_encodeToBuffer_beginObject(&state.context)
-        assert(result >= 0, "Failed to begin object")
-
-        self.containerDepth = state.currentDepth
+        if result < 0 {
+            let status = ksbonjson_encodeStatus(rawValue: UInt32(-result))
+            switch status {
+            case KSBONJSON_ENCODE_MAX_DEPTH_EXCEEDED:
+                self.deferredError = BONJSONEncodingError.maxDepthExceeded
+            default:
+                let message = ksbonjson_describeEncodeStatus(status).map { String(cString: $0) } ?? "Unknown error"
+                self.deferredError = BONJSONEncodingError.encodingFailed(message)
+            }
+            self.containerDepth = state.currentDepth
+        } else {
+            self.deferredError = nil
+            self.containerDepth = state.currentDepth
+        }
     }
 
     /// Ensures we're at the right depth before encoding a value.
     private func prepareToEncode() throws {
+        if let error = deferredError {
+            throw error
+        }
         try state.closeContainersToDepth(containerDepth)
     }
 
@@ -787,22 +854,40 @@ struct _BufferUnkeyedEncodingContainer: UnkeyedEncodingContainer {
     /// The depth when this container was created.
     let containerDepth: Int
 
+    /// Deferred error from container creation (thrown on first encode).
+    private let deferredError: Error?
+
     private(set) var count: Int = 0
 
     init(state: _BufferEncoderState, codingPath: [CodingKey]) {
         self.state = state
         self.codingPath = codingPath
 
-        // Begin array
+        // Begin array - store any error for deferred throwing
         state.ensureCapacity(Int(KSBONJSON_MAX_ENCODED_SIZE_CONTAINER_BEGIN))
         let result = ksbonjson_encodeToBuffer_beginArray(&state.context)
-        assert(result >= 0, "Failed to begin array")
-
-        self.containerDepth = state.currentDepth
+        if result < 0 {
+            let status = ksbonjson_encodeStatus(rawValue: UInt32(-result))
+            switch status {
+            case KSBONJSON_ENCODE_MAX_DEPTH_EXCEEDED:
+                self.deferredError = BONJSONEncodingError.maxDepthExceeded
+            default:
+                let message = ksbonjson_describeEncodeStatus(status).map { String(cString: $0) } ?? "Unknown error"
+                self.deferredError = BONJSONEncodingError.encodingFailed(message)
+            }
+            self.containerDepth = state.currentDepth
+        } else {
+            self.deferredError = nil
+            self.containerDepth = state.currentDepth
+        }
     }
 
     /// Ensures we're at the right depth before encoding a value.
     private mutating func prepareToEncode() throws {
+        // Throw deferred error from container creation if any
+        if let error = deferredError {
+            throw error
+        }
         try state.closeContainersToDepth(containerDepth)
         count += 1
     }

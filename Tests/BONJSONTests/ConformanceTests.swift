@@ -683,6 +683,38 @@ func valuesEqual(_ a: AnyJSON, _ b: AnyJSON) -> Bool {
         if af.isNaN { return false }
         return af == Double(bu) && af == af.rounded()
 
+    // Compare float with special number representations
+    case (.float(let af), .specialNumber(let bs)):
+        switch bs {
+        case .nan:
+            return af.isNaN
+        case .infinity:
+            return af == .infinity
+        case .negativeInfinity:
+            return af == -.infinity
+        case .negativeZero:
+            return af == 0 && af.sign == .minus
+        case .bigNumber:
+            return false
+        }
+
+    case (.specialNumber(let as_), .float(let bf)):
+        switch as_ {
+        case .nan:
+            return bf.isNaN
+        case .infinity:
+            return bf == .infinity
+        case .negativeInfinity:
+            return bf == -.infinity
+        case .negativeZero:
+            return bf == 0 && bf.sign == .minus
+        case .bigNumber:
+            return false
+        }
+
+    case (.specialNumber(let as_), .specialNumber(let bs)):
+        return as_ == bs
+
     case (.string(let as_), .string(let bs)):
         return as_ == bs
 
@@ -1020,21 +1052,19 @@ final class ConformanceTests: XCTestCase {
             encoder.nonConformingFloatEncodingStrategy = .allow
         }
 
-        // Skip tests that require unsupported options
-        if options.maxDepth != nil {
-            throw ConformanceTestError.skipped("maxDepth option not supported")
+        // Apply limit options
+        if let maxDepth = options.maxDepth {
+            encoder.maxDepth = maxDepth
         }
-        if options.maxContainerSize != nil {
-            throw ConformanceTestError.skipped("maxContainerSize option not supported")
+        if let maxContainerSize = options.maxContainerSize {
+            encoder.maxContainerSize = maxContainerSize
         }
-        if options.maxStringLength != nil {
-            throw ConformanceTestError.skipped("maxStringLength option not supported")
+        if let maxStringLength = options.maxStringLength {
+            encoder.maxStringLength = maxStringLength
         }
-        if options.maxChunks != nil {
-            throw ConformanceTestError.skipped("maxChunks option not supported")
-        }
-        if options.maxDocumentSize != nil {
-            throw ConformanceTestError.skipped("maxDocumentSize option not supported")
+        // Note: maxChunks is decode-only
+        if let maxDocumentSize = options.maxDocumentSize {
+            encoder.maxDocumentSize = maxDocumentSize
         }
     }
 
@@ -1053,21 +1083,21 @@ final class ConformanceTests: XCTestCase {
             decoder.trailingBytesDecodingStrategy = .allow
         }
 
-        // Skip tests that require unsupported options
-        if options.maxDepth != nil {
-            throw ConformanceTestError.skipped("maxDepth option not supported")
+        // Apply limit options
+        if let maxDepth = options.maxDepth {
+            decoder.maxDepth = maxDepth
         }
-        if options.maxContainerSize != nil {
-            throw ConformanceTestError.skipped("maxContainerSize option not supported")
+        if let maxContainerSize = options.maxContainerSize {
+            decoder.maxContainerSize = maxContainerSize
         }
-        if options.maxStringLength != nil {
-            throw ConformanceTestError.skipped("maxStringLength option not supported")
+        if let maxStringLength = options.maxStringLength {
+            decoder.maxStringLength = maxStringLength
         }
-        if options.maxChunks != nil {
-            throw ConformanceTestError.skipped("maxChunks option not supported")
+        if let maxChunks = options.maxChunks {
+            decoder.maxChunks = maxChunks
         }
-        if options.maxDocumentSize != nil {
-            throw ConformanceTestError.skipped("maxDocumentSize option not supported")
+        if let maxDocumentSize = options.maxDocumentSize {
+            decoder.maxDocumentSize = maxDocumentSize
         }
     }
 
@@ -1106,11 +1136,6 @@ final class ConformanceTests: XCTestCase {
 
         let expectedValue = test.expectedValue ?? .null
 
-        // Skip tests expecting NaN - decoder doesn't properly distinguish NaN float bits
-        if containsNaN(expectedValue) {
-            throw ConformanceTestError.skipped("NaN decode not supported (decoder doesn't recognize NaN float bits)")
-        }
-
         let inputBytes = try parseHexString(inputBytesHex)
 
         let decoder = BONJSONDecoder()
@@ -1137,11 +1162,6 @@ final class ConformanceTests: XCTestCase {
         // Skip BigNumber roundtrip tests - Swift's Decimal encodes as an object, not as BONJSON BigNumber
         if containsBigNumber(input) {
             throw ConformanceTestError.skipped("BigNumber roundtrip not supported (Decimal encodes as object)")
-        }
-
-        // Skip negative zero roundtrip tests - encoder encodes -0.0 as integer 0
-        if containsNegativeZero(input) {
-            throw ConformanceTestError.skipped("Negative zero roundtrip not supported (encoder encodes as integer 0)")
         }
 
         let encoder = BONJSONEncoder()
@@ -1174,40 +1194,6 @@ final class ConformanceTests: XCTestCase {
             return items.contains { containsBigNumber($0) }
         case .object(let pairs):
             return pairs.contains { containsBigNumber($0.1) }
-        default:
-            return false
-        }
-    }
-
-    /// Check if an AnyJSON value contains a negative zero anywhere in its structure
-    private func containsNegativeZero(_ value: AnyJSON) -> Bool {
-        switch value {
-        case .specialNumber(let special):
-            if case .negativeZero = special {
-                return true
-            }
-            return false
-        case .array(let items):
-            return items.contains { containsNegativeZero($0) }
-        case .object(let pairs):
-            return pairs.contains { containsNegativeZero($0.1) }
-        default:
-            return false
-        }
-    }
-
-    /// Check if an AnyJSON value contains a NaN anywhere in its structure
-    private func containsNaN(_ value: AnyJSON) -> Bool {
-        switch value {
-        case .specialNumber(let special):
-            if case .nan = special {
-                return true
-            }
-            return false
-        case .array(let items):
-            return items.contains { containsNaN($0) }
-        case .object(let pairs):
-            return pairs.contains { containsNaN($0.1) }
         default:
             return false
         }

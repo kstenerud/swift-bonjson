@@ -188,9 +188,19 @@ The BONJSON spec provides three options for handling these values, all supported
 Note: Using `.allow` creates BONJSON data that cannot be converted to JSON. The `.convertToString`
 and `.convertFromString` strategies maintain JSON compatibility by using string representations.
 
-### Other Security Limits
+### Resource Limits
 
-- Container depth is limited (default 200)
+All limits default to BONJSON spec-recommended values:
+
+| Property | Default | Description |
+|----------|---------|-------------|
+| `maxDepth` | 512 | Maximum container nesting depth |
+| `maxStringLength` | 10,000,000 | Maximum string length in bytes |
+| `maxContainerSize` | 1,000,000 | Maximum elements in a container |
+| `maxDocumentSize` | 2,000,000,000 | Maximum document size in bytes |
+| `maxChunks` | 100 | Maximum string chunks (decoder only) |
+
+All limits are configurable on both `BONJSONEncoder` and `BONJSONDecoder`.
 
 ## Usage Example
 

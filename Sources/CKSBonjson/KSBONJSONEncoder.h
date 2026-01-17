@@ -41,11 +41,18 @@ extern "C" {
 // Compile-time Configuration
 // ============================================================================
 
-/**
- * Maximum depth of objects / arrays before the library will abort processing.
- */
+// BONJSON spec-recommended defaults
 #ifndef KSBONJSON_MAX_CONTAINER_DEPTH
-#   define KSBONJSON_MAX_CONTAINER_DEPTH 200
+#   define KSBONJSON_MAX_CONTAINER_DEPTH 512
+#endif
+#ifndef KSBONJSON_DEFAULT_MAX_STRING_LENGTH
+#   define KSBONJSON_DEFAULT_MAX_STRING_LENGTH 10000000
+#endif
+#ifndef KSBONJSON_DEFAULT_MAX_CONTAINER_SIZE
+#   define KSBONJSON_DEFAULT_MAX_CONTAINER_SIZE 1000000
+#endif
+#ifndef KSBONJSON_DEFAULT_MAX_DOCUMENT_SIZE
+#   define KSBONJSON_DEFAULT_MAX_DOCUMENT_SIZE 2000000000
 #endif
 
 #ifndef KSBONJSON_RESTRICT
@@ -107,6 +114,10 @@ typedef enum
     KSBONJSON_ENCODE_TOO_BIG = 8,
     KSBONJSON_ENCODE_BUFFER_TOO_SMALL = 9,
     KSBONJSON_ENCODE_NUL_CHARACTER = 10,
+    KSBONJSON_ENCODE_MAX_DEPTH_EXCEEDED = 11,
+    KSBONJSON_ENCODE_MAX_STRING_LENGTH_EXCEEDED = 12,
+    KSBONJSON_ENCODE_MAX_CONTAINER_SIZE_EXCEEDED = 13,
+    KSBONJSON_ENCODE_MAX_DOCUMENT_SIZE_EXCEEDED = 14,
     KSBONJSON_ENCODE_COULD_NOT_ADD_DATA = 100,
 } ksbonjson_encodeStatus;
 
@@ -130,6 +141,26 @@ typedef struct {
      * These values cannot be represented in JSON.
      */
     bool rejectNonFiniteFloat;
+
+    /**
+     * Maximum container nesting depth (0 = use compile-time default).
+     */
+    size_t maxDepth;
+
+    /**
+     * Maximum string length in bytes (0 = no limit).
+     */
+    size_t maxStringLength;
+
+    /**
+     * Maximum number of elements in a container (0 = no limit).
+     */
+    size_t maxContainerSize;
+
+    /**
+     * Maximum document size in bytes (0 = no limit).
+     */
+    size_t maxDocumentSize;
 } KSBONJSONEncodeFlags;
 
 /**
@@ -140,6 +171,10 @@ static inline KSBONJSONEncodeFlags ksbonjson_defaultEncodeFlags(void)
     KSBONJSONEncodeFlags flags = {
         .rejectNUL = true,
         .rejectNonFiniteFloat = true,
+        .maxDepth = 0,
+        .maxStringLength = 0,
+        .maxContainerSize = 0,
+        .maxDocumentSize = 0,
     };
     return flags;
 }
@@ -181,6 +216,7 @@ typedef struct {
     // Container tracking
     int containerDepth;
     KSBONJSONContainerState containers[KSBONJSON_MAX_CONTAINER_DEPTH];
+    size_t containerElementCounts[KSBONJSON_MAX_CONTAINER_DEPTH];  // Element count per container
 
     // Security validation flags
     KSBONJSONEncodeFlags flags;
