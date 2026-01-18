@@ -272,10 +272,9 @@ swift test --filter Conformance
 - `duplicate_key`: "keep_first", "keep_last"
 - `invalid_utf8`: "replace", "delete"
 
-**Skipped tests:**
-- BigNumber roundtrip tests (Swift's Decimal encodes as object, not as BONJSON BigNumber)
-- `nan_infinity: "stringify"` tests (would require converting float NaN/Infinity to strings)
-- `invalid_object_key` error tests (error type not recognized)
+**Skipped tests (9 total):**
+- 6 BigNumber roundtrip tests (Swift's Decimal encodes as object, not as BONJSON BigNumber)
+- 3 `nan_infinity: "stringify"` tests (would require converting float NaN/Infinity to strings)
 
 ## Build Commands
 

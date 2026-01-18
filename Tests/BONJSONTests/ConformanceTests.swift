@@ -556,6 +556,7 @@ enum StandardErrorType: String {
     case maxDocumentSizeExceeded = "max_document_size_exceeded"
     case nanNotAllowed = "nan_not_allowed"
     case infinityNotAllowed = "infinity_not_allowed"
+    case invalidObjectKey = "invalid_object_key"
 }
 
 // MARK: - Hex String Parsing
@@ -651,6 +652,11 @@ func mapErrorToStandardType(_ error: Error) -> StandardErrorType? {
     }
     if desc.contains("document size") || desc.contains("document too large") {
         return .maxDocumentSizeExceeded
+    }
+    // Invalid object key - non-string used as object key
+    // C error: "Expected to find a string for an object element name"
+    if desc.contains("object") && desc.contains("name") && desc.contains("string") {
+        return .invalidObjectKey
     }
 
     return nil
