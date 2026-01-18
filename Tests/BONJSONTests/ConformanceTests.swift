@@ -1280,9 +1280,9 @@ final class ConformanceTests: XCTestCase {
 
         let input = test.input ?? .null
 
-        // Skip BigNumber roundtrip tests - Swift's Decimal encodes as an object, not as BONJSON BigNumber
-        if containsBigNumber(input) {
-            throw ConformanceTestError.skipped("BigNumber roundtrip not supported (Decimal encodes as object)")
+        // Skip BigNumber values that exceed our implementation limits
+        if let skipReason = bigNumberExceedsLimits(input) {
+            throw ConformanceTestError.skipped(skipReason)
         }
 
         let encoder = BONJSONEncoder()
@@ -1303,20 +1303,60 @@ final class ConformanceTests: XCTestCase {
         }
     }
 
-    /// Check if an AnyJSON value contains a BigNumber anywhere in its structure
-    private func containsBigNumber(_ value: AnyJSON) -> Bool {
+    /// Check if a BigNumber value exceeds our implementation limits.
+    /// Returns a skip reason if it does, nil if it's within limits.
+    private func bigNumberExceedsLimits(_ value: AnyJSON) -> String? {
         switch value {
         case .specialNumber(let special):
-            if case .bigNumber(_) = special {
-                return true
+            if case .bigNumber(let str) = special {
+                // Parse the BigNumber string to check limits
+                // Our limits: 19 significant digits (UInt64), exponent -128 to 127 (Decimal)
+
+                // Extract exponent if present
+                let lower = str.lowercased()
+                var exponent: Int = 0
+                var sigPart = str
+
+                if let eIndex = lower.firstIndex(of: "e") {
+                    let expPart = String(lower[lower.index(after: eIndex)...])
+                    sigPart = String(str[..<eIndex])
+                    exponent = Int(expPart) ?? 0
+                }
+
+                // Check exponent limits (Decimal supports -128 to 127)
+                if exponent < -128 || exponent > 127 {
+                    return "BigNumber exponent \(exponent) exceeds Decimal range (-128 to 127)"
+                }
+
+                // Count significant digits (excluding leading zeros and decimal point)
+                let cleaned = sigPart.replacingOccurrences(of: "-", with: "")
+                                      .replacingOccurrences(of: "+", with: "")
+                                      .replacingOccurrences(of: ".", with: "")
+                let trimmed = cleaned.drop(while: { $0 == "0" })
+                let sigDigits = trimmed.count
+
+                // UInt64 max is about 1.84e19, so ~19 digits
+                if sigDigits > 19 {
+                    return "BigNumber has \(sigDigits) significant digits, exceeds UInt64 limit (~19)"
+                }
             }
-            return false
+            return nil
         case .array(let items):
-            return items.contains { containsBigNumber($0) }
+            for item in items {
+                if let reason = bigNumberExceedsLimits(item) {
+                    return reason
+                }
+            }
+            return nil
         case .object(let pairs):
-            return pairs.contains { containsBigNumber($0.1) }
+            for (_, item) in pairs {
+                if let reason = bigNumberExceedsLimits(item) {
+                    return reason
+                }
+            }
+            return nil
         default:
-            return false
+            return nil
         }
     }
 

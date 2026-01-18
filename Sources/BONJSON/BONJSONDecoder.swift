@@ -388,6 +388,9 @@ public enum BONJSONDecodingError: Error, CustomStringConvertible {
     case maxContainerSizeExceeded
     case maxDocumentSizeExceeded
     case maxChunksExceeded
+    case decimalCannotRepresentNaN
+    case decimalCannotRepresentInfinity
+    case bigNumberExponentOutOfRange(Int32)
 
     public var description: String {
         switch self {
@@ -435,6 +438,12 @@ public enum BONJSONDecodingError: Error, CustomStringConvertible {
             return "Maximum document size exceeded"
         case .maxChunksExceeded:
             return "Maximum number of string chunks exceeded"
+        case .decimalCannotRepresentNaN:
+            return "Decimal cannot represent NaN"
+        case .decimalCannotRepresentInfinity:
+            return "Decimal cannot represent Infinity"
+        case .bigNumberExponentOutOfRange(let exp):
+            return "BigNumber exponent \(exp) is outside Decimal's supported range (-128 to 127)"
         }
     }
 }
@@ -1182,6 +1191,36 @@ final class _MapDecoderState {
         let result = significand * pow(10.0, Double(bn.exponent))
         return bn.sign < 0 ? -result : result
     }
+
+    /// Decode a BigNumber entry to a Decimal value.
+    /// Handles both regular big numbers and special values (NaN/Infinity).
+    /// Throws if the exponent is outside Decimal's supported range (-128 to 127).
+    @inline(__always)
+    func decodeBigNumberAsDecimal(_ bn: (significand: UInt64, exponent: Int32, sign: Int32, specialType: UInt8)) throws -> Decimal {
+        // Handle special values (NaN/Infinity)
+        // Decimal cannot represent NaN or Infinity
+        if bn.specialType != 0 {
+            if bn.specialType == 3 {
+                throw BONJSONDecodingError.decimalCannotRepresentNaN
+            } else {
+                throw BONJSONDecodingError.decimalCannotRepresentInfinity
+            }
+        }
+
+        // Check exponent range - Decimal supports -128 to 127
+        guard bn.exponent >= -128 && bn.exponent <= 127 else {
+            throw BONJSONDecodingError.bigNumberExponentOutOfRange(bn.exponent)
+        }
+
+        // Build Decimal from components
+        // Decimal(sign:exponent:significand:) expects:
+        // - sign: FloatingPointSign
+        // - exponent: Int (the power of 10)
+        // - significand: Decimal (we convert UInt64 to Decimal first)
+        let sign: FloatingPointSign = bn.sign < 0 ? .minus : .plus
+        let significandDecimal = Decimal(bn.significand)
+        return Decimal(sign: sign, exponent: Int(bn.exponent), significand: significandDecimal)
+    }
 }
 
 // MARK: - Lazy Coding Path
@@ -1781,6 +1820,14 @@ struct _MapKeyedDecodingContainer<Key: CodingKey>: KeyedDecodingContainerProtoco
             }
             return url as! T
         }
+        if type == Decimal.self {
+            let entry = try entryForKey(key)
+            if entry.type == KSBONJSON_TYPE_BIGNUMBER {
+                let bn = entry.data.bigNumber
+                return try state.decodeBigNumberAsDecimal((bn.significand, bn.exponent, bn.sign, bn.specialType)) as! T
+            }
+            // Fall through to let Decimal's Decodable init handle other numeric types
+        }
 
         return try T(from: dec)
     }
@@ -2024,6 +2071,23 @@ struct _MapUnkeyedDecodingContainer: UnkeyedDecodingContainer {
     }
 
     mutating func decode<T: Decodable>(_ type: T.Type) throws -> T {
+        // Handle Decimal specially when underlying type is BigNumber
+        if type == Decimal.self {
+            guard !isAtEnd else {
+                throw DecodingError.valueNotFound(Any.self, DecodingError.Context(
+                    codingPath: codingPath,
+                    debugDescription: "Unkeyed container is at end"
+                ))
+            }
+            let entryType = state.map.getEntryUnchecked(at: currentEntryIndex).type
+            if entryType == KSBONJSON_TYPE_BIGNUMBER {
+                let (_, entry) = try nextEntry()
+                let bn = entry.data.bigNumber
+                return try state.decodeBigNumberAsDecimal((bn.significand, bn.exponent, bn.sign, bn.specialType)) as! T
+            }
+            // Fall through to let Decimal's Decodable init handle other numeric types
+        }
+
         let decoder = try nextDecoder()
 
         if type == Date.self {
@@ -2210,6 +2274,14 @@ struct _MapSingleValueDecodingContainer: SingleValueDecodingContainer {
                 throw BONJSONDecodingError.invalidURL(string)
             }
             return url as! T
+        }
+        if type == Decimal.self {
+            let entry = state.map.getEntry(at: entryIndex)
+            if let entry = entry, entry.type == KSBONJSON_TYPE_BIGNUMBER {
+                let bn = entry.data.bigNumber
+                return try state.decodeBigNumberAsDecimal((bn.significand, bn.exponent, bn.sign, bn.specialType)) as! T
+            }
+            // Fall through to let Decimal's Decodable init handle other numeric types
         }
 
         let decoder = _MapDecoder(state: state, entryIndex: entryIndex, lazyPath: lazyPath)

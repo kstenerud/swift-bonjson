@@ -505,6 +505,11 @@ final class _BufferEncoder: Encoder {
             return
         }
 
+        if let decimal = value as? Decimal {
+            try encodeDecimal(decimal)
+            return
+        }
+
         // Default encoding
         try value.encode(to: self)
     }
@@ -582,6 +587,45 @@ final class _BufferEncoder: Encoder {
                 try encodeString(negInf)
             }
         }
+    }
+
+    /// Encodes a Decimal as a BigNumber.
+    /// This preserves the full precision of the Decimal without conversion to Double.
+    func encodeDecimal(_ value: Decimal) throws {
+        // Extract components from Decimal using its public properties
+        let sign: Int32 = value.sign == .minus ? -1 : 1
+        let exponent = Int32(truncatingIfNeeded: value.exponent)
+
+        // Get the significand as a Decimal and convert to UInt64
+        // The significand property returns the mantissa without the exponent
+        let significandDecimal = value.significand
+        var significand: UInt64 = 0
+
+        // Decimal structure layout (Darwin/NSDecimal):
+        // bytes[0-3]: packed fields (_exponent:8, _length:4, _isNegative:1, _isCompact:1, _reserved:18)
+        // bytes[4-19]: _mantissa (8 x UInt16, little-endian)
+        var sigDecimal = significandDecimal
+        withUnsafeBytes(of: &sigDecimal) { bytes in
+            // Extract length from bits 8-11 of the first 4 bytes
+            let packedFields = bytes.load(fromByteOffset: 0, as: UInt32.self)
+            let length = (packedFields >> 8) & 0xF
+
+            // Mantissa starts at byte offset 4
+            let mantissaOffset = 4
+            let usedDigits = min(Int(length), 4) // We can only fit 4 UInt16s in UInt64
+
+            for i in 0..<usedDigits {
+                let digit = bytes.load(fromByteOffset: mantissaOffset + i * 2, as: UInt16.self)
+                significand |= UInt64(digit) << (i * 16)
+            }
+        }
+
+        // Create KSBigNumber and encode
+        // Max bignumber size: 13 bytes (type + header + 3 exp + 8 sig)
+        let bigNumber = ksbonjson_newBigNumber(sign, significand, exponent)
+        state.ensureCapacity(13)
+        let result = ksbonjson_encodeToBuffer_bigNumber(&state.context, bigNumber)
+        try throwIfEncodingFailed(result)
     }
 }
 

@@ -122,6 +122,23 @@ Big numbers use a header byte followed by data:
 - Followed by exponent bytes (little-endian signed)
 - Followed by significand bytes (little-endian unsigned)
 
+### Swift Decimal Support
+
+Swift's `Decimal` type is used for encoding and decoding BigNumber values:
+
+**Encoding**: When encoding a `Decimal` value, it is automatically encoded as a BONJSON BigNumber,
+preserving precision that would be lost with Double conversion.
+
+**Decoding**: When decoding a BigNumber to `Decimal`, the full precision is preserved within
+implementation limits.
+
+**Implementation Limits**:
+- Significand: up to 19 decimal digits (limited by UInt64 internal storage)
+- Exponent: -128 to 127 (limited by Swift Decimal's exponent range)
+
+Values exceeding these limits cannot be roundtrip-tested with this implementation, but can still
+be decoded to Double (with precision loss) or to a custom type.
+
 ## Security Features
 
 This library implements comprehensive security features as mandated by the BONJSON specification.
@@ -273,7 +290,9 @@ swift test --filter Conformance
 - `invalid_utf8`: "replace", "delete"
 
 **Skipped tests (9 total):**
-- 6 BigNumber roundtrip tests (Swift's Decimal encodes as object, not as BONJSON BigNumber)
+- 6 BigNumber roundtrip tests that exceed implementation limits:
+  - Tests with >19 significant digits (exceeds UInt64 significand limit)
+  - Tests with exponents outside -128 to 127 (exceeds Swift Decimal range)
 - 3 `nan_infinity: "stringify"` tests (would require converting float NaN/Infinity to strings)
 
 ## Build Commands
