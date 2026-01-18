@@ -172,6 +172,12 @@ typedef struct {
     bool rejectNonCanonicalLengths;
 
     /**
+     * If true (default), reject NaN and Infinity BigNumber special values.
+     * These values cannot be represented in JSON.
+     */
+    bool rejectNaNInfinity;
+
+    /**
      * Maximum container nesting depth (0 = use compile-time default).
      */
     size_t maxDepth;
@@ -209,6 +215,7 @@ static inline KSBONJSONDecodeFlags ksbonjson_defaultDecodeFlags(void)
         .rejectDuplicateKeys = true,
         .rejectTrailingBytes = true,
         .rejectNonCanonicalLengths = true,
+        .rejectNaNInfinity = true,
         .maxDepth = SIZE_MAX,           // Spec default: 512
         .maxStringLength = SIZE_MAX,    // Spec default: 10,000,000
         .maxContainerSize = SIZE_MAX,   // Spec default: 1,000,000
@@ -263,6 +270,7 @@ typedef struct {
             uint64_t significand;
             int32_t exponent;
             int32_t sign;
+            uint8_t specialType;  // 0=regular, 1=Inf, 3=NaN (from exponentLength)
         } bigNumber;
     } data;
 } KSBONJSONMapEntry;

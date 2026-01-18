@@ -265,8 +265,17 @@ Run conformance tests only:
 swift test --filter Conformance
 ```
 
-Known limitations (options not yet supported):
+**Supported test options:**
+- `allow_nul`, `allow_nan_infinity`, `allow_trailing_bytes`
 - `max_depth`, `max_container_size`, `max_string_length`, `max_chunks`, `max_document_size`
+- `nan_infinity`: "allow" (pass through), "stringify" is skipped (converts floats to strings, not supported)
+- `duplicate_key`: "keep_first", "keep_last"
+- `invalid_utf8`: "replace", "delete"
+
+**Skipped tests:**
+- BigNumber roundtrip tests (Swift's Decimal encodes as object, not as BONJSON BigNumber)
+- `nan_infinity: "stringify"` tests (would require converting float NaN/Infinity to strings)
+- `invalid_object_key` error tests (error type not recognized)
 
 ## Build Commands
 

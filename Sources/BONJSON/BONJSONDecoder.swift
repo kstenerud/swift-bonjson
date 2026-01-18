@@ -342,6 +342,15 @@ public final class BONJSONDecoder {
         flags.rejectDuplicateKeys = (duplicateKeyDecodingStrategy == .reject)
         flags.rejectTrailingBytes = (trailingBytesDecodingStrategy == .reject)
 
+        // NaN/Infinity: allow at C level for .allow and .convertFromString strategies
+        // .throw rejects them, others allow at C level and handle in Swift
+        switch nonConformingFloatDecodingStrategy {
+        case .throw:
+            flags.rejectNaNInfinity = true
+        case .allow, .convertFromString:
+            flags.rejectNaNInfinity = false
+        }
+
         // Set limit options
         flags.maxDepth = maxDepth
         flags.maxStringLength = maxStringLength
@@ -1150,6 +1159,29 @@ final class _MapDecoderState {
             return nil
         }
     }
+
+    /// Decode a BigNumber entry to a Double value.
+    /// Handles both regular big numbers and special values (NaN/Infinity).
+    @inline(__always)
+    func decodeBigNumber(_ bn: (significand: UInt64, exponent: Int32, sign: Int32, specialType: UInt8)) throws -> Double {
+        // Handle special values (NaN/Infinity)
+        // specialType: 0=regular, 1=Infinity, 3=NaN
+        if bn.specialType != 0 {
+            let value: Double
+            if bn.specialType == 3 {
+                value = .nan
+            } else {
+                // Infinity (specialType == 1)
+                value = bn.sign < 0 ? -.infinity : .infinity
+            }
+            return try validateFloat(value)
+        }
+
+        // Regular big number
+        let significand = Double(bn.significand)
+        let result = significand * pow(10.0, Double(bn.exponent))
+        return bn.sign < 0 ? -result : result
+    }
 }
 
 // MARK: - Lazy Coding Path
@@ -1295,11 +1327,8 @@ final class _MapDecoder: Decoder {
         case KSBONJSON_TYPE_UINT:
             return Double(entry.data.uintValue)
         case KSBONJSON_TYPE_BIGNUMBER:
-            // Convert big number to double
             let bn = entry.data.bigNumber
-            let significand = Double(bn.significand)
-            let result = significand * pow(10.0, Double(bn.exponent))
-            return bn.sign < 0 ? -result : result
+            return try state.decodeBigNumber((bn.significand, bn.exponent, bn.sign, bn.specialType))
         case KSBONJSON_TYPE_STRING:
             // Try to decode string as non-conforming float
             if let string = state.map.getString(at: entryIndex),
@@ -1433,19 +1462,45 @@ struct _MapKeyedDecodingContainer<Key: CodingKey>: KeyedDecodingContainerProtoco
     }
 
     /// Build allKeys array - only called when allKeys is accessed.
+    /// Respects duplicateKeyDecodingStrategy to filter duplicates.
     private func buildAllKeys() -> [Key] {
         var keys: [Key] = []
         keys.reserveCapacity(pairCount)
 
+        // Track seen keys if we need to filter duplicates
+        let keepLast = state.duplicateKeyDecodingStrategy == .keepLast
+        var seenKeys: Set<String>? = state.duplicateKeyDecodingStrategy != .reject ? Set() : nil
+        var keyPositions: [Int]? = keepLast ? [] : nil
+
         var currentIndex = firstChildIndex
-        for _ in 0..<pairCount {
+        for i in 0..<pairCount {
             let keyIndex = currentIndex
             let valueIndex = state.map.nextSiblingIndex(keyIndex)
             currentIndex = state.map.nextSiblingIndex(valueIndex)
 
             if let keyString = state.map.getString(at: size_t(keyIndex)) {
                 let convertedKey = convertKey(keyString)
+
+                // Handle duplicate filtering
+                if let seen = seenKeys {
+                    if seen.contains(convertedKey) {
+                        if keepLast {
+                            // Remove the previous occurrence for keepLast
+                            if let positions = keyPositions,
+                               let prevIndex = positions.firstIndex(where: { keys[$0].stringValue == convertedKey }) {
+                                keys.remove(at: prevIndex)
+                                keyPositions?.remove(at: prevIndex)
+                            }
+                        } else {
+                            // keepFirst: skip this duplicate
+                            continue
+                        }
+                    }
+                    seenKeys?.insert(convertedKey)
+                }
+
                 if let key = Key(stringValue: convertedKey) {
+                    keyPositions?.append(keys.count)
                     keys.append(key)
                 }
             }
@@ -1635,9 +1690,7 @@ struct _MapKeyedDecodingContainer<Key: CodingKey>: KeyedDecodingContainerProtoco
         case KSBONJSON_TYPE_UINT: return Double(entry.data.uintValue)
         case KSBONJSON_TYPE_BIGNUMBER:
             let bn = entry.data.bigNumber
-            let significand = Double(bn.significand)
-            let result = significand * pow(10.0, Double(bn.exponent))
-            return bn.sign < 0 ? -result : result
+            return try state.decodeBigNumber((bn.significand, bn.exponent, bn.sign, bn.specialType))
         case KSBONJSON_TYPE_STRING:
             // Try to decode string as non-conforming float
             if let string = state.map.getString(at: idx),
@@ -1896,9 +1949,7 @@ struct _MapUnkeyedDecodingContainer: UnkeyedDecodingContainer {
         case KSBONJSON_TYPE_UINT: return Double(entry.data.uintValue)
         case KSBONJSON_TYPE_BIGNUMBER:
             let bn = entry.data.bigNumber
-            let significand = Double(bn.significand)
-            let result = significand * pow(10.0, Double(bn.exponent))
-            return bn.sign < 0 ? -result : result
+            return try state.decodeBigNumber((bn.significand, bn.exponent, bn.sign, bn.specialType))
         case KSBONJSON_TYPE_STRING:
             // Try to decode string as non-conforming float
             if let string = state.map.getString(at: size_t(idx)),
@@ -2065,9 +2116,7 @@ struct _MapSingleValueDecodingContainer: SingleValueDecodingContainer {
         case KSBONJSON_TYPE_UINT: return Double(entry.data.uintValue)
         case KSBONJSON_TYPE_BIGNUMBER:
             let bn = entry.data.bigNumber
-            let significand = Double(bn.significand)
-            let result = significand * pow(10.0, Double(bn.exponent))
-            return bn.sign < 0 ? -result : result
+            return try state.decodeBigNumber((bn.significand, bn.exponent, bn.sign, bn.specialType))
         case KSBONJSON_TYPE_STRING:
             // Try to decode string as non-conforming float
             if let string = state.map.getString(at: entryIndex),

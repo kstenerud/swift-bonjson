@@ -1064,7 +1064,9 @@ static ksbonjson_decodeStatus mapScanBigNumber(KSBONJSONMapContext* ctx, size_t*
     }
 
     // Special BigNumber encodings (NaN/Infinity): significandLength == 0 with non-zero exponentLength
-    unlikely_if(significandLength == 0 && exponentLength != 0)
+    // exponentLength encodes the special value type: 1=Infinity (sign determines +/-), 3=NaN
+    const uint8_t specialType = (significandLength == 0 && exponentLength != 0) ? (uint8_t)exponentLength : 0;
+    unlikely_if(specialType != 0 && ctx->flags.rejectNaNInfinity)
     {
         return KSBONJSON_DECODE_INVALID_DATA;
     }
@@ -1084,7 +1086,8 @@ static ksbonjson_decodeStatus mapScanBigNumber(KSBONJSONMapContext* ctx, size_t*
         .data.bigNumber = {
             .significand = significand,
             .exponent = exponent,
-            .sign = sign
+            .sign = sign,
+            .specialType = specialType
         }
     };
     *outIndex = mapAddEntry(ctx, entry);
