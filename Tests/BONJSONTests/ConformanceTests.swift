@@ -101,8 +101,11 @@ struct TestCase: Decodable {
     // Options
     let options: TestOptions?
 
+    // Required capabilities
+    let requires: [String]?
+
     enum CodingKeys: String, CodingKey {
-        case name, type, input, options
+        case name, type, input, options, requires
         case expectedBytes = "expected_bytes"
         case inputBytes = "input_bytes"
         case expectedValue = "expected_value"
@@ -118,6 +121,7 @@ struct TestCase: Decodable {
         inputBytes = try container.decodeIfPresent(String.self, forKey: .inputBytes)
         expectedError = try container.decodeIfPresent(String.self, forKey: .expectedError)
         options = try container.decodeIfPresent(TestOptions.self, forKey: .options)
+        requires = try container.decodeIfPresent([String].self, forKey: .requires)
 
         // Handle input - need to distinguish null from absent
         if container.contains(.input) {
@@ -1103,7 +1107,23 @@ final class ConformanceTests: XCTestCase {
         return results
     }
 
+    /// Capabilities supported by this implementation.
+    /// Tests with `requires` containing capabilities not in this set will be skipped.
+    private static let supportedCapabilities: Set<String> = [
+        // Swift's Decimal supports exponents -128 to 127
+        // Swift's UInt64 significand supports ~19 significant digits
+        // NaN/Infinity stringify is not supported (Swift has native NaN/Infinity)
+    ]
+
     private func runTest(_ test: TestCase, testId: String) throws {
+        // Check required capabilities
+        if let requires = test.requires {
+            let unsupported = requires.filter { !Self.supportedCapabilities.contains($0) }
+            if !unsupported.isEmpty {
+                throw ConformanceTestError.skipped("requires unsupported capability: \(unsupported.joined(separator: ", "))")
+            }
+        }
+
         switch test.type {
         case .encode:
             try runEncodeTest(test, testId: testId)
@@ -1249,12 +1269,6 @@ final class ConformanceTests: XCTestCase {
             throw ConformanceTestError.structuralError("\(testId): missing expected_value")
         }
 
-        // Skip stringify tests - the library doesn't support converting float NaN/Infinity to strings
-        // (Swift's .convertFromString does the opposite: strings -> floats)
-        if test.options?.nanInfinity == "stringify" {
-            throw ConformanceTestError.skipped("nan_infinity: stringify not supported (converts floats to strings)")
-        }
-
         let expectedValue = test.expectedValue ?? .null
 
         let inputBytes = try parseHexString(inputBytesHex)
@@ -1280,11 +1294,6 @@ final class ConformanceTests: XCTestCase {
 
         let input = test.input ?? .null
 
-        // Skip BigNumber values that exceed our implementation limits
-        if let skipReason = bigNumberExceedsLimits(input) {
-            throw ConformanceTestError.skipped(skipReason)
-        }
-
         let encoder = BONJSONEncoder()
         let decoder = BONJSONDecoder()
         try configureEncoder(encoder, options: test.options)
@@ -1300,63 +1309,6 @@ final class ConformanceTests: XCTestCase {
                 "  Decoded:  \(decoded)\n" +
                 "  Bytes:    \(bytesToHex(encoded))"
             )
-        }
-    }
-
-    /// Check if a BigNumber value exceeds our implementation limits.
-    /// Returns a skip reason if it does, nil if it's within limits.
-    private func bigNumberExceedsLimits(_ value: AnyJSON) -> String? {
-        switch value {
-        case .specialNumber(let special):
-            if case .bigNumber(let str) = special {
-                // Parse the BigNumber string to check limits
-                // Our limits: 19 significant digits (UInt64), exponent -128 to 127 (Decimal)
-
-                // Extract exponent if present
-                let lower = str.lowercased()
-                var exponent: Int = 0
-                var sigPart = str
-
-                if let eIndex = lower.firstIndex(of: "e") {
-                    let expPart = String(lower[lower.index(after: eIndex)...])
-                    sigPart = String(str[..<eIndex])
-                    exponent = Int(expPart) ?? 0
-                }
-
-                // Check exponent limits (Decimal supports -128 to 127)
-                if exponent < -128 || exponent > 127 {
-                    return "BigNumber exponent \(exponent) exceeds Decimal range (-128 to 127)"
-                }
-
-                // Count significant digits (excluding leading zeros and decimal point)
-                let cleaned = sigPart.replacingOccurrences(of: "-", with: "")
-                                      .replacingOccurrences(of: "+", with: "")
-                                      .replacingOccurrences(of: ".", with: "")
-                let trimmed = cleaned.drop(while: { $0 == "0" })
-                let sigDigits = trimmed.count
-
-                // UInt64 max is about 1.84e19, so ~19 digits
-                if sigDigits > 19 {
-                    return "BigNumber has \(sigDigits) significant digits, exceeds UInt64 limit (~19)"
-                }
-            }
-            return nil
-        case .array(let items):
-            for item in items {
-                if let reason = bigNumberExceedsLimits(item) {
-                    return reason
-                }
-            }
-            return nil
-        case .object(let pairs):
-            for (_, item) in pairs {
-                if let reason = bigNumberExceedsLimits(item) {
-                    return reason
-                }
-            }
-            return nil
-        default:
-            return nil
         }
     }
 
