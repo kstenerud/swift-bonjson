@@ -2325,3 +2325,12 @@ extension String {
         return result
     }
 }
+
+// MARK: - Type Alias for Easy Migration
+
+/// Type alias for `BONJSONDecoder` that enables easy migration from JSON.
+///
+/// To migrate from JSON to BONJSON, simply find-replace `JSON` with `BinaryJSON`:
+/// - `JSONEncoder` becomes `BinaryJSONEncoder`
+/// - `JSONDecoder` becomes `BinaryJSONDecoder`
+public typealias BinaryJSONDecoder = BONJSONDecoder
