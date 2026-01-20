@@ -167,8 +167,8 @@ typedef struct {
     bool rejectTrailingBytes;
 
     /**
-     * If true (default), reject length fields that use more bytes than necessary.
-     * Non-canonical encodings may be used to bypass security checks.
+     * If true, reject length fields that use more bytes than necessary.
+     * Per the BONJSON spec, decoders MUST accept non-canonical lengths (default: false).
      */
     bool rejectNonCanonicalLengths;
 
@@ -215,7 +215,7 @@ static inline KSBONJSONDecodeFlags ksbonjson_defaultDecodeFlags(void)
         .rejectInvalidUTF8 = true,
         .rejectDuplicateKeys = true,
         .rejectTrailingBytes = true,
-        .rejectNonCanonicalLengths = true,
+        .rejectNonCanonicalLengths = false,
         .rejectNaNInfinity = true,
         .maxDepth = SIZE_MAX,           // Spec default: 512
         .maxStringLength = SIZE_MAX,    // Spec default: 10,000,000
