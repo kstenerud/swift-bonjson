@@ -106,30 +106,96 @@ extern "C" {
 // Constants
 // ============================================================================
 
+// Type codes for BONJSON format (2026 spec)
+//
+// Layout:
+//   0x00-0xc8: Small integers (-100 to 100), value = type_code - 100
+//   0xc9-0xcf: RESERVED
+//   0xd0-0xd7: Unsigned integers (1-8 bytes)
+//   0xd8-0xdf: Signed integers (1-8 bytes)
+//   0xe0-0xef: Short strings (0-15 bytes, length in lower nibble)
+//   0xf0:      Long string (chunked)
+//   0xf1:      Big number
+//   0xf2-0xf4: Floats (16, 32, 64-bit)
+//   0xf5:      Null
+//   0xf6-0xf7: Booleans (false, true)
+//   0xf8-0xf9: Containers (array, object) - chunked, no end marker
+//   0xfa-0xff: RESERVED
+
 enum
 {
-    /* SMALLINT   96 = 0x60 */ TYPE_UINT8  = 0x70,   TYPE_STRING0  = 0x80,   TYPE_RESERVED_90 = 0x90,
-    /* SMALLINT   97 = 0x61 */ TYPE_UINT16 = 0x71,   TYPE_STRING1  = 0x81,   TYPE_RESERVED_91 = 0x91,
-    /* SMALLINT   98 = 0x62 */ TYPE_UINT24 = 0x72,   TYPE_STRING2  = 0x82,   TYPE_RESERVED_92 = 0x92,
-    /* SMALLINT   99 = 0x63 */ TYPE_UINT32 = 0x73,   TYPE_STRING3  = 0x83,   TYPE_RESERVED_93 = 0x93,
-    /* SMALLINT  100 = 0x64 */ TYPE_UINT40 = 0x74,   TYPE_STRING4  = 0x84,   TYPE_RESERVED_94 = 0x94,
-    TYPE_RESERVED_65 = 0x65,   TYPE_UINT48 = 0x75,   TYPE_STRING5  = 0x85,   TYPE_RESERVED_95 = 0x95,
-    TYPE_RESERVED_66 = 0x66,   TYPE_UINT56 = 0x76,   TYPE_STRING6  = 0x86,   TYPE_RESERVED_96 = 0x96,
-    TYPE_RESERVED_67 = 0x67,   TYPE_UINT64 = 0x77,   TYPE_STRING7  = 0x87,   TYPE_RESERVED_97 = 0x97,
-    TYPE_STRING      = 0x68,   TYPE_SINT8  = 0x78,   TYPE_STRING8  = 0x88,   TYPE_RESERVED_98 = 0x98,
-    TYPE_BIG_NUMBER  = 0x69,   TYPE_SINT16 = 0x79,   TYPE_STRING9  = 0x89,   TYPE_ARRAY       = 0x99,
-    TYPE_FLOAT16     = 0x6a,   TYPE_SINT24 = 0x7a,   TYPE_STRING10 = 0x8a,   TYPE_OBJECT      = 0x9a,
-    TYPE_FLOAT32     = 0x6b,   TYPE_SINT32 = 0x7b,   TYPE_STRING11 = 0x8b,   TYPE_END         = 0x9b,
-    TYPE_FLOAT64     = 0x6c,   TYPE_SINT40 = 0x7c,   TYPE_STRING12 = 0x8c,   /* SMALLINT -100 = 0x9c */
-    TYPE_NULL        = 0x6d,   TYPE_SINT48 = 0x7d,   TYPE_STRING13 = 0x8d,   /* SMALLINT  -99 = 0x9d */
-    TYPE_FALSE       = 0x6e,   TYPE_SINT56 = 0x7e,   TYPE_STRING14 = 0x8e,   /* SMALLINT  -98 = 0x9e */
-    TYPE_TRUE        = 0x6f,   TYPE_SINT64 = 0x7f,   TYPE_STRING15 = 0x8f,   /* SMALLINT  -97 = 0x9f */
+    // Small integers: 0x00-0xc8 encode values -100 to 100
+    // value = type_code - 100, so type_code = value + 100
+    TYPE_SMALLINT_MIN  = 0x00,  // -100
+    TYPE_SMALLINT_ZERO = 0x64,  // 0
+    TYPE_SMALLINT_MAX  = 0xc8,  // 100
+
+    // Unsigned integers (1-8 bytes), lower 3 bits = byte_count - 1
+    TYPE_UINT8  = 0xd0,
+    TYPE_UINT16 = 0xd1,
+    TYPE_UINT24 = 0xd2,
+    TYPE_UINT32 = 0xd3,
+    TYPE_UINT40 = 0xd4,
+    TYPE_UINT48 = 0xd5,
+    TYPE_UINT56 = 0xd6,
+    TYPE_UINT64 = 0xd7,
+
+    // Signed integers (1-8 bytes), lower 3 bits = byte_count - 1
+    TYPE_SINT8  = 0xd8,
+    TYPE_SINT16 = 0xd9,
+    TYPE_SINT24 = 0xda,
+    TYPE_SINT32 = 0xdb,
+    TYPE_SINT40 = 0xdc,
+    TYPE_SINT48 = 0xdd,
+    TYPE_SINT56 = 0xde,
+    TYPE_SINT64 = 0xdf,
+
+    // Short strings (0-15 bytes), lower nibble = length
+    TYPE_STRING0  = 0xe0,
+    TYPE_STRING1  = 0xe1,
+    TYPE_STRING2  = 0xe2,
+    TYPE_STRING3  = 0xe3,
+    TYPE_STRING4  = 0xe4,
+    TYPE_STRING5  = 0xe5,
+    TYPE_STRING6  = 0xe6,
+    TYPE_STRING7  = 0xe7,
+    TYPE_STRING8  = 0xe8,
+    TYPE_STRING9  = 0xe9,
+    TYPE_STRING10 = 0xea,
+    TYPE_STRING11 = 0xeb,
+    TYPE_STRING12 = 0xec,
+    TYPE_STRING13 = 0xed,
+    TYPE_STRING14 = 0xee,
+    TYPE_STRING15 = 0xef,
+
+    // Long string (chunked encoding)
+    TYPE_STRING = 0xf0,
+
+    // Big number (arbitrary precision decimal)
+    TYPE_BIG_NUMBER = 0xf1,
+
+    // Floats
+    TYPE_FLOAT16 = 0xf2,
+    TYPE_FLOAT32 = 0xf3,
+    TYPE_FLOAT64 = 0xf4,
+
+    // Null
+    TYPE_NULL = 0xf5,
+
+    // Booleans
+    TYPE_FALSE = 0xf6,
+    TYPE_TRUE  = 0xf7,
+
+    // Containers (chunked encoding, no end marker)
+    TYPE_ARRAY  = 0xf8,
+    TYPE_OBJECT = 0xf9,
 };
 
 enum
 {
-    SMALLINT_NEGATIVE_EDGE = -100,
-    SMALLINT_POSITIVE_EDGE = 100,
+    SMALLINT_MIN = -100,
+    SMALLINT_MAX = 100,
+    SMALLINT_BIAS = 100,  // type_code = value + SMALLINT_BIAS
 };
 
 

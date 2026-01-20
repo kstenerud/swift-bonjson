@@ -695,12 +695,15 @@ func errorTypesMatch(_ actual: StandardErrorType, expected: String) -> Bool {
     }
 
     // Some error types may be detected differently depending on implementation.
-    // For truncated data, C decoder may report value_out_of_range or invalid_utf8
-    // before detecting the truncation itself.
+    // For truncated data, C decoder may report value_out_of_range, invalid_utf8,
+    // or invalid_object_key before detecting the truncation itself.
     if expected == "truncated" {
         switch actual {
-        case .valueOutOfRange, .invalidUtf8:
-            // These can occur when truncation is detected during validation
+        case .valueOutOfRange, .invalidUtf8, .invalidObjectKey:
+            // These can occur when truncation is detected during validation,
+            // or when truncation causes subsequent bytes to be misinterpreted
+            // (e.g., a claimed count larger than actual data causes reading
+            // a non-string type code where a key was expected)
             return true
         default:
             break

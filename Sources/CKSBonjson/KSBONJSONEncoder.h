@@ -217,6 +217,7 @@ typedef struct {
     int containerDepth;
     KSBONJSONContainerState containers[KSBONJSON_MAX_CONTAINER_DEPTH];
     size_t containerElementCounts[KSBONJSON_MAX_CONTAINER_DEPTH];  // Element count per container
+    size_t containerContentStarts[KSBONJSON_MAX_CONTAINER_DEPTH];  // Position after type code (for length field insertion)
 
     // Security validation flags
     KSBONJSONEncodeFlags flags;
@@ -274,8 +275,8 @@ KSBONJSON_PUBLIC ssize_t ksbonjson_encodeToBuffer_end(KSBONJSONBufferEncodeConte
 #define KSBONJSON_MAX_ENCODED_SIZE_BOOL           1
 #define KSBONJSON_MAX_ENCODED_SIZE_INT            9   // type byte + 8 bytes max
 #define KSBONJSON_MAX_ENCODED_SIZE_FLOAT          9   // type byte + 8 bytes max
-#define KSBONJSON_MAX_ENCODED_SIZE_CONTAINER_BEGIN 1
-#define KSBONJSON_MAX_ENCODED_SIZE_CONTAINER_END  1
+#define KSBONJSON_MAX_ENCODED_SIZE_CONTAINER_BEGIN 1  // type byte only
+#define KSBONJSON_MAX_ENCODED_SIZE_CONTAINER_END  9   // length field (up to 9 bytes)
 
 /**
  * Calculate the maximum bytes needed to encode a string.

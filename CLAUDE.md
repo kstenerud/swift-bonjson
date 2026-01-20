@@ -68,34 +68,56 @@ The C `KSBONJSONMapEntry` stores decoded values inline:
 ## Type Codes
 
 Key type code ranges (defined in `KSBONJSONCommon.h`):
-- `0x00-0x64`: Small positive integers (0-100) encoded directly
-- `0x68`: Long string (followed by length-prefixed chunks)
-- `0x69`: Big number (for arbitrary precision decimals)
-- `0x6a-0x6c`: Floats (16-bit, 32-bit, 64-bit)
-- `0x6d`: Null
-- `0x6e-0x6f`: Boolean (false, true)
-- `0x70-0x77`: Unsigned integers (1-8 bytes)
-- `0x78-0x7f`: Signed integers (1-8 bytes)
-- `0x80-0x8f`: Short strings (0-15 bytes, length in lower nibble)
-- `0x99`: Array start
-- `0x9a`: Object start
-- `0x9b`: Container end
-- `0x9c-0xff`: Small negative integers (-100 to -1)
+- `0x00-0xc8`: Small integers (-100 to 100), value = type_code - 100
+- `0xc9-0xcf`: Reserved
+- `0xd0-0xd7`: Unsigned integers (1-8 bytes)
+- `0xd8-0xdf`: Signed integers (1-8 bytes)
+- `0xe0-0xef`: Short strings (0-15 bytes, length in lower nibble)
+- `0xf0`: Long string (followed by length-prefixed chunks)
+- `0xf1`: Big number (for arbitrary precision decimals)
+- `0xf2-0xf4`: Floats (16-bit, 32-bit, 64-bit)
+- `0xf5`: Null
+- `0xf6-0xf7`: Boolean (false, true)
+- `0xf8`: Array (followed by chunked elements)
+- `0xf9`: Object (followed by chunked key-value pairs)
+- `0xfa-0xff`: Reserved
+
+The new layout is optimized for mask-based type detection:
+- Small integers: `type_code < 0xc9`
+- Short strings: `type_code >= 0xe0 && type_code <= 0xef`
+- Long types: `type_code >= 0xf0`
 
 ## Length Field Encoding
 
-Length fields use variable-width encoding with a continuation bit for string chunking:
-- Format: `payload = (length << 1) | continuation_flag`
+Length fields use variable-width encoding with a continuation bit for chunking:
+- Format: `payload = (count << 1) | continuation_flag`
 - Trailing zeros in first byte indicate total byte count
-- Single byte encodes lengths 0-127 (after bit manipulation)
+- Single byte encodes counts 0-63 (after bit manipulation)
 - Multi-byte for larger values
 - Continuation flag (bit 0 of payload) indicates if more chunks follow
+- **Validation rule**: Empty chunk (count=0) with continuation=1 is invalid (DOS protection)
+
+## Container Encoding (Chunked Format)
+
+Containers (arrays and objects) use chunked encoding without an end marker:
+- Format: `[type_code] [chunk]...`
+- Each chunk: `[length_field] [elements...]`
+- Length field's count = number of elements (arrays) or key-value pairs (objects)
+- Final chunk has continuation bit = 0; intermediate chunks have continuation bit = 1
+
+This allows:
+- **Pre-allocation**: Decoder can sum chunk counts for total size
+- **Streaming**: Encoder can write chunks before knowing total size
+- **Efficient detection**: No need to scan for end markers
 
 ## Integer Encoding
 
 Integers are encoded using the smallest representation:
-1. Small int range (-100 to 100): Single byte type code encodes the value
-2. Larger values: Type code indicates byte count, followed by little-endian bytes
+1. Small int range (-100 to 100): Single byte type code, value = type_code - 100
+   - Type code 0x00 = -100, 0x64 = 0, 0xc8 = 100
+2. Larger values: Type code indicates sign and byte count, followed by little-endian bytes
+   - Unsigned: 0xd0-0xd7 (1-8 bytes)
+   - Signed: 0xd8-0xdf (1-8 bytes)
 3. Unsigned values try signed encoding when MSB allows (saves type code range)
 
 ## Float Encoding
@@ -108,9 +130,10 @@ Float encoding attempts smallest lossless representation:
 
 ## String Encoding
 
-- Short strings (0-15 bytes): Type code encodes length, followed by UTF-8 bytes
-- Long strings: Type code `0x68`, followed by length-field-prefixed UTF-8 data
+- Short strings (0-15 bytes): Type codes 0xe0-0xef encode length (length = type_code - 0xe0), followed by UTF-8 bytes
+- Long strings: Type code 0xf0, followed by length-field-prefixed UTF-8 chunks
 - Length field includes continuation bit for chunked encoding
+- Chunks may split UTF-8 sequences; only the assembled string must be valid UTF-8
 
 ## Big Number Format
 
@@ -159,6 +182,10 @@ Configure via `unicodeDecodingStrategy`:
 
 Note: The `.ignore` mode from the BONJSON spec is not supported because Swift's `String`
 type only accepts valid UTF-8. Use `.replace` as a permissive alternative.
+
+**Chunked string handling**: For multi-chunk strings, UTF-8 validation happens on the final
+assembled string, not per-chunk. Individual chunks may split UTF-8 sequences; only the
+complete string must be valid.
 
 ### NUL Character Handling
 
@@ -289,8 +316,8 @@ swift test --filter Conformance
 - `duplicate_key`: "keep_first", "keep_last"
 - `invalid_utf8`: "replace", "delete"
 
-**Skipped tests (9 total):**
-- 6 BigNumber roundtrip tests that exceed implementation limits:
+**Skipped tests (23 total):**
+- 20 BigNumber tests that exceed implementation limits:
   - Tests with >19 significant digits (exceeds UInt64 significand limit)
   - Tests with exponents outside -128 to 127 (exceeds Swift Decimal range)
 - 3 `nan_infinity: "stringify"` tests (would require converting float NaN/Infinity to strings)

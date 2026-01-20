@@ -388,6 +388,7 @@ public enum BONJSONDecodingError: Error, CustomStringConvertible {
     case maxContainerSizeExceeded
     case maxDocumentSizeExceeded
     case maxChunksExceeded
+    case emptyChunkContinuation
     case decimalCannotRepresentNaN
     case decimalCannotRepresentInfinity
     case bigNumberExponentOutOfRange(Int32)
@@ -438,6 +439,8 @@ public enum BONJSONDecodingError: Error, CustomStringConvertible {
             return "Maximum document size exceeded"
         case .maxChunksExceeded:
             return "Maximum number of string chunks exceeded"
+        case .emptyChunkContinuation:
+            return "Empty chunk with continuation bit set is invalid"
         case .decimalCannotRepresentNaN:
             return "Decimal cannot represent NaN"
         case .decimalCannotRepresentInfinity:
@@ -549,6 +552,8 @@ final class _PositionMap {
                         throw BONJSONDecodingError.maxDocumentSizeExceeded
                     case KSBONJSON_DECODE_MAX_CHUNKS_EXCEEDED:
                         throw BONJSONDecodingError.maxChunksExceeded
+                    case KSBONJSON_DECODE_EMPTY_CHUNK_CONTINUATION:
+                        throw BONJSONDecodingError.emptyChunkContinuation
                     default:
                         let message = ksbonjson_describeDecodeStatus(status).map { String(cString: $0) } ?? "Unknown error"
                         throw BONJSONDecodingError.scanFailed(message)
@@ -661,6 +666,8 @@ final class _PositionMap {
     }
 
     /// Assemble a chunked string by re-parsing the raw bytes.
+    /// NOTE: UTF-8 validation for chunked strings happens here since the C layer
+    /// cannot validate individual chunks (they may split UTF-8 sequences).
     private func assembleChunkedString(offset: Int, rawLength: Int) -> String? {
         var chunks: [ArraySlice<UInt8>] = []
         var pos = offset
@@ -692,7 +699,80 @@ final class _PositionMap {
             allBytes.append(contentsOf: chunk)
         }
 
+        // For .reject strategy, validate the assembled UTF-8 before creating string
+        // (C layer couldn't validate per-chunk since chunks may split UTF-8 sequences)
+        if case .reject = unicodeStrategy {
+            guard isValidUTF8(allBytes) else {
+                return nil
+            }
+        }
+
         return createStringFromBytes(allBytes)
+    }
+
+    /// Check if a byte array contains valid UTF-8.
+    private func isValidUTF8(_ bytes: [UInt8]) -> Bool {
+        var i = 0
+        let end = bytes.count
+
+        while i < end {
+            let b0 = bytes[i]
+
+            // ASCII (0x00-0x7F)
+            if b0 < 0x80 {
+                i += 1
+                continue
+            }
+
+            // Invalid: continuation byte without leading byte (0x80-0xBF)
+            // Invalid: 0xC0 and 0xC1 are overlong encodings
+            if b0 < 0xC2 {
+                return false
+            }
+
+            // 2-byte sequence (0xC2-0xDF)
+            if b0 < 0xE0 {
+                guard i + 1 < end else { return false }
+                let b1 = bytes[i + 1]
+                guard (b1 & 0xC0) == 0x80 else { return false }
+                i += 2
+                continue
+            }
+
+            // 3-byte sequence (0xE0-0xEF)
+            if b0 < 0xF0 {
+                guard i + 2 < end else { return false }
+                let b1 = bytes[i + 1]
+                let b2 = bytes[i + 2]
+                guard (b1 & 0xC0) == 0x80 && (b2 & 0xC0) == 0x80 else { return false }
+                // Check for overlong encoding (codepoint < 0x800)
+                if b0 == 0xE0 && b1 < 0xA0 { return false }
+                // Check for surrogates (U+D800-U+DFFF)
+                if b0 == 0xED && b1 >= 0xA0 { return false }
+                i += 3
+                continue
+            }
+
+            // 4-byte sequence (0xF0-0xF4)
+            if b0 < 0xF5 {
+                guard i + 3 < end else { return false }
+                let b1 = bytes[i + 1]
+                let b2 = bytes[i + 2]
+                let b3 = bytes[i + 3]
+                guard (b1 & 0xC0) == 0x80 && (b2 & 0xC0) == 0x80 && (b3 & 0xC0) == 0x80 else { return false }
+                // Check for overlong encoding (codepoint < 0x10000)
+                if b0 == 0xF0 && b1 < 0x90 { return false }
+                // Check for codepoint > U+10FFFF
+                if b0 == 0xF4 && b1 > 0x8F { return false }
+                i += 4
+                continue
+            }
+
+            // Invalid: bytes 0xF5-0xFF are not valid UTF-8 leading bytes
+            return false
+        }
+
+        return true
     }
 
     /// Decode a BONJSON length payload at the given position.
