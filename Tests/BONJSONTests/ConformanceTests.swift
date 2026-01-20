@@ -883,10 +883,9 @@ final class ConformanceTests: XCTestCase {
             .deletingLastPathComponent()  // BONJSONTests
             .deletingLastPathComponent()  // Tests
             .deletingLastPathComponent()  // swift-bonjson
-        // The bonjson repo is at ../bonjson relative to swift-bonjson
+        // The specification submodule contains the test suite
         return projectRoot
-            .deletingLastPathComponent()  // Projects directory
-            .appendingPathComponent("bonjson/tests")
+            .appendingPathComponent("specification/tests")
             .path
     }()
 
