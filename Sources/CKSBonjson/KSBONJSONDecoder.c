@@ -377,14 +377,16 @@ static ksbonjson_decodeStatus reportFloat(DecodeContext* const ctx, const double
 
 static ksbonjson_decodeStatus decodeAndReportUnsignedInteger(DecodeContext* const ctx, const uint8_t typeCode)
 {
-    const size_t size = (size_t)(typeCode - TYPE_UINT8 + 1);
+    // Byte count is in lower 3 bits + 1 (0xd0-0xd7 -> 1-8 bytes)
+    const size_t size = (size_t)(typeCode & 0x07) + 1;
     SHOULD_HAVE_ROOM_FOR_BYTES(size);
     return ctx->callbacks->onUnsignedInteger(decodeUnsignedInt(ctx, size), ctx->userData);
 }
 
 static ksbonjson_decodeStatus decodeAndReportSignedInteger(DecodeContext* const ctx, const uint8_t typeCode)
 {
-    const size_t size = (size_t)(typeCode - TYPE_SINT8 + 1);
+    // Byte count is in lower 3 bits + 1 (0xd8-0xdf -> 1-8 bytes)
+    const size_t size = (size_t)(typeCode & 0x07) + 1;
     SHOULD_HAVE_ROOM_FOR_BYTES(size);
     return ctx->callbacks->onSignedInteger(decodeSignedInt(ctx, size), ctx->userData);
 }
@@ -446,7 +448,8 @@ static ksbonjson_decodeStatus decodeAndReportBigNumber(DecodeContext* const ctx)
 
 static ksbonjson_decodeStatus decodeAndReportShortString(DecodeContext* const ctx, const uint8_t typeCode)
 {
-    const size_t length = (size_t)(typeCode - TYPE_STRING0);
+    // Short string length is in the lower nibble (0xe0-0xef -> length 0-15)
+    const size_t length = (size_t)(typeCode & 0x0f);
     SHOULD_HAVE_ROOM_FOR_BYTES(length);
     const uint8_t* const begin = ctx->bufferCurrent;
     ctx->bufferCurrent += length;
@@ -602,66 +605,71 @@ static ksbonjson_decodeStatus checkContainerState(DecodeContext* const ctx)
 
 static ksbonjson_decodeStatus decodeObjectName(DecodeContext* const ctx, const uint8_t typeCode)
 {
-    switch(typeCode)
+    // Short string: 0xe0-0xef (mask-based detection)
+    if ((typeCode & TYPE_MASK_SHORT_STRING) == TYPE_SHORT_STRING_BASE)
     {
-        case TYPE_STRING:
-            return decodeAndReportLongString(ctx);
-        case TYPE_STRING0:  case TYPE_STRING1:  case TYPE_STRING2:  case TYPE_STRING3:
-        case TYPE_STRING4:  case TYPE_STRING5:  case TYPE_STRING6:  case TYPE_STRING7:
-        case TYPE_STRING8:  case TYPE_STRING9:  case TYPE_STRING10: case TYPE_STRING11:
-        case TYPE_STRING12: case TYPE_STRING13: case TYPE_STRING14: case TYPE_STRING15:
-            return decodeAndReportShortString(ctx, typeCode);
-        default:
-            return KSBONJSON_DECODE_EXPECTED_OBJECT_NAME;
+        return decodeAndReportShortString(ctx, typeCode);
     }
+    // Long string: 0xf0
+    if (typeCode == TYPE_STRING)
+    {
+        return decodeAndReportLongString(ctx);
+    }
+    return KSBONJSON_DECODE_EXPECTED_OBJECT_NAME;
 }
 
 static ksbonjson_decodeStatus decodeValue(DecodeContext* const ctx, const uint8_t typeCode)
 {
-    switch(typeCode)
+    // Small integers: 0x00-0xc8 (most common case)
+    if (typeCode <= TYPE_SMALLINT_MAX)
+    {
+        return ctx->callbacks->onSignedInteger((int64_t)typeCode - SMALLINT_BIAS, ctx->userData);
+    }
+
+    // Short strings: 0xe0-0xef (mask-based detection)
+    if ((typeCode & TYPE_MASK_SHORT_STRING) == TYPE_SHORT_STRING_BASE)
+    {
+        return decodeAndReportShortString(ctx, typeCode);
+    }
+
+    // Unsigned integers: 0xd0-0xd7 (mask-based detection)
+    if ((typeCode & TYPE_MASK_INT) == TYPE_UINT_BASE)
+    {
+        return decodeAndReportUnsignedInteger(ctx, typeCode);
+    }
+
+    // Signed integers: 0xd8-0xdf (mask-based detection)
+    if ((typeCode & TYPE_MASK_INT) == TYPE_SINT_BASE)
+    {
+        return decodeAndReportSignedInteger(ctx, typeCode);
+    }
+
+    // Remaining types: 0xf0-0xf9 (individual checks)
+    switch (typeCode)
     {
         case TYPE_STRING:
             return decodeAndReportLongString(ctx);
-        case TYPE_STRING0:  case TYPE_STRING1:  case TYPE_STRING2:  case TYPE_STRING3:
-        case TYPE_STRING4:  case TYPE_STRING5:  case TYPE_STRING6:  case TYPE_STRING7:
-        case TYPE_STRING8:  case TYPE_STRING9:  case TYPE_STRING10: case TYPE_STRING11:
-        case TYPE_STRING12: case TYPE_STRING13: case TYPE_STRING14: case TYPE_STRING15:
-            return decodeAndReportShortString(ctx, typeCode);
-        case TYPE_UINT8:  case TYPE_UINT16: case TYPE_UINT24: case TYPE_UINT32:
-        case TYPE_UINT40: case TYPE_UINT48: case TYPE_UINT56: case TYPE_UINT64:
-            return decodeAndReportUnsignedInteger(ctx, typeCode);
-        case TYPE_SINT8:  case TYPE_SINT16: case TYPE_SINT24: case TYPE_SINT32:
-        case TYPE_SINT40: case TYPE_SINT48: case TYPE_SINT56: case TYPE_SINT64:
-            return decodeAndReportSignedInteger(ctx, typeCode);
+        case TYPE_BIG_NUMBER:
+            return decodeAndReportBigNumber(ctx);
         case TYPE_FLOAT16:
             return decodeAndReportFloat16(ctx);
         case TYPE_FLOAT32:
             return decodeAndReportFloat32(ctx);
         case TYPE_FLOAT64:
             return decodeAndReportFloat64(ctx);
-        case TYPE_BIG_NUMBER:
-            return decodeAndReportBigNumber(ctx);
-        case TYPE_ARRAY:
-            return beginArray(ctx);
-        case TYPE_OBJECT:
-            return beginObject(ctx);
+        case TYPE_NULL:
+            return ctx->callbacks->onNull(ctx->userData);
         case TYPE_FALSE:
             return ctx->callbacks->onBoolean(false, ctx->userData);
         case TYPE_TRUE:
             return ctx->callbacks->onBoolean(true, ctx->userData);
-        case TYPE_NULL:
-            return ctx->callbacks->onNull(ctx->userData);
+        case TYPE_ARRAY:
+            return beginArray(ctx);
+        case TYPE_OBJECT:
+            return beginObject(ctx);
         default:
-        {
-            // Check for reserved type codes (0xc9-0xcf, 0xfa-0xff)
-            if ((typeCode >= 0xc9 && typeCode <= 0xcf) || typeCode >= 0xfa)
-            {
-                return KSBONJSON_DECODE_INVALID_DATA;
-            }
-            // Small integer: type codes 0x00-0xc8 encode values -100 to 100
-            // value = typeCode - 100
-            return ctx->callbacks->onSignedInteger((int64_t)typeCode - SMALLINT_BIAS, ctx->userData);
-        }
+            // Reserved type codes: 0xc9-0xcf, 0xfa-0xff
+            return KSBONJSON_DECODE_INVALID_DATA;
     }
 }
 
@@ -937,7 +945,8 @@ static ksbonjson_decodeStatus mapScanShortString(KSBONJSONMapContext* ctx, uint8
 {
     MAP_SHOULD_HAVE_ENTRY_SPACE();
 
-    size_t length = (size_t)(typeCode - TYPE_STRING0);
+    // Short string length is in the lower nibble (0xe0-0xef -> length 0-15)
+    size_t length = (size_t)(typeCode & 0x0f);
     size_t offset = ctx->position;
 
     // Check max string length (SIZE_MAX means use spec default)
@@ -1084,7 +1093,8 @@ static ksbonjson_decodeStatus mapScanUnsignedInt(KSBONJSONMapContext* ctx, uint8
 {
     MAP_SHOULD_HAVE_ENTRY_SPACE();
 
-    size_t byteCount = (size_t)(typeCode - TYPE_UINT8 + 1);
+    // Byte count is in lower 3 bits + 1 (0xd0-0xd7 -> 1-8 bytes)
+    size_t byteCount = (size_t)(typeCode & 0x07) + 1;
     MAP_SHOULD_HAVE_ROOM_FOR_BYTES(byteCount);
 
     uint64_t value = mapDecodeUnsignedInt(ctx, byteCount);
@@ -1102,7 +1112,8 @@ static ksbonjson_decodeStatus mapScanSignedInt(KSBONJSONMapContext* ctx, uint8_t
 {
     MAP_SHOULD_HAVE_ENTRY_SPACE();
 
-    size_t byteCount = (size_t)(typeCode - TYPE_SINT8 + 1);
+    // Byte count is in lower 3 bits + 1 (0xd8-0xdf -> 1-8 bytes)
+    size_t byteCount = (size_t)(typeCode & 0x07) + 1;
     MAP_SHOULD_HAVE_ROOM_FOR_BYTES(byteCount);
 
     int64_t value = mapDecodeSignedInt(ctx, byteCount);
@@ -1290,18 +1301,17 @@ static ksbonjson_decodeStatus mapScanObjectName(KSBONJSONMapContext* ctx, size_t
     MAP_SHOULD_HAVE_ROOM_FOR_BYTES(1);
     uint8_t typeCode = ctx->input[ctx->position++];
 
-    switch (typeCode)
+    // Short string: 0xe0-0xef (mask-based detection)
+    if ((typeCode & TYPE_MASK_SHORT_STRING) == TYPE_SHORT_STRING_BASE)
     {
-        case TYPE_STRING:
-            return mapScanLongString(ctx, outIndex);
-        case TYPE_STRING0:  case TYPE_STRING1:  case TYPE_STRING2:  case TYPE_STRING3:
-        case TYPE_STRING4:  case TYPE_STRING5:  case TYPE_STRING6:  case TYPE_STRING7:
-        case TYPE_STRING8:  case TYPE_STRING9:  case TYPE_STRING10: case TYPE_STRING11:
-        case TYPE_STRING12: case TYPE_STRING13: case TYPE_STRING14: case TYPE_STRING15:
-            return mapScanShortString(ctx, typeCode, outIndex);
-        default:
-            return KSBONJSON_DECODE_EXPECTED_OBJECT_NAME;
+        return mapScanShortString(ctx, typeCode, outIndex);
     }
+    // Long string: 0xf0
+    if (typeCode == TYPE_STRING)
+    {
+        return mapScanLongString(ctx, outIndex);
+    }
+    return KSBONJSON_DECODE_EXPECTED_OBJECT_NAME;
 }
 
 /**
@@ -1443,8 +1453,49 @@ static ksbonjson_decodeStatus mapScanValue(KSBONJSONMapContext* ctx, size_t* out
     MAP_SHOULD_HAVE_ROOM_FOR_BYTES(1);
     uint8_t typeCode = ctx->input[ctx->position++];
 
+    // Small integers: 0x00-0xc8 (most common case)
+    if (typeCode <= TYPE_SMALLINT_MAX)
+    {
+        MAP_SHOULD_HAVE_ENTRY_SPACE();
+        KSBONJSONMapEntry entry = {
+            .type = KSBONJSON_TYPE_INT,
+            .data.intValue = (int64_t)typeCode - SMALLINT_BIAS
+        };
+        *outIndex = mapAddEntry(ctx, entry);
+        return KSBONJSON_DECODE_OK;
+    }
+
+    // Short strings: 0xe0-0xef (mask-based detection)
+    if ((typeCode & TYPE_MASK_SHORT_STRING) == TYPE_SHORT_STRING_BASE)
+    {
+        return mapScanShortString(ctx, typeCode, outIndex);
+    }
+
+    // Unsigned integers: 0xd0-0xd7 (mask-based detection)
+    if ((typeCode & TYPE_MASK_INT) == TYPE_UINT_BASE)
+    {
+        return mapScanUnsignedInt(ctx, typeCode, outIndex);
+    }
+
+    // Signed integers: 0xd8-0xdf (mask-based detection)
+    if ((typeCode & TYPE_MASK_INT) == TYPE_SINT_BASE)
+    {
+        return mapScanSignedInt(ctx, typeCode, outIndex);
+    }
+
+    // Remaining types: 0xf0-0xf9 (individual checks)
     switch (typeCode)
     {
+        case TYPE_STRING:
+            return mapScanLongString(ctx, outIndex);
+        case TYPE_BIG_NUMBER:
+            return mapScanBigNumber(ctx, outIndex);
+        case TYPE_FLOAT16:
+            return mapScanFloat16(ctx, outIndex);
+        case TYPE_FLOAT32:
+            return mapScanFloat32(ctx, outIndex);
+        case TYPE_FLOAT64:
+            return mapScanFloat64(ctx, outIndex);
         case TYPE_NULL:
         {
             MAP_SHOULD_HAVE_ENTRY_SPACE();
@@ -1466,48 +1517,13 @@ static ksbonjson_decodeStatus mapScanValue(KSBONJSONMapContext* ctx, size_t* out
             *outIndex = mapAddEntry(ctx, entry);
             return KSBONJSON_DECODE_OK;
         }
-        case TYPE_STRING:
-            return mapScanLongString(ctx, outIndex);
-        case TYPE_STRING0:  case TYPE_STRING1:  case TYPE_STRING2:  case TYPE_STRING3:
-        case TYPE_STRING4:  case TYPE_STRING5:  case TYPE_STRING6:  case TYPE_STRING7:
-        case TYPE_STRING8:  case TYPE_STRING9:  case TYPE_STRING10: case TYPE_STRING11:
-        case TYPE_STRING12: case TYPE_STRING13: case TYPE_STRING14: case TYPE_STRING15:
-            return mapScanShortString(ctx, typeCode, outIndex);
-        case TYPE_UINT8:  case TYPE_UINT16: case TYPE_UINT24: case TYPE_UINT32:
-        case TYPE_UINT40: case TYPE_UINT48: case TYPE_UINT56: case TYPE_UINT64:
-            return mapScanUnsignedInt(ctx, typeCode, outIndex);
-        case TYPE_SINT8:  case TYPE_SINT16: case TYPE_SINT24: case TYPE_SINT32:
-        case TYPE_SINT40: case TYPE_SINT48: case TYPE_SINT56: case TYPE_SINT64:
-            return mapScanSignedInt(ctx, typeCode, outIndex);
-        case TYPE_FLOAT16:
-            return mapScanFloat16(ctx, outIndex);
-        case TYPE_FLOAT32:
-            return mapScanFloat32(ctx, outIndex);
-        case TYPE_FLOAT64:
-            return mapScanFloat64(ctx, outIndex);
-        case TYPE_BIG_NUMBER:
-            return mapScanBigNumber(ctx, outIndex);
         case TYPE_ARRAY:
             return mapScanArray(ctx, outIndex);
         case TYPE_OBJECT:
             return mapScanObject(ctx, outIndex);
         default:
-        {
-            // Check for reserved type codes (0xc9-0xcf, 0xfa-0xff)
-            if ((typeCode >= 0xc9 && typeCode <= 0xcf) || typeCode >= 0xfa)
-            {
-                return KSBONJSON_DECODE_INVALID_DATA;
-            }
-            // Small integer: type codes 0x00-0xc8 encode values -100 to 100
-            // value = typeCode - 100
-            MAP_SHOULD_HAVE_ENTRY_SPACE();
-            KSBONJSONMapEntry entry = {
-                .type = KSBONJSON_TYPE_INT,
-                .data.intValue = (int64_t)typeCode - SMALLINT_BIAS
-            };
-            *outIndex = mapAddEntry(ctx, entry);
-            return KSBONJSON_DECODE_OK;
-        }
+            // Reserved type codes: 0xc9-0xcf, 0xfa-0xff
+            return KSBONJSON_DECODE_INVALID_DATA;
     }
 }
 

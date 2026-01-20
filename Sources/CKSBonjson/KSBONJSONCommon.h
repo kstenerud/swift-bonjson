@@ -198,6 +198,28 @@ enum
     SMALLINT_BIAS = 100,  // type_code = value + SMALLINT_BIAS
 };
 
+// Masks and bases for efficient type detection
+// These allow single-instruction type category detection:
+//   Short strings: (typeCode & TYPE_MASK_SHORT_STRING) == TYPE_SHORT_STRING_BASE
+//   Unsigned ints: (typeCode & TYPE_MASK_INT) == TYPE_UINT_BASE
+//   Signed ints:   (typeCode & TYPE_MASK_INT) == TYPE_SINT_BASE
+//   Containers:    (typeCode & TYPE_MASK_CONTAINER) == TYPE_CONTAINER_BASE
+enum
+{
+    // Short strings: 0xe0-0xef (lower nibble = length)
+    TYPE_MASK_SHORT_STRING = 0xf0,
+    TYPE_SHORT_STRING_BASE = 0xe0,
+
+    // Integers: 0xd0-0xd7 unsigned, 0xd8-0xdf signed (lower 3 bits = byte_count - 1)
+    TYPE_MASK_INT  = 0xf8,
+    TYPE_UINT_BASE = 0xd0,
+    TYPE_SINT_BASE = 0xd8,
+
+    // Containers: 0xf8 array, 0xf9 object
+    TYPE_MASK_CONTAINER = 0xfe,
+    TYPE_CONTAINER_BASE = 0xf8,
+};
+
 
 #ifdef __cplusplus
 }
