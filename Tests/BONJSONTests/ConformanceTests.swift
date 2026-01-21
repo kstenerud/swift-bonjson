@@ -915,9 +915,11 @@ final class ConformanceTests: XCTestCase {
         XCTAssertEqual(results.failed, 0, "Some conformance tests failed")
     }
 
-    /// Run runner validation tests from the runner/valid directory.
+    /// Run runner validation tests from the test-runner-validation/must-pass directory.
+    /// These tests validate that the test runner itself works correctly.
+    /// If these fail, conformance test results cannot be trusted.
     func testRunnerValid() throws {
-        let validDir = Self.testSuitePath + "/runner/valid"
+        let validDir = Self.testSuitePath + "/test-runner-validation/must-pass"
 
         guard FileManager.default.fileExists(atPath: validDir) else {
             throw XCTSkip("Runner validation tests not found at \(validDir)")
@@ -940,9 +942,11 @@ final class ConformanceTests: XCTestCase {
         XCTAssertEqual(results.failed, 0, "Some runner validation tests failed")
     }
 
-    /// Run runner special value tests.
+    /// Run runner value handling tests (numeric comparison, NaN, trailing bytes, etc.).
+    /// These tests validate that the test runner correctly compares values.
+    /// If these fail, conformance test results cannot be trusted.
     func testRunnerSpecialValues() throws {
-        let specialDir = Self.testSuitePath + "/runner/special-values"
+        let specialDir = Self.testSuitePath + "/test-runner-validation/value-handling"
 
         guard FileManager.default.fileExists(atPath: specialDir) else {
             throw XCTSkip("Runner special value tests not found at \(specialDir)")

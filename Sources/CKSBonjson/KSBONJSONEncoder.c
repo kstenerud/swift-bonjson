@@ -321,15 +321,34 @@ ssize_t ksbonjson_encodeToBuffer_int(KSBONJSONBufferEncodeContext* ctx, int64_t 
         return 1;
     }
 
-    size_t byteCount = requiredSignedIntegerBytesMin1(value);
+    const size_t signedBytes = requiredSignedIntegerBytesMin1(value);
 
-    // If it's positive and fits in less bytes as unsigned, save as type unsigned.
-    const uint64_t maskOutIfNegative = (uint64_t)~(value >> 63);
-    const uint64_t highByteIs0 = !(value >> (8 * (byteCount - 1)));
-    const uint64_t isPositiveAndHighByteIs0 = maskOutIfNegative & highByteIs0;
-
-    byteCount -= isPositiveAndHighByteIs0;
-    const uint8_t typeCode = (uint8_t)(TYPE_SINT8 + byteCount - 1 - 8 * isPositiveAndHighByteIs0);
+    // Per spec: favor signed over unsigned when both use the same number of bytes.
+    // Only use unsigned if it strictly saves bytes.
+    size_t byteCount;
+    uint8_t typeCode;
+    if (value > 0)
+    {
+        const size_t unsignedBytes = requiredUnsignedIntegerBytesMin1((uint64_t)value);
+        if (unsignedBytes < signedBytes)
+        {
+            // Unsigned saves bytes - use unsigned encoding
+            byteCount = unsignedBytes;
+            typeCode = (uint8_t)(TYPE_UINT8 + byteCount - 1);
+        }
+        else
+        {
+            // Same or more bytes - prefer signed
+            byteCount = signedBytes;
+            typeCode = (uint8_t)(TYPE_SINT8 + byteCount - 1);
+        }
+    }
+    else
+    {
+        // Negative values always use signed encoding
+        byteCount = signedBytes;
+        typeCode = (uint8_t)(TYPE_SINT8 + byteCount - 1);
+    }
 
     // Write type code + value bytes
     union num64_bits bits[2];
@@ -674,15 +693,34 @@ static inline size_t encodeInt64Fast(KSBONJSONBufferEncodeContext* ctx, int64_t 
         return 1;
     }
 
-    size_t byteCount = requiredSignedIntegerBytesMin1(value);
+    const size_t signedBytes = requiredSignedIntegerBytesMin1(value);
 
-    // If it's positive and fits in less bytes as unsigned, save as type unsigned.
-    const uint64_t maskOutIfNegative = (uint64_t)~(value >> 63);
-    const uint64_t highByteIs0 = !(value >> (8 * (byteCount - 1)));
-    const uint64_t isPositiveAndHighByteIs0 = maskOutIfNegative & highByteIs0;
-
-    byteCount -= isPositiveAndHighByteIs0;
-    const uint8_t typeCode = (uint8_t)(TYPE_SINT8 + byteCount - 1 - 8 * isPositiveAndHighByteIs0);
+    // Per spec: favor signed over unsigned when both use the same number of bytes.
+    // Only use unsigned if it strictly saves bytes.
+    size_t byteCount;
+    uint8_t typeCode;
+    if (value > 0)
+    {
+        const size_t unsignedBytes = requiredUnsignedIntegerBytesMin1((uint64_t)value);
+        if (unsignedBytes < signedBytes)
+        {
+            // Unsigned saves bytes - use unsigned encoding
+            byteCount = unsignedBytes;
+            typeCode = (uint8_t)(TYPE_UINT8 + byteCount - 1);
+        }
+        else
+        {
+            // Same or more bytes - prefer signed
+            byteCount = signedBytes;
+            typeCode = (uint8_t)(TYPE_SINT8 + byteCount - 1);
+        }
+    }
+    else
+    {
+        // Negative values always use signed encoding
+        byteCount = signedBytes;
+        typeCode = (uint8_t)(TYPE_SINT8 + byteCount - 1);
+    }
 
     // Write type code + value bytes
     union num64_bits bits[2];
@@ -1094,14 +1132,34 @@ ksbonjson_encodeStatus ksbonjson_addSignedInteger(KSBONJSONEncodeContext* const 
         return encodeSmallInt(ctx, value);
     }
 
-    size_t byteCount = requiredSignedIntegerBytesMin1(value);
+    const size_t signedBytes = requiredSignedIntegerBytesMin1(value);
 
-    const uint64_t maskOutIfNegative = (uint64_t)~(value>>63);
-    const uint64_t highByteIs0 = !(value>>(8*(byteCount-1)));
-    const uint64_t isPositiveAndHighByteIs0 = maskOutIfNegative & highByteIs0;
-
-    byteCount -= isPositiveAndHighByteIs0;
-    const uint8_t typeCode = (uint8_t)(TYPE_SINT8 + byteCount - 1 - 8*isPositiveAndHighByteIs0);
+    // Per spec: favor signed over unsigned when both use the same number of bytes.
+    // Only use unsigned if it strictly saves bytes.
+    size_t byteCount;
+    uint8_t typeCode;
+    if (value > 0)
+    {
+        const size_t unsignedBytes = requiredUnsignedIntegerBytesMin1((uint64_t)value);
+        if (unsignedBytes < signedBytes)
+        {
+            // Unsigned saves bytes - use unsigned encoding
+            byteCount = unsignedBytes;
+            typeCode = (uint8_t)(TYPE_UINT8 + byteCount - 1);
+        }
+        else
+        {
+            // Same or more bytes - prefer signed
+            byteCount = signedBytes;
+            typeCode = (uint8_t)(TYPE_SINT8 + byteCount - 1);
+        }
+    }
+    else
+    {
+        // Negative values always use signed encoding
+        byteCount = signedBytes;
+        typeCode = (uint8_t)(TYPE_SINT8 + byteCount - 1);
+    }
 
     return encodePrimitiveNumeric(ctx, typeCode, (uint64_t)value, byteCount);
 }
