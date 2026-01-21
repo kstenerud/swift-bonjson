@@ -316,8 +316,8 @@ swift test --filter Conformance
 - `duplicate_key`: "keep_first", "keep_last"
 - `invalid_utf8`: "replace", "delete"
 
-**Skipped tests (23 total):**
-- 20 BigNumber tests that exceed implementation limits:
+**Skipped tests (24 total):**
+- 21 BigNumber tests that exceed implementation limits:
   - Tests with >19 significant digits (exceeds UInt64 significand limit)
   - Tests with exponents outside -128 to 127 (exceeds Swift Decimal range)
 - 3 `nan_infinity: "stringify"` tests (would require converting float NaN/Infinity to strings)
