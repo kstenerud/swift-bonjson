@@ -160,10 +160,10 @@ struct TestOptions: Decodable {
     let maxStringLength: Int?
     let maxChunks: Int?
     let maxDocumentSize: Int?
-    // New string-based options from security.json
-    let nanInfinity: String?      // "allow", "stringify"
-    let duplicateKey: String?     // "keep_first", "keep_last"
-    let invalidUtf8: String?      // "replace", "delete"
+    // New string-based options per spec
+    let nanInfinityBehavior: String?  // "allow", "stringify"
+    let duplicateKey: String?         // "keep_first", "keep_last"
+    let invalidUtf8: String?          // "replace", "delete"
 
     // Track unrecognized options for skip detection
     var hasUnrecognizedOptions: Bool = false
@@ -177,7 +177,7 @@ struct TestOptions: Decodable {
         case maxStringLength = "max_string_length"
         case maxChunks = "max_chunks"
         case maxDocumentSize = "max_document_size"
-        case nanInfinity = "nan_infinity"
+        case nanInfinityBehavior = "nan_infinity_behavior"
         case duplicateKey = "duplicate_key"
         case invalidUtf8 = "invalid_utf8"
     }
@@ -192,7 +192,7 @@ struct TestOptions: Decodable {
         maxStringLength = try container.decodeIfPresent(Int.self, forKey: .maxStringLength)
         maxChunks = try container.decodeIfPresent(Int.self, forKey: .maxChunks)
         maxDocumentSize = try container.decodeIfPresent(Int.self, forKey: .maxDocumentSize)
-        nanInfinity = try container.decodeIfPresent(String.self, forKey: .nanInfinity)
+        nanInfinityBehavior = try container.decodeIfPresent(String.self, forKey: .nanInfinityBehavior)
         duplicateKey = try container.decodeIfPresent(String.self, forKey: .duplicateKey)
         invalidUtf8 = try container.decodeIfPresent(String.self, forKey: .invalidUtf8)
 
@@ -1155,6 +1155,22 @@ final class ConformanceTests: XCTestCase {
             encoder.nonConformingFloatEncodingStrategy = .allow
         }
 
+        // Apply string-based options
+        if let nanInfinityBehavior = options.nanInfinityBehavior {
+            switch nanInfinityBehavior {
+            case "allow":
+                encoder.nonConformingFloatEncodingStrategy = .allow
+            case "stringify":
+                encoder.nonConformingFloatEncodingStrategy = .convertToString(
+                    positiveInfinity: "Infinity",
+                    negativeInfinity: "-Infinity",
+                    nan: "NaN"
+                )
+            default:
+                break
+            }
+        }
+
         // Apply limit options
         if let maxDepth = options.maxDepth {
             encoder.maxDepth = maxDepth
@@ -1204,8 +1220,8 @@ final class ConformanceTests: XCTestCase {
         }
 
         // Apply string-based options
-        if let nanInfinity = options.nanInfinity {
-            switch nanInfinity {
+        if let nanInfinityBehavior = options.nanInfinityBehavior {
+            switch nanInfinityBehavior {
             case "allow":
                 decoder.nonConformingFloatDecodingStrategy = .allow
             case "stringify":
