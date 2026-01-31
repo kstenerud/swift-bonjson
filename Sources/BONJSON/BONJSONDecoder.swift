@@ -187,9 +187,6 @@ public final class BONJSONDecoder {
     /// Maximum document size in bytes. Default is 2,000,000,000 (BONJSON spec recommendation).
     public var maxDocumentSize: Int = 2_000_000_000
 
-    /// Maximum number of string chunks. Default is 100 (BONJSON spec recommendation).
-    public var maxChunks: Int = 100
-
     /// Contextual user info for decoding.
     public var userInfo: [CodingUserInfoKey: Any] = [:]
 
@@ -356,7 +353,6 @@ public final class BONJSONDecoder {
         flags.maxStringLength = maxStringLength
         flags.maxContainerSize = maxContainerSize
         flags.maxDocumentSize = maxDocumentSize
-        flags.maxChunks = maxChunks
 
         return flags
     }
@@ -387,8 +383,6 @@ public enum BONJSONDecodingError: Error, CustomStringConvertible {
     case maxStringLengthExceeded
     case maxContainerSizeExceeded
     case maxDocumentSizeExceeded
-    case maxChunksExceeded
-    case emptyChunkContinuation
     case decimalCannotRepresentNaN
     case decimalCannotRepresentInfinity
     case bigNumberExponentOutOfRange(Int32)
@@ -437,10 +431,6 @@ public enum BONJSONDecodingError: Error, CustomStringConvertible {
             return "Maximum container size exceeded"
         case .maxDocumentSizeExceeded:
             return "Maximum document size exceeded"
-        case .maxChunksExceeded:
-            return "Maximum number of string chunks exceeded"
-        case .emptyChunkContinuation:
-            return "Empty chunk with continuation bit set is invalid"
         case .decimalCannotRepresentNaN:
             return "Decimal cannot represent NaN"
         case .decimalCannotRepresentInfinity:
@@ -550,10 +540,6 @@ final class _PositionMap {
                         throw BONJSONDecodingError.maxContainerSizeExceeded
                     case KSBONJSON_DECODE_MAX_DOCUMENT_SIZE_EXCEEDED:
                         throw BONJSONDecodingError.maxDocumentSizeExceeded
-                    case KSBONJSON_DECODE_MAX_CHUNKS_EXCEEDED:
-                        throw BONJSONDecodingError.maxChunksExceeded
-                    case KSBONJSON_DECODE_EMPTY_CHUNK_CONTINUATION:
-                        throw BONJSONDecodingError.emptyChunkContinuation
                     default:
                         let message = ksbonjson_describeDecodeStatus(status).map { String(cString: $0) } ?? "Unknown error"
                         throw BONJSONDecodingError.scanFailed(message)
@@ -611,13 +597,9 @@ final class _PositionMap {
         return entries[index]
     }
 
-    // Flag bit to indicate a chunked string (matches C decoder)
-    private static let chunkedStringFlag: UInt32 = 0x80000000
-
     /// Get string data - reads from stored input bytes using entry offset/length.
     /// Uses caching to avoid creating duplicate String objects for repeated keys.
     /// Handles unicode strategy for replace/delete modes.
-    /// Handles chunked strings by re-assembling from raw bytes.
     @inline(__always)
     func getString(at index: size_t) -> String? {
         guard index >= 0 && index < entryCount else {
@@ -629,184 +611,26 @@ final class _PositionMap {
             return nil
         }
 
-        let rawOffset = entry.data.string.offset
+        let offset = Int(entry.data.string.offset)
         let length = Int(entry.data.string.length)
-
-        // Check if this is a chunked string (high bit set in offset)
-        let isChunked = (rawOffset & Self.chunkedStringFlag) != 0
-        let offset = Int(rawOffset & ~Self.chunkedStringFlag)
 
         guard offset >= 0 && offset + length <= inputBytes.count else {
             return nil
         }
 
         // Pack offset and length into a single UInt64 key for cache lookup
-        let cacheKey = UInt64(rawOffset) << 32 | UInt64(length)
+        let cacheKey = UInt64(offset) << 32 | UInt64(length)
 
         // Check cache first
         if let cached = stringCache[cacheKey] {
             return cached
         }
 
-        // For chunked strings, we need to re-parse and concatenate the chunks
-        let string: String
-        if isChunked {
-            guard let assembled = assembleChunkedString(offset: offset, rawLength: length) else {
-                return nil
-            }
-            string = assembled
-        } else {
-            // Single-chunk string - create directly from contiguous bytes
-            string = createString(offset: offset, length: length)
-        }
+        let string = createString(offset: offset, length: length)
 
         // Cache for future lookups
         stringCache[cacheKey] = string
         return string
-    }
-
-    /// Assemble a chunked string by re-parsing the raw bytes.
-    /// NOTE: UTF-8 validation for chunked strings happens here since the C layer
-    /// cannot validate individual chunks (they may split UTF-8 sequences).
-    private func assembleChunkedString(offset: Int, rawLength: Int) -> String? {
-        var chunks: [ArraySlice<UInt8>] = []
-        var pos = offset
-        let end = offset + rawLength
-
-        while pos < end {
-            // Decode length payload
-            guard let (payload, newPos) = decodeLengthPayload(at: pos, end: end) else {
-                return nil
-            }
-            pos = newPos
-
-            let chunkLength = Int(payload >> 1)
-            // continuation flag is payload & 1, but we don't need it here
-
-            guard pos + chunkLength <= end else {
-                return nil
-            }
-
-            chunks.append(inputBytes[pos..<(pos + chunkLength)])
-            pos += chunkLength
-        }
-
-        // Concatenate all chunks
-        var allBytes: [UInt8] = []
-        let totalLength = chunks.reduce(0) { $0 + $1.count }
-        allBytes.reserveCapacity(totalLength)
-        for chunk in chunks {
-            allBytes.append(contentsOf: chunk)
-        }
-
-        // For .reject strategy, validate the assembled UTF-8 before creating string
-        // (C layer couldn't validate per-chunk since chunks may split UTF-8 sequences)
-        if case .reject = unicodeStrategy {
-            guard isValidUTF8(allBytes) else {
-                return nil
-            }
-        }
-
-        return createStringFromBytes(allBytes)
-    }
-
-    /// Check if a byte array contains valid UTF-8.
-    private func isValidUTF8(_ bytes: [UInt8]) -> Bool {
-        var i = 0
-        let end = bytes.count
-
-        while i < end {
-            let b0 = bytes[i]
-
-            // ASCII (0x00-0x7F)
-            if b0 < 0x80 {
-                i += 1
-                continue
-            }
-
-            // Invalid: continuation byte without leading byte (0x80-0xBF)
-            // Invalid: 0xC0 and 0xC1 are overlong encodings
-            if b0 < 0xC2 {
-                return false
-            }
-
-            // 2-byte sequence (0xC2-0xDF)
-            if b0 < 0xE0 {
-                guard i + 1 < end else { return false }
-                let b1 = bytes[i + 1]
-                guard (b1 & 0xC0) == 0x80 else { return false }
-                i += 2
-                continue
-            }
-
-            // 3-byte sequence (0xE0-0xEF)
-            if b0 < 0xF0 {
-                guard i + 2 < end else { return false }
-                let b1 = bytes[i + 1]
-                let b2 = bytes[i + 2]
-                guard (b1 & 0xC0) == 0x80 && (b2 & 0xC0) == 0x80 else { return false }
-                // Check for overlong encoding (codepoint < 0x800)
-                if b0 == 0xE0 && b1 < 0xA0 { return false }
-                // Check for surrogates (U+D800-U+DFFF)
-                if b0 == 0xED && b1 >= 0xA0 { return false }
-                i += 3
-                continue
-            }
-
-            // 4-byte sequence (0xF0-0xF4)
-            if b0 < 0xF5 {
-                guard i + 3 < end else { return false }
-                let b1 = bytes[i + 1]
-                let b2 = bytes[i + 2]
-                let b3 = bytes[i + 3]
-                guard (b1 & 0xC0) == 0x80 && (b2 & 0xC0) == 0x80 && (b3 & 0xC0) == 0x80 else { return false }
-                // Check for overlong encoding (codepoint < 0x10000)
-                if b0 == 0xF0 && b1 < 0x90 { return false }
-                // Check for codepoint > U+10FFFF
-                if b0 == 0xF4 && b1 > 0x8F { return false }
-                i += 4
-                continue
-            }
-
-            // Invalid: bytes 0xF5-0xFF are not valid UTF-8 leading bytes
-            return false
-        }
-
-        return true
-    }
-
-    /// Decode a BONJSON length payload at the given position.
-    /// Returns (payload, newPosition) or nil on error.
-    private func decodeLengthPayload(at pos: Int, end: Int) -> (UInt64, Int)? {
-        guard pos < end else { return nil }
-
-        let header = inputBytes[pos]
-
-        // Special case: 0xff means 8-byte payload follows
-        if header == 0xff {
-            guard pos + 9 <= end else { return nil }
-            var payload: UInt64 = 0
-            for i in 0..<8 {
-                payload |= UInt64(inputBytes[pos + 1 + i]) << (i * 8)
-            }
-            return (payload, pos + 9)
-        }
-
-        // Count trailing 1s in header (after bit inversion) to get byte count
-        let inverted = ~header
-        let trailingZeros = inverted.trailingZeroBitCount
-        let byteCount = trailingZeros + 1
-
-        guard pos + byteCount <= end else { return nil }
-
-        var bits: UInt64 = 0
-        for i in 0..<byteCount {
-            bits |= UInt64(inputBytes[pos + i]) << (i * 8)
-        }
-
-        // Shift right by byteCount to get the payload
-        let payload = bits >> byteCount
-        return (payload, pos + byteCount)
     }
 
     /// Create a string from contiguous bytes at the given offset/length.
@@ -824,74 +648,6 @@ final class _PositionMap {
             // Filter out invalid UTF-8 bytes before creating string
             return createStringDeletingInvalidUTF8(offset: offset, length: length)
         }
-    }
-
-    /// Create a string from a byte array.
-    private func createStringFromBytes(_ bytes: [UInt8]) -> String {
-        switch unicodeStrategy {
-        case .reject, .replace:
-            return String(decoding: bytes, as: UTF8.self)
-
-        case .delete:
-            return createStringDeletingInvalidUTF8FromBytes(bytes)
-        }
-    }
-
-    /// Create a string by filtering out invalid UTF-8 sequences from a byte array.
-    private func createStringDeletingInvalidUTF8FromBytes(_ bytes: [UInt8]) -> String {
-        var validBytes: [UInt8] = []
-        validBytes.reserveCapacity(bytes.count)
-
-        var i = 0
-        let end = bytes.count
-
-        while i < end {
-            let b0 = bytes[i]
-
-            // ASCII (0x00-0x7F) - always valid
-            if b0 < 0x80 {
-                validBytes.append(b0)
-                i += 1
-                continue
-            }
-
-            // Determine expected sequence length and validate
-            let seqLen: Int
-            if b0 & 0xE0 == 0xC0 { seqLen = 2 }
-            else if b0 & 0xF0 == 0xE0 { seqLen = 3 }
-            else if b0 & 0xF8 == 0xF0 { seqLen = 4 }
-            else {
-                // Invalid start byte - skip
-                i += 1
-                continue
-            }
-
-            // Check we have enough bytes
-            guard i + seqLen <= end else {
-                i += 1
-                continue
-            }
-
-            // Validate continuation bytes
-            var valid = true
-            for j in 1..<seqLen {
-                if bytes[i + j] & 0xC0 != 0x80 {
-                    valid = false
-                    break
-                }
-            }
-
-            if valid {
-                for j in 0..<seqLen {
-                    validBytes.append(bytes[i + j])
-                }
-                i += seqLen
-            } else {
-                i += 1
-            }
-        }
-
-        return String(decoding: validBytes, as: UTF8.self)
     }
 
     /// Create a string by filtering out invalid UTF-8 sequences.
@@ -1250,43 +1006,17 @@ final class _MapDecoderState {
     }
 
     /// Decode a BigNumber entry to a Double value.
-    /// Handles both regular big numbers and special values (NaN/Infinity).
     @inline(__always)
-    func decodeBigNumber(_ bn: (significand: UInt64, exponent: Int32, sign: Int32, specialType: UInt8)) throws -> Double {
-        // Handle special values (NaN/Infinity)
-        // specialType: 0=regular, 1=Infinity, 3=NaN
-        if bn.specialType != 0 {
-            let value: Double
-            if bn.specialType == 3 {
-                value = .nan
-            } else {
-                // Infinity (specialType == 1)
-                value = bn.sign < 0 ? -.infinity : .infinity
-            }
-            return try validateFloat(value)
-        }
-
-        // Regular big number
+    func decodeBigNumber(_ bn: (significand: UInt64, exponent: Int32, sign: Int32)) throws -> Double {
         let significand = Double(bn.significand)
         let result = significand * pow(10.0, Double(bn.exponent))
         return bn.sign < 0 ? -result : result
     }
 
     /// Decode a BigNumber entry to a Decimal value.
-    /// Handles both regular big numbers and special values (NaN/Infinity).
     /// Throws if the exponent is outside Decimal's supported range (-128 to 127).
     @inline(__always)
-    func decodeBigNumberAsDecimal(_ bn: (significand: UInt64, exponent: Int32, sign: Int32, specialType: UInt8)) throws -> Decimal {
-        // Handle special values (NaN/Infinity)
-        // Decimal cannot represent NaN or Infinity
-        if bn.specialType != 0 {
-            if bn.specialType == 3 {
-                throw BONJSONDecodingError.decimalCannotRepresentNaN
-            } else {
-                throw BONJSONDecodingError.decimalCannotRepresentInfinity
-            }
-        }
-
+    func decodeBigNumberAsDecimal(_ bn: (significand: UInt64, exponent: Int32, sign: Int32)) throws -> Decimal {
         // Check exponent range - Decimal supports -128 to 127
         guard bn.exponent >= -128 && bn.exponent <= 127 else {
             throw BONJSONDecodingError.bigNumberExponentOutOfRange(bn.exponent)
@@ -1447,7 +1177,7 @@ final class _MapDecoder: Decoder {
             return Double(entry.data.uintValue)
         case KSBONJSON_TYPE_BIGNUMBER:
             let bn = entry.data.bigNumber
-            return try state.decodeBigNumber((bn.significand, bn.exponent, bn.sign, bn.specialType))
+            return try state.decodeBigNumber((bn.significand, bn.exponent, bn.sign))
         case KSBONJSON_TYPE_STRING:
             // Try to decode string as non-conforming float
             if let string = state.map.getString(at: entryIndex),
@@ -1592,7 +1322,7 @@ struct _MapKeyedDecodingContainer<Key: CodingKey>: KeyedDecodingContainerProtoco
         var keyPositions: [Int]? = keepLast ? [] : nil
 
         var currentIndex = firstChildIndex
-        for i in 0..<pairCount {
+        for _ in 0..<pairCount {
             let keyIndex = currentIndex
             let valueIndex = state.map.nextSiblingIndex(keyIndex)
             currentIndex = state.map.nextSiblingIndex(valueIndex)
@@ -1809,7 +1539,7 @@ struct _MapKeyedDecodingContainer<Key: CodingKey>: KeyedDecodingContainerProtoco
         case KSBONJSON_TYPE_UINT: return Double(entry.data.uintValue)
         case KSBONJSON_TYPE_BIGNUMBER:
             let bn = entry.data.bigNumber
-            return try state.decodeBigNumber((bn.significand, bn.exponent, bn.sign, bn.specialType))
+            return try state.decodeBigNumber((bn.significand, bn.exponent, bn.sign))
         case KSBONJSON_TYPE_STRING:
             // Try to decode string as non-conforming float
             if let string = state.map.getString(at: idx),
@@ -1904,7 +1634,7 @@ struct _MapKeyedDecodingContainer<Key: CodingKey>: KeyedDecodingContainerProtoco
             let entry = try entryForKey(key)
             if entry.type == KSBONJSON_TYPE_BIGNUMBER {
                 let bn = entry.data.bigNumber
-                return try state.decodeBigNumberAsDecimal((bn.significand, bn.exponent, bn.sign, bn.specialType)) as! T
+                return try state.decodeBigNumberAsDecimal((bn.significand, bn.exponent, bn.sign)) as! T
             }
             // Fall through to let Decimal's Decodable init handle other numeric types
         }
@@ -2076,7 +1806,7 @@ struct _MapUnkeyedDecodingContainer: UnkeyedDecodingContainer {
         case KSBONJSON_TYPE_UINT: return Double(entry.data.uintValue)
         case KSBONJSON_TYPE_BIGNUMBER:
             let bn = entry.data.bigNumber
-            return try state.decodeBigNumber((bn.significand, bn.exponent, bn.sign, bn.specialType))
+            return try state.decodeBigNumber((bn.significand, bn.exponent, bn.sign))
         case KSBONJSON_TYPE_STRING:
             // Try to decode string as non-conforming float
             if let string = state.map.getString(at: size_t(idx)),
@@ -2163,7 +1893,7 @@ struct _MapUnkeyedDecodingContainer: UnkeyedDecodingContainer {
             if entryType == KSBONJSON_TYPE_BIGNUMBER {
                 let (_, entry) = try nextEntry()
                 let bn = entry.data.bigNumber
-                return try state.decodeBigNumberAsDecimal((bn.significand, bn.exponent, bn.sign, bn.specialType)) as! T
+                return try state.decodeBigNumberAsDecimal((bn.significand, bn.exponent, bn.sign)) as! T
             }
             // Fall through to let Decimal's Decodable init handle other numeric types
         }
@@ -2260,7 +1990,7 @@ struct _MapSingleValueDecodingContainer: SingleValueDecodingContainer {
         case KSBONJSON_TYPE_UINT: return Double(entry.data.uintValue)
         case KSBONJSON_TYPE_BIGNUMBER:
             let bn = entry.data.bigNumber
-            return try state.decodeBigNumber((bn.significand, bn.exponent, bn.sign, bn.specialType))
+            return try state.decodeBigNumber((bn.significand, bn.exponent, bn.sign))
         case KSBONJSON_TYPE_STRING:
             // Try to decode string as non-conforming float
             if let string = state.map.getString(at: entryIndex),
@@ -2359,7 +2089,7 @@ struct _MapSingleValueDecodingContainer: SingleValueDecodingContainer {
             let entry = state.map.getEntry(at: entryIndex)
             if let entry = entry, entry.type == KSBONJSON_TYPE_BIGNUMBER {
                 let bn = entry.data.bigNumber
-                return try state.decodeBigNumberAsDecimal((bn.significand, bn.exponent, bn.sign, bn.specialType)) as! T
+                return try state.decodeBigNumberAsDecimal((bn.significand, bn.exponent, bn.sign)) as! T
             }
             // Fall through to let Decimal's Decodable init handle other numeric types
         }

@@ -24,6 +24,9 @@
 // THE SOFTWARE.
 //
 
+// ABOUTME: Public API for buffer-based and callback-based BONJSON encoding.
+// ABOUTME: Phase 2 delimiter-terminated format.
+
 #ifndef KSBONJSONEncoder_h
 #define KSBONJSONEncoder_h
 
@@ -106,7 +109,6 @@ typedef enum
     KSBONJSON_ENCODE_OK = 0,
     KSBONJSON_ENCODE_EXPECTED_OBJECT_NAME = 1,
     KSBONJSON_ENCODE_EXPECTED_OBJECT_VALUE = 2,
-    KSBONJSON_ENCODE_CHUNKING_STRING = 3,
     KSBONJSON_ENCODE_NULL_POINTER = 4,
     KSBONJSON_ENCODE_CLOSED_TOO_MANY_CONTAINERS = 5,
     KSBONJSON_ENCODE_CONTAINERS_ARE_STILL_OPEN = 6,
@@ -126,46 +128,15 @@ typedef enum
 // Security Configuration Flags
 // ============================================================================
 
-/**
- * Flags controlling security validation during encoding.
- * All flags default to secure behavior (reject problematic data).
- */
 typedef struct {
-    /**
-     * If true (default), reject strings containing NUL (U+0000) characters.
-     * NUL characters are a common source of security vulnerabilities.
-     */
     bool rejectNUL;
-    /**
-     * If true (default), reject NaN and infinity float values.
-     * These values cannot be represented in JSON.
-     */
     bool rejectNonFiniteFloat;
-
-    /**
-     * Maximum container nesting depth (0 = use compile-time default).
-     */
     size_t maxDepth;
-
-    /**
-     * Maximum string length in bytes (0 = no limit).
-     */
     size_t maxStringLength;
-
-    /**
-     * Maximum number of elements in a container (0 = no limit).
-     */
     size_t maxContainerSize;
-
-    /**
-     * Maximum document size in bytes (0 = no limit).
-     */
     size_t maxDocumentSize;
 } KSBONJSONEncodeFlags;
 
-/**
- * Returns default encode flags with all security checks enabled.
- */
 static inline KSBONJSONEncodeFlags ksbonjson_defaultEncodeFlags(void)
 {
     KSBONJSONEncodeFlags flags = {
@@ -181,232 +152,112 @@ static inline KSBONJSONEncodeFlags ksbonjson_defaultEncodeFlags(void)
 
 
 // ============================================================================
-// Buffer-Based Encoder (NEW - High Performance API)
+// Buffer-Based Encoder
 // ============================================================================
 
-/**
- * Container state tracking for the encoder.
- */
 typedef struct {
     uint8_t isObject: 1;
     uint8_t isExpectingName: 1;
-    uint8_t isChunkingString: 1;
 } KSBONJSONContainerState;
 
-/**
- * Buffer-based encoding context.
- *
- * This context writes directly to a user-provided buffer, eliminating
- * callback overhead. Swift can access the buffer pointer and position
- * directly for optimal performance.
- *
- * Usage:
- * 1. Allocate a buffer in Swift
- * 2. Call ksbonjson_encodeToBuffer_begin() with the buffer
- * 3. Call encoding functions - they return bytes written or negative error
- * 4. Check position against capacity before each call, grow buffer if needed
- * 5. Call ksbonjson_encodeToBuffer_end() to finalize
- */
 typedef struct {
-    // Buffer management - Swift can read these directly
-    uint8_t* buffer;          // Pointer to output buffer (owned by caller)
-    size_t capacity;          // Total buffer capacity
-    size_t position;          // Current write position (bytes written so far)
-
-    // Container tracking
+    uint8_t* buffer;
+    size_t capacity;
+    size_t position;
     int containerDepth;
     KSBONJSONContainerState containers[KSBONJSON_MAX_CONTAINER_DEPTH];
-    size_t containerElementCounts[KSBONJSON_MAX_CONTAINER_DEPTH];  // Element count per container
-    size_t containerContentStarts[KSBONJSON_MAX_CONTAINER_DEPTH];  // Position after type code (for length field insertion)
-
-    // Security validation flags
+    size_t containerElementCounts[KSBONJSON_MAX_CONTAINER_DEPTH];
     KSBONJSONEncodeFlags flags;
 } KSBONJSONBufferEncodeContext;
 
-/**
- * Initialize buffer-based encoding with security flags.
- *
- * @param ctx The encoding context to initialize
- * @param buffer The output buffer (caller-owned)
- * @param capacity The buffer's capacity in bytes
- * @param flags Security validation flags
- */
 KSBONJSON_PUBLIC void ksbonjson_encodeToBuffer_beginWithFlags(
     KSBONJSONBufferEncodeContext* ctx,
     uint8_t* buffer,
     size_t capacity,
     KSBONJSONEncodeFlags flags);
 
-/**
- * Initialize buffer-based encoding with default (secure) flags.
- *
- * @param ctx The encoding context to initialize
- * @param buffer The output buffer (caller-owned)
- * @param capacity The buffer's capacity in bytes
- */
 KSBONJSON_PUBLIC void ksbonjson_encodeToBuffer_begin(
     KSBONJSONBufferEncodeContext* ctx,
     uint8_t* buffer,
     size_t capacity);
 
-/**
- * Update the buffer pointer and capacity (call after growing the buffer).
- *
- * @param ctx The encoding context
- * @param buffer The new buffer pointer
- * @param capacity The new capacity
- */
 KSBONJSON_PUBLIC void ksbonjson_encodeToBuffer_setBuffer(
     KSBONJSONBufferEncodeContext* ctx,
     uint8_t* buffer,
     size_t capacity);
 
-/**
- * End buffer-based encoding.
- * Returns the final position (total bytes written) or negative error code.
- */
 KSBONJSON_PUBLIC ssize_t ksbonjson_encodeToBuffer_end(KSBONJSONBufferEncodeContext* ctx);
 
-/**
- * Maximum bytes needed to encode values of each type.
- * These are compile-time constants for use in capacity calculations.
- */
+// Max encoded sizes for capacity calculations
 #define KSBONJSON_MAX_ENCODED_SIZE_NULL           1
 #define KSBONJSON_MAX_ENCODED_SIZE_BOOL           1
 #define KSBONJSON_MAX_ENCODED_SIZE_INT            9   // type byte + 8 bytes max
 #define KSBONJSON_MAX_ENCODED_SIZE_FLOAT          9   // type byte + 8 bytes max
 #define KSBONJSON_MAX_ENCODED_SIZE_CONTAINER_BEGIN 1  // type byte only
-#define KSBONJSON_MAX_ENCODED_SIZE_CONTAINER_END  9   // length field (up to 9 bytes)
+#define KSBONJSON_MAX_ENCODED_SIZE_CONTAINER_END  1   // 0xFE end marker
 
-/**
- * Calculate the maximum bytes needed to encode a string.
- */
 static inline size_t ksbonjson_maxEncodedSize_string(size_t stringLength)
 {
     if (stringLength <= 15) return 1 + stringLength;
-    // type + length field (max 9 bytes) + string
-    return 10 + stringLength;
+    // Long string: FF + data + FF
+    return 2 + stringLength;
 }
 
-// Encoding functions - return bytes written (positive) or error code (negative)
-// All functions assume sufficient buffer capacity - caller must check first!
-
+// Encoding functions
 KSBONJSON_PUBLIC ssize_t ksbonjson_encodeToBuffer_null(KSBONJSONBufferEncodeContext* ctx);
-
 KSBONJSON_PUBLIC ssize_t ksbonjson_encodeToBuffer_bool(KSBONJSONBufferEncodeContext* ctx, bool value);
-
 KSBONJSON_PUBLIC ssize_t ksbonjson_encodeToBuffer_int(KSBONJSONBufferEncodeContext* ctx, int64_t value);
-
 KSBONJSON_PUBLIC ssize_t ksbonjson_encodeToBuffer_uint(KSBONJSONBufferEncodeContext* ctx, uint64_t value);
-
 KSBONJSON_PUBLIC ssize_t ksbonjson_encodeToBuffer_float(KSBONJSONBufferEncodeContext* ctx, double value);
-
 KSBONJSON_PUBLIC ssize_t ksbonjson_encodeToBuffer_bigNumber(KSBONJSONBufferEncodeContext* ctx, KSBigNumber value);
-
 KSBONJSON_PUBLIC ssize_t ksbonjson_encodeToBuffer_string(
     KSBONJSONBufferEncodeContext* ctx,
     const char* value,
     size_t length);
-
 KSBONJSON_PUBLIC ssize_t ksbonjson_encodeToBuffer_beginObject(KSBONJSONBufferEncodeContext* ctx);
-
 KSBONJSON_PUBLIC ssize_t ksbonjson_encodeToBuffer_beginArray(KSBONJSONBufferEncodeContext* ctx);
-
 KSBONJSON_PUBLIC ssize_t ksbonjson_encodeToBuffer_endContainer(KSBONJSONBufferEncodeContext* ctx);
-
-/**
- * End all open containers.
- * Returns total bytes written for all container ends, or negative error.
- */
 KSBONJSON_PUBLIC ssize_t ksbonjson_encodeToBuffer_endAllContainers(KSBONJSONBufferEncodeContext* ctx);
-
-/**
- * Get the current container depth.
- */
 KSBONJSON_PUBLIC int ksbonjson_encodeToBuffer_getDepth(KSBONJSONBufferEncodeContext* ctx);
-
-/**
- * Check if currently inside an object (vs array or top-level).
- */
 KSBONJSON_PUBLIC bool ksbonjson_encodeToBuffer_isInObject(KSBONJSONBufferEncodeContext* ctx);
 
-// Batch encoding functions for primitive arrays - much faster than encoding one at a time
-
-/**
- * Encode an array of int64 values.
- * This is much faster than encoding elements one at a time.
- *
- * @param ctx The encoding context
- * @param values Pointer to array of int64 values
- * @param count Number of values to encode
- * @return Total bytes written (positive) or error code (negative)
- */
+// Batch encoding functions
 KSBONJSON_PUBLIC ssize_t ksbonjson_encodeToBuffer_int64Array(
     KSBONJSONBufferEncodeContext* ctx,
     const int64_t* values,
     size_t count);
 
-/**
- * Encode an array of double values.
- * This is much faster than encoding elements one at a time.
- *
- * @param ctx The encoding context
- * @param values Pointer to array of double values
- * @param count Number of values to encode
- * @return Total bytes written (positive) or error code (negative)
- */
 KSBONJSON_PUBLIC ssize_t ksbonjson_encodeToBuffer_doubleArray(
     KSBONJSONBufferEncodeContext* ctx,
     const double* values,
     size_t count);
 
-/**
- * Calculate maximum bytes needed for an int64 array.
- */
 static inline size_t ksbonjson_maxEncodedSize_int64Array(size_t count)
 {
     // Array begin (1) + count * max int size (9) + array end (1)
     return 2 + count * KSBONJSON_MAX_ENCODED_SIZE_INT;
 }
 
-/**
- * Calculate maximum bytes needed for a double array.
- */
 static inline size_t ksbonjson_maxEncodedSize_doubleArray(size_t count)
 {
-    // Array begin (1) + count * max float size (9) + array end (1)
     return 2 + count * KSBONJSON_MAX_ENCODED_SIZE_FLOAT;
 }
 
-/**
- * Encode an array of strings.
- * This is much faster than encoding elements one at a time.
- *
- * @param ctx The encoding context
- * @param strings Array of string pointers (UTF-8 encoded)
- * @param lengths Array of string lengths (one per string)
- * @param count Number of strings to encode
- * @return Total bytes written (positive) or error code (negative)
- */
 KSBONJSON_PUBLIC ssize_t ksbonjson_encodeToBuffer_stringArray(
     KSBONJSONBufferEncodeContext* ctx,
     const char* const* strings,
     const size_t* lengths,
     size_t count);
 
-/**
- * Calculate maximum bytes needed for a string array.
- * Note: This requires the total length of all strings.
- */
 static inline size_t ksbonjson_maxEncodedSize_stringArray(size_t count, size_t totalStringLength)
 {
-    // Array begin (1) + count * max string header (10 per string) + total string bytes + array end (1)
-    return 2 + count * 10 + totalStringLength;
+    // Array begin (1) + count * max string header (2 per string for FF+FF) + total string bytes + array end (1)
+    return 2 + count * 2 + totalStringLength;
 }
 
 
 // ============================================================================
-// Callback-Based Encoder (Original API - Preserved for Compatibility)
+// Callback-Based Encoder (Legacy API)
 // ============================================================================
 
 typedef ksbonjson_encodeStatus (*KSBONJSONAddEncodedDataFunc)(
@@ -445,11 +296,6 @@ KSBONJSON_PUBLIC ksbonjson_encodeStatus ksbonjson_addNull(KSBONJSONEncodeContext
 KSBONJSON_PUBLIC ksbonjson_encodeStatus ksbonjson_addString(KSBONJSONEncodeContext* KSBONJSON_RESTRICT context,
                                                             const char* KSBONJSON_RESTRICT value,
                                                             size_t valueLength);
-
-KSBONJSON_PUBLIC ksbonjson_encodeStatus ksbonjson_chunkString(KSBONJSONEncodeContext* KSBONJSON_RESTRICT context,
-                                                              const char* KSBONJSON_RESTRICT chunk,
-                                                              size_t chunkLength,
-                                                              bool isLastChunk);
 
 KSBONJSON_PUBLIC ksbonjson_encodeStatus ksbonjson_addBONJSONDocument(KSBONJSONEncodeContext* KSBONJSON_RESTRICT context,
                                                                      const uint8_t* KSBONJSON_RESTRICT bonjsonDocument,

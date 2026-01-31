@@ -24,6 +24,9 @@
 // THE SOFTWARE.
 //
 
+// ABOUTME: BONJSON decoder implementation (Phase 2: delimiter-terminated format).
+// ABOUTME: Provides callback-based decoder, position-map scanner, and batch decode.
+
 #include "KSBONJSONDecoder.h"
 #include "KSBONJSONCommon.h"
 #include <string.h> // For memcpy() and strnlen()
@@ -193,15 +196,15 @@ union number_bits
     double   f64;
 };
 
+// Integer byte counts indexed by type code lower 2 bits: 0->1, 1->2, 2->4, 3->8
+static const size_t intByteCounts[] = { 1, 2, 4, 8 };
+
 #pragma GCC diagnostic push
 #pragma GCC diagnostic ignored "-Wpadded"
 typedef struct
 {
     uint8_t isObject: 1;
     uint8_t isExpectingName: 1;
-    uint8_t isChunkingString: 1;
-    uint64_t remainingInChunk;  // Remaining elements (array) or pairs (object) in current chunk
-    bool moreChunksFollow;      // Whether another chunk follows after current
 } ContainerState;
 
 typedef struct
@@ -257,59 +260,6 @@ static uint64_t fromLittleEndian(uint64_t v)
 }
 
 /**
- * Get a length field's total byte count from its header.
- * Note: Undefined for header value 0xff.
- */
-static size_t decodeLengthFieldTotalByteCount(uint8_t header)
-{
-    // Invert header: length field uses trailing 1s terminated by 0
-    header = (uint8_t)~header;
-
-#if HAS_BUILTIN(__builtin_ctz)
-    return (size_t)__builtin_ctz(header) + 1;
-#elif defined(_MSC_VER)
-    unsigned long tz = 0;
-    _BitScanForward(&tz, header);
-    return tz + 1;
-#else
-    // Isolate lowest 1-bit
-    header &= -header;
-
-    // Calculate log2
-    uint8_t result = (header & 0xAA) != 0;
-    result |= ((header & 0xCC) != 0) << 1;
-    result |= ((header & 0xF0) != 0) << 2;
-
-    // Add 1
-    return result + 1;
-#endif
-}
-
-static ksbonjson_decodeStatus decodeLengthPayload(DecodeContext* const ctx, uint64_t *payloadBuffer)
-{
-    SHOULD_HAVE_ROOM_FOR_BYTES(1);
-    const uint8_t header = *ctx->bufferCurrent;
-    unlikely_if(header == 0xff)
-    {
-        ctx->bufferCurrent++;
-        SHOULD_HAVE_ROOM_FOR_BYTES(8);
-        union number_bits bits;
-        memcpy(bits.b, ctx->bufferCurrent, 8);
-        ctx->bufferCurrent += 8;
-        *payloadBuffer = fromLittleEndian(bits.u64);
-        return KSBONJSON_DECODE_OK;
-    }
-
-    const size_t count = decodeLengthFieldTotalByteCount(header);
-    SHOULD_HAVE_ROOM_FOR_BYTES(count);
-    union number_bits bits = {0};
-    memcpy(bits.b, ctx->bufferCurrent, count);
-    ctx->bufferCurrent += count;
-    *payloadBuffer = fromLittleEndian(bits.u64 >> count);
-    return KSBONJSON_DECODE_OK;
-}
-
-/**
  * Decode a primitive numeric type of the specified size.
  * @param ctx The context
  * @param byteCount Size of the number in bytes. Do NOT set size > 8 as it isn't sanity checked!
@@ -332,11 +282,6 @@ static int8_t fillWithBit7(uint8_t value)
     return (int8_t)value >> 7;
 }
 
-static int8_t fillWithBit0(uint8_t value)
-{
-    return (int8_t)(value<<7) >> 7;
-}
-
 static uint64_t decodeUnsignedInt(DecodeContext* const ctx, const size_t size)
 {
     return decodePrimitiveNumeric(ctx, size, 0).u64;
@@ -345,13 +290,6 @@ static uint64_t decodeUnsignedInt(DecodeContext* const ctx, const size_t size)
 static int64_t decodeSignedInt(DecodeContext* const ctx, const size_t size)
 {
     return decodePrimitiveNumeric(ctx, size, fillWithBit7(ctx->bufferCurrent[size-1])).i64;
-}
-
-static float decodeFloat16(DecodeContext* const ctx)
-{
-    union number_bits value = decodePrimitiveNumeric(ctx, 2, 0);
-    value.u32 <<= 16;
-    return value.f32;
 }
 
 static float decodeFloat32(DecodeContext* const ctx)
@@ -377,24 +315,16 @@ static ksbonjson_decodeStatus reportFloat(DecodeContext* const ctx, const double
 
 static ksbonjson_decodeStatus decodeAndReportUnsignedInteger(DecodeContext* const ctx, const uint8_t typeCode)
 {
-    // Byte count is in lower 3 bits + 1 (0xd0-0xd7 -> 1-8 bytes)
-    const size_t size = (size_t)(typeCode & 0x07) + 1;
+    const size_t size = intByteCounts[typeCode & 0x03];
     SHOULD_HAVE_ROOM_FOR_BYTES(size);
     return ctx->callbacks->onUnsignedInteger(decodeUnsignedInt(ctx, size), ctx->userData);
 }
 
 static ksbonjson_decodeStatus decodeAndReportSignedInteger(DecodeContext* const ctx, const uint8_t typeCode)
 {
-    // Byte count is in lower 3 bits + 1 (0xd8-0xdf -> 1-8 bytes)
-    const size_t size = (size_t)(typeCode & 0x07) + 1;
+    const size_t size = intByteCounts[typeCode & 0x03];
     SHOULD_HAVE_ROOM_FOR_BYTES(size);
     return ctx->callbacks->onSignedInteger(decodeSignedInt(ctx, size), ctx->userData);
-}
-
-static ksbonjson_decodeStatus decodeAndReportFloat16(DecodeContext* const ctx)
-{
-    SHOULD_HAVE_ROOM_FOR_BYTES(2);
-    return reportFloat(ctx, (double)decodeFloat16(ctx));
 }
 
 static ksbonjson_decodeStatus decodeAndReportFloat32(DecodeContext* const ctx)
@@ -411,44 +341,36 @@ static ksbonjson_decodeStatus decodeAndReportFloat64(DecodeContext* const ctx)
 
 static ksbonjson_decodeStatus decodeAndReportBigNumber(DecodeContext* const ctx)
 {
-    SHOULD_HAVE_ROOM_FOR_BYTES(1);
-    const uint8_t header = *ctx->bufferCurrent++;
+    // BigNumber: zigzag LEB128 exponent + zigzag LEB128 signed significand
+    size_t available = (size_t)(ctx->bufferEnd - ctx->bufferCurrent);
 
-    //   Header Byte
-    // ───────────────
-    // S S S S S E E N
-    // ╰─┴─┼─┴─╯ ╰─┤ ╰─> Significand sign (0 = positive, 1 = negative)
-    //     │       ╰───> Exponent Length (0-3 bytes)
-    //     ╰───────────> Significand Length (0-31 bytes)
-
-    const int sign = fillWithBit0((uint8_t)header);
-    const size_t exponentLength = (header >> 1) & 3;
-    const size_t significandLength = header >> 3;
-
-    unlikely_if(significandLength > 8)
+    int64_t exponent;
+    size_t bytesRead = ksbonjson_readZigzagLEB128(ctx->bufferCurrent, available, &exponent);
+    unlikely_if(bytesRead == 0)
     {
-        return KSBONJSON_DECODE_VALUE_OUT_OF_RANGE;
+        return KSBONJSON_DECODE_INCOMPLETE;
     }
-    unlikely_if(significandLength == 0)
+    ctx->bufferCurrent += bytesRead;
+    available -= bytesRead;
+
+    int64_t signedSignificand;
+    bytesRead = ksbonjson_readZigzagLEB128(ctx->bufferCurrent, available, &signedSignificand);
+    unlikely_if(bytesRead == 0)
     {
-        unlikely_if(exponentLength != 0)
-        {
-            // Special BigNumber encodings: Inf or NaN
-            return KSBONJSON_DECODE_INVALID_DATA;
-        }
-        return ctx->callbacks->onBigNumber(ksbonjson_newBigNumber(sign, 0, 0), ctx->userData);
+        return KSBONJSON_DECODE_INCOMPLETE;
     }
+    ctx->bufferCurrent += bytesRead;
 
-    SHOULD_HAVE_ROOM_FOR_BYTES(significandLength + exponentLength);
-    const int32_t exponent = (int32_t)decodeSignedInt(ctx, exponentLength);
-    const uint64_t significand = decodeUnsignedInt(ctx, significandLength);
+    // Extract sign and absolute significand
+    int sign = signedSignificand < 0 ? -1 : 0;
+    uint64_t significand = signedSignificand < 0 ? (uint64_t)(-signedSignificand) : (uint64_t)signedSignificand;
 
-    return ctx->callbacks->onBigNumber(ksbonjson_newBigNumber(sign, significand, exponent), ctx->userData);
+    return ctx->callbacks->onBigNumber(ksbonjson_newBigNumber(sign, significand, (int32_t)exponent), ctx->userData);
 }
 
 static ksbonjson_decodeStatus decodeAndReportShortString(DecodeContext* const ctx, const uint8_t typeCode)
 {
-    // Short string length is in the lower nibble (0xe0-0xef -> length 0-15)
+    // Short string length is in the lower nibble (0xD0-0xDF -> length 0-15)
     const size_t length = (size_t)(typeCode & 0x0f);
     SHOULD_HAVE_ROOM_FOR_BYTES(length);
     const uint8_t* const begin = ctx->bufferCurrent;
@@ -459,53 +381,27 @@ static ksbonjson_decodeStatus decodeAndReportShortString(DecodeContext* const ct
 
 static ksbonjson_decodeStatus decodeAndReportLongString(DecodeContext* const ctx)
 {
-    uint64_t lengthPayload;
-    PROPAGATE_ERROR(ctx, decodeLengthPayload(ctx, &lengthPayload));
-    uint64_t length = lengthPayload >> 1;
-    bool moreChunksFollow = (bool)(lengthPayload&1);
-    SHOULD_HAVE_ROOM_FOR_BYTES(length);
+    // Long string: data bytes until 0xFF terminator
+    // 0xFF cannot appear in valid UTF-8, so it's a safe terminator
+    const uint8_t* start = ctx->bufferCurrent;
+    const uint8_t* end = ctx->bufferEnd;
 
-    const uint8_t* pos = ctx->bufferCurrent;
-    ctx->bufferCurrent += length;
-    SHOULD_NOT_CONTAIN_NUL_CHARS(pos, length);
-
-    likely_if(!moreChunksFollow)
+    // Scan for terminator
+    const uint8_t* pos = start;
+    while (pos < end && *pos != TYPE_STRING_LONG)
     {
-        return ctx->callbacks->onString((const char*)pos, length, ctx->userData);
+        pos++;
+    }
+    unlikely_if(pos >= end)
+    {
+        return KSBONJSON_DECODE_INCOMPLETE;
     }
 
-    PROPAGATE_ERROR(ctx, ctx->callbacks->onStringChunk((const char*)pos, length, moreChunksFollow, ctx->userData));
+    size_t length = (size_t)(pos - start);
+    ctx->bufferCurrent = pos + 1; // skip terminator
 
-    while(moreChunksFollow)
-    {
-        PROPAGATE_ERROR(ctx, decodeLengthPayload(ctx, &lengthPayload));
-        length = lengthPayload >> 1;
-        moreChunksFollow = (bool)(lengthPayload&1);
-        SHOULD_HAVE_ROOM_FOR_BYTES(length);
-        pos = ctx->bufferCurrent;
-        ctx->bufferCurrent += length;
-        SHOULD_NOT_CONTAIN_NUL_CHARS(pos, length);
-        PROPAGATE_ERROR(ctx, ctx->callbacks->onStringChunk((const char*)pos, length, moreChunksFollow, ctx->userData));
-    }
-
-    return KSBONJSON_DECODE_OK;
-}
-
-// Read a chunk header for the callback decoder
-static ksbonjson_decodeStatus readChunkHeader(DecodeContext* const ctx, uint64_t* outCount, bool* outMoreChunks)
-{
-    uint64_t payload;
-    PROPAGATE_ERROR(ctx, decodeLengthPayload(ctx, &payload));
-    *outCount = payload >> 1;
-    *outMoreChunks = (payload & 1) != 0;
-
-    // Empty chunk with continuation is invalid (DOS protection)
-    unlikely_if(*outCount == 0 && *outMoreChunks)
-    {
-        return KSBONJSON_DECODE_EMPTY_CHUNK_CONTINUATION;
-    }
-
-    return KSBONJSON_DECODE_OK;
+    SHOULD_NOT_CONTAIN_NUL_CHARS(start, length);
+    return ctx->callbacks->onString((const char*)start, length, ctx->userData);
 }
 
 static ksbonjson_decodeStatus beginArray(DecodeContext* const ctx)
@@ -515,17 +411,10 @@ static ksbonjson_decodeStatus beginArray(DecodeContext* const ctx)
         return KSBONJSON_DECODE_CONTAINER_DEPTH_EXCEEDED;
     }
 
-    // Read first chunk header
-    uint64_t count;
-    bool moreChunks;
-    PROPAGATE_ERROR(ctx, readChunkHeader(ctx, &count, &moreChunks));
-
     ctx->containerDepth++;
     ctx->containers[ctx->containerDepth] = (ContainerState){
         .isObject = false,
         .isExpectingName = false,
-        .remainingInChunk = count,
-        .moreChunksFollow = moreChunks,
     };
 
     return ctx->callbacks->onBeginArray(ctx->userData);
@@ -538,18 +427,11 @@ static ksbonjson_decodeStatus beginObject(DecodeContext* const ctx)
         return KSBONJSON_DECODE_CONTAINER_DEPTH_EXCEEDED;
     }
 
-    // Read first chunk header (count = number of key-value pairs)
-    uint64_t count;
-    bool moreChunks;
-    PROPAGATE_ERROR(ctx, readChunkHeader(ctx, &count, &moreChunks));
-
     ctx->containerDepth++;
     ctx->containers[ctx->containerDepth] = (ContainerState)
                                             {
                                                 .isObject = true,
                                                 .isExpectingName = true,
-                                                .remainingInChunk = count,
-                                                .moreChunksFollow = moreChunks,
                                             };
 
     return ctx->callbacks->onBeginObject(ctx->userData);
@@ -571,47 +453,15 @@ static ksbonjson_decodeStatus endContainer(DecodeContext* const ctx)
     return ctx->callbacks->onEndContainer(ctx->userData);
 }
 
-// Check if container needs more elements, read next chunk if needed, or end container if done
-static ksbonjson_decodeStatus checkContainerState(DecodeContext* const ctx)
-{
-    if (ctx->containerDepth <= 0)
-    {
-        return KSBONJSON_DECODE_OK;
-    }
-
-    ContainerState* const container = &ctx->containers[ctx->containerDepth];
-
-    // Check if we've finished all elements in the current chunk
-    while (container->remainingInChunk == 0)
-    {
-        if (container->moreChunksFollow)
-        {
-            // Read next chunk header
-            uint64_t count;
-            bool moreChunks;
-            PROPAGATE_ERROR(ctx, readChunkHeader(ctx, &count, &moreChunks));
-            container->remainingInChunk = count;
-            container->moreChunksFollow = moreChunks;
-        }
-        else
-        {
-            // No more chunks - container is complete
-            return endContainer(ctx);
-        }
-    }
-
-    return KSBONJSON_DECODE_OK;
-}
-
 static ksbonjson_decodeStatus decodeObjectName(DecodeContext* const ctx, const uint8_t typeCode)
 {
-    // Short string: 0xe0-0xef (mask-based detection)
+    // Short string: 0xD0-0xDF (mask-based detection)
     if ((typeCode & TYPE_MASK_SHORT_STRING) == TYPE_SHORT_STRING_BASE)
     {
         return decodeAndReportShortString(ctx, typeCode);
     }
-    // Long string: 0xf0
-    if (typeCode == TYPE_STRING)
+    // Long string: 0xFF
+    if (typeCode == TYPE_STRING_LONG)
     {
         return decodeAndReportLongString(ctx);
     }
@@ -620,39 +470,37 @@ static ksbonjson_decodeStatus decodeObjectName(DecodeContext* const ctx, const u
 
 static ksbonjson_decodeStatus decodeValue(DecodeContext* const ctx, const uint8_t typeCode)
 {
-    // Small integers: 0x00-0xc8 (most common case)
+    // Small integers: 0x00-0xC8 (most common case)
     if (typeCode <= TYPE_SMALLINT_MAX)
     {
         return ctx->callbacks->onSignedInteger((int64_t)typeCode - SMALLINT_BIAS, ctx->userData);
     }
 
-    // Short strings: 0xe0-0xef (mask-based detection)
+    // Short strings: 0xD0-0xDF (mask-based detection)
     if ((typeCode & TYPE_MASK_SHORT_STRING) == TYPE_SHORT_STRING_BASE)
     {
         return decodeAndReportShortString(ctx, typeCode);
     }
 
-    // Unsigned integers: 0xd0-0xd7 (mask-based detection)
-    if ((typeCode & TYPE_MASK_INT) == TYPE_UINT_BASE)
+    // Unsigned integers: 0xE0-0xE3 (mask-based detection)
+    if ((typeCode & TYPE_MASK_UINT) == TYPE_UINT_BASE)
     {
         return decodeAndReportUnsignedInteger(ctx, typeCode);
     }
 
-    // Signed integers: 0xd8-0xdf (mask-based detection)
-    if ((typeCode & TYPE_MASK_INT) == TYPE_SINT_BASE)
+    // Signed integers: 0xE4-0xE7 (mask-based detection)
+    if ((typeCode & TYPE_MASK_SINT) == TYPE_SINT_BASE)
     {
         return decodeAndReportSignedInteger(ctx, typeCode);
     }
 
-    // Remaining types: 0xf0-0xf9 (individual checks)
+    // Remaining types (individual checks)
     switch (typeCode)
     {
-        case TYPE_STRING:
+        case TYPE_STRING_LONG:
             return decodeAndReportLongString(ctx);
         case TYPE_BIG_NUMBER:
             return decodeAndReportBigNumber(ctx);
-        case TYPE_FLOAT16:
-            return decodeAndReportFloat16(ctx);
         case TYPE_FLOAT32:
             return decodeAndReportFloat32(ctx);
         case TYPE_FLOAT64:
@@ -667,8 +515,9 @@ static ksbonjson_decodeStatus decodeValue(DecodeContext* const ctx, const uint8_
             return beginArray(ctx);
         case TYPE_OBJECT:
             return beginObject(ctx);
+        case TYPE_END:
+            return endContainer(ctx);
         default:
-            // Reserved type codes: 0xc9-0xcf, 0xfa-0xff
             return KSBONJSON_DECODE_INVALID_DATA;
     }
 }
@@ -680,46 +529,45 @@ static ksbonjson_decodeStatus decodeDocument(DecodeContext* const ctx)
         decodeValue, decodeObjectName,
     };
 
-    while(ctx->bufferCurrent < ctx->bufferEnd || ctx->containerDepth > 0)
+    while(ctx->bufferCurrent < ctx->bufferEnd)
     {
-        // Check if current container is done (may read new chunk or end container)
-        PROPAGATE_ERROR(ctx, checkContainerState(ctx));
+        const uint8_t typeCode = *ctx->bufferCurrent++;
 
-        // If no more containers and no more data, we're done
-        if (ctx->containerDepth <= 0 && ctx->bufferCurrent >= ctx->bufferEnd)
+        // Handle container end marker
+        if (typeCode == TYPE_END)
         {
-            break;
+            PROPAGATE_ERROR(ctx, endContainer(ctx));
+
+            // Update parent container state after ending child container
+            if (ctx->containerDepth > 0)
+            {
+                ContainerState* const parentContainer = &ctx->containers[ctx->containerDepth];
+                if (parentContainer->isObject)
+                {
+                    parentContainer->isExpectingName = !parentContainer->isExpectingName;
+                }
+            }
+            continue;
         }
 
-        SHOULD_HAVE_ROOM_FOR_BYTES(1);
         ContainerState* const container = &ctx->containers[ctx->containerDepth];
-        const uint8_t typeCode = *ctx->bufferCurrent++;
-        PROPAGATE_ERROR(ctx, decodeFuncs[container->isObject & container->isExpectingName](ctx, typeCode));
+
+        if (container->isObject && container->isExpectingName)
+        {
+            PROPAGATE_ERROR(ctx, decodeObjectName(ctx, typeCode));
+        }
+        else
+        {
+            PROPAGATE_ERROR(ctx, decodeValue(ctx, typeCode));
+        }
 
         // Update container state
         if (ctx->containerDepth > 0)
         {
             ContainerState* const updatedContainer = &ctx->containers[ctx->containerDepth];
-            updatedContainer->isExpectingName = !updatedContainer->isExpectingName;
-
-            // Decrement remaining count:
-            // - For arrays: decrement after each element
-            // - For objects: decrement after each complete pair (when expecting name again)
-            if (!updatedContainer->isObject)
+            if (updatedContainer->isObject)
             {
-                // Array: decrement after each element
-                if (updatedContainer->remainingInChunk > 0)
-                {
-                    updatedContainer->remainingInChunk--;
-                }
-            }
-            else if (updatedContainer->isExpectingName)
-            {
-                // Object: just finished a value, so pair is complete
-                if (updatedContainer->remainingInChunk > 0)
-                {
-                    updatedContainer->remainingInChunk--;
-                }
+                updatedContainer->isExpectingName = !updatedContainer->isExpectingName;
             }
         }
     }
@@ -791,8 +639,6 @@ const char* ksbonjson_describeDecodeStatus(const ksbonjson_decodeStatus status)
             return "Object has more keys than the duplicate detection limit (256)";
         case KSBONJSON_DECODE_TRAILING_BYTES:
             return "Document has trailing bytes after the root value";
-        case KSBONJSON_DECODE_NON_CANONICAL_LENGTH:
-            return "Length field uses non-canonical encoding (more bytes than necessary)";
         case KSBONJSON_DECODE_MAX_DEPTH_EXCEEDED:
             return "Maximum container depth exceeded";
         case KSBONJSON_DECODE_MAX_STRING_LENGTH_EXCEEDED:
@@ -801,10 +647,6 @@ const char* ksbonjson_describeDecodeStatus(const ksbonjson_decodeStatus status)
             return "Maximum container size exceeded";
         case KSBONJSON_DECODE_MAX_DOCUMENT_SIZE_EXCEEDED:
             return "Maximum document size exceeded";
-        case KSBONJSON_DECODE_MAX_CHUNKS_EXCEEDED:
-            return "Maximum number of string chunks exceeded";
-        case KSBONJSON_DECODE_EMPTY_CHUNK_CONTINUATION:
-            return "Empty chunk with continuation bit set is invalid";
         default:
             return "(unknown status - was it a user-defined status code?)";
     }
@@ -833,62 +675,7 @@ static inline size_t mapAddEntry(KSBONJSONMapContext* ctx, KSBONJSONMapEntry ent
     return index;
 }
 
-// Maximum payload that fits in N bytes: (1 << (7*N)) - 1
-// Precomputed for common sizes to avoid overflow
-static const uint64_t maxPayloadForBytes[] = {
-    0,                     // 0 bytes: not applicable
-    0x7FULL,              // 1 byte: 127
-    0x3FFFULL,            // 2 bytes: 16383
-    0x1FFFFFULL,          // 3 bytes: 2097151
-    0x0FFFFFFFULL,        // 4 bytes: 268435455
-    0x07FFFFFFFFULL,      // 5 bytes
-    0x03FFFFFFFFFFULL,    // 6 bytes
-    0x01FFFFFFFFFFFFULL,  // 7 bytes
-    0x00FFFFFFFFFFFFFFULL // 8 bytes
-};
-
-// Decode a length payload for the position map
-static ksbonjson_decodeStatus mapDecodeLengthPayload(KSBONJSONMapContext* ctx, uint64_t* payloadBuffer)
-{
-    MAP_SHOULD_HAVE_ROOM_FOR_BYTES(1);
-    const uint8_t header = ctx->input[ctx->position];
-
-    unlikely_if(header == 0xff)
-    {
-        ctx->position++;
-        MAP_SHOULD_HAVE_ROOM_FOR_BYTES(8);
-        union number_bits bits;
-        memcpy(bits.b, ctx->input + ctx->position, 8);
-        ctx->position += 8;
-        uint64_t payload = fromLittleEndian(bits.u64);
-        *payloadBuffer = payload;
-
-        // Check for non-canonical: 9-byte encoding only if payload > max for 8 bytes
-        unlikely_if(ctx->flags.rejectNonCanonicalLengths && payload <= maxPayloadForBytes[8])
-        {
-            return KSBONJSON_DECODE_NON_CANONICAL_LENGTH;
-        }
-        return KSBONJSON_DECODE_OK;
-    }
-
-    const size_t count = decodeLengthFieldTotalByteCount(header);
-    MAP_SHOULD_HAVE_ROOM_FOR_BYTES(count);
-    union number_bits bits = {0};
-    memcpy(bits.b, ctx->input + ctx->position, count);
-    ctx->position += count;
-    uint64_t payload = fromLittleEndian(bits.u64 >> count);
-    *payloadBuffer = payload;
-
-    // Check for non-canonical length: could the payload fit in fewer bytes?
-    unlikely_if(ctx->flags.rejectNonCanonicalLengths && count > 1 && payload <= maxPayloadForBytes[count - 1])
-    {
-        return KSBONJSON_DECODE_NON_CANONICAL_LENGTH;
-    }
-
-    return KSBONJSON_DECODE_OK;
-}
-
-// Decode unsigned int for position map (similar to existing but uses map context)
+// Decode unsigned int for position map
 static uint64_t mapDecodeUnsignedInt(KSBONJSONMapContext* ctx, size_t byteCount)
 {
     union number_bits bits = {.u64 = 0};
@@ -900,22 +687,11 @@ static uint64_t mapDecodeUnsignedInt(KSBONJSONMapContext* ctx, size_t byteCount)
 // Decode signed int for position map
 static int64_t mapDecodeSignedInt(KSBONJSONMapContext* ctx, size_t byteCount)
 {
-    int64_t initValue = fillWithBit7(ctx->input[ctx->position + byteCount - 1]);
-    union number_bits bits = {.u64 = (uint64_t)initValue};
+    int8_t signFill = (int8_t)ctx->input[ctx->position + byteCount - 1] >> 7;
+    union number_bits bits = {.u64 = (uint64_t)(int64_t)signFill};
     memcpy(bits.b, ctx->input + ctx->position, byteCount);
     ctx->position += byteCount;
     return (int64_t)fromLittleEndian(bits.u64);
-}
-
-// Decode float16 for position map
-static double mapDecodeFloat16(KSBONJSONMapContext* ctx)
-{
-    union number_bits bits = {.u64 = 0};
-    memcpy(bits.b, ctx->input + ctx->position, 2);
-    ctx->position += 2;
-    bits.u64 = fromLittleEndian(bits.u64);
-    bits.u32 <<= 16;
-    return (double)bits.f32;
 }
 
 // Decode float32 for position map
@@ -945,7 +721,7 @@ static ksbonjson_decodeStatus mapScanShortString(KSBONJSONMapContext* ctx, uint8
 {
     MAP_SHOULD_HAVE_ENTRY_SPACE();
 
-    // Short string length is in the lower nibble (0xe0-0xef -> length 0-15)
+    // Short string length is in the lower nibble (0xD0-0xDF -> length 0-15)
     size_t length = (size_t)(typeCode & 0x0f);
     size_t offset = ctx->position;
 
@@ -983,107 +759,52 @@ static ksbonjson_decodeStatus mapScanShortString(KSBONJSONMapContext* ctx, uint8
     return KSBONJSON_DECODE_OK;
 }
 
-// Flag bit to indicate a chunked string that needs re-assembly
-// This is set in the high bit of the offset field
-#define CHUNKED_STRING_FLAG 0x80000000u
-
-// Scan a long string (length in payload)
+// Scan a long string (0xFF terminated)
 static ksbonjson_decodeStatus mapScanLongString(KSBONJSONMapContext* ctx, size_t* outIndex)
 {
     MAP_SHOULD_HAVE_ENTRY_SPACE();
 
-    // Store position before first length payload for potential re-assembly
     size_t startOffset = ctx->position;
-    size_t firstDataOffset = 0;
-    size_t totalLength = 0;
-    bool isChunked = false;
-    bool firstChunk = true;
-    size_t chunkCount = 0;
 
-    bool moreChunksFollow = true;
-    while (moreChunksFollow)
+    // Scan for 0xFF terminator
+    while (ctx->position < ctx->inputLength && ctx->input[ctx->position] != TYPE_STRING_LONG)
     {
-        chunkCount++;
+        ctx->position++;
+    }
+    unlikely_if(ctx->position >= ctx->inputLength)
+    {
+        return KSBONJSON_DECODE_INCOMPLETE;
+    }
 
-        // Check max chunks (SIZE_MAX means use spec default)
-        size_t maxChunks = ctx->flags.maxChunks < SIZE_MAX ? ctx->flags.maxChunks : KSBONJSON_DEFAULT_MAX_CHUNKS;
-        unlikely_if(chunkCount > maxChunks)
+    size_t length = ctx->position - startOffset;
+    ctx->position++; // skip terminator
+
+    // Check max string length (SIZE_MAX means use spec default)
+    size_t maxStrLen = ctx->flags.maxStringLength < SIZE_MAX ? ctx->flags.maxStringLength : KSBONJSON_DEFAULT_MAX_STRING_LENGTH;
+    unlikely_if(length > maxStrLen)
+    {
+        return KSBONJSON_DECODE_MAX_STRING_LENGTH_EXCEEDED;
+    }
+
+    // Validate string
+    if (ctx->flags.rejectInvalidUTF8 || ctx->flags.rejectNUL)
+    {
+        ksbonjson_decodeStatus status = validateString(ctx->input + startOffset, length,
+                                                        ctx->flags.rejectNUL,
+                                                        ctx->flags.rejectInvalidUTF8);
+        unlikely_if(status != KSBONJSON_DECODE_OK)
         {
-            return KSBONJSON_DECODE_MAX_CHUNKS_EXCEEDED;
-        }
-
-        uint64_t lengthPayload;
-        ksbonjson_decodeStatus status = mapDecodeLengthPayload(ctx, &lengthPayload);
-        unlikely_if(status != KSBONJSON_DECODE_OK) return status;
-
-        uint64_t chunkLength = lengthPayload >> 1;
-        moreChunksFollow = (bool)(lengthPayload & 1);
-
-        if (firstChunk)
-        {
-            firstDataOffset = ctx->position;
-            firstChunk = false;
-            if (moreChunksFollow)
-            {
-                isChunked = true;
-            }
-        }
-
-        MAP_SHOULD_HAVE_ROOM_FOR_BYTES(chunkLength);
-
-        // NUL checking can be done per-chunk (NUL is always invalid)
-        // UTF-8 validation must wait for the final assembled string
-        if (ctx->flags.rejectNUL)
-        {
-            status = validateString(ctx->input + ctx->position, (size_t)chunkLength,
-                                    true, false);
-            unlikely_if(status != KSBONJSON_DECODE_OK)
-            {
-                return status;
-            }
-        }
-
-        totalLength += (size_t)chunkLength;
-        ctx->position += (size_t)chunkLength;
-
-        // Check max string length after accumulating total length (SIZE_MAX means use spec default)
-        size_t maxStrLen2 = ctx->flags.maxStringLength < SIZE_MAX ? ctx->flags.maxStringLength : KSBONJSON_DEFAULT_MAX_STRING_LENGTH;
-        unlikely_if(totalLength > maxStrLen2)
-        {
-            return KSBONJSON_DECODE_MAX_STRING_LENGTH_EXCEEDED;
+            return status;
         }
     }
 
-    KSBONJSONMapEntry entry;
-    entry.type = KSBONJSON_TYPE_STRING;
-
-    if (isChunked)
-    {
-        // For chunked strings, store the start offset (before first length payload)
-        // with the CHUNKED_STRING_FLAG set, and the raw byte count including all
-        // length fields. Swift will re-parse this to assemble the string.
-        // NOTE: UTF-8 validation for chunked strings must be done by Swift after
-        // assembly, since individual chunks may not contain complete UTF-8 sequences.
-        size_t rawByteCount = ctx->position - startOffset;
-        entry.data.string.offset = (uint32_t)(startOffset | CHUNKED_STRING_FLAG);
-        entry.data.string.length = (uint32_t)rawByteCount;
-    }
-    else
-    {
-        // Single chunk - validate UTF-8 here since string is complete
-        if (ctx->flags.rejectInvalidUTF8)
-        {
-            ksbonjson_decodeStatus status = validateString(ctx->input + firstDataOffset, totalLength,
-                                                           false, true);
-            unlikely_if(status != KSBONJSON_DECODE_OK)
-            {
-                return status;
-            }
+    KSBONJSONMapEntry entry = {
+        .type = KSBONJSON_TYPE_STRING,
+        .data.string = {
+            .offset = (uint32_t)startOffset,
+            .length = (uint32_t)length
         }
-        entry.data.string.offset = (uint32_t)firstDataOffset;
-        entry.data.string.length = (uint32_t)totalLength;
-    }
-
+    };
     *outIndex = mapAddEntry(ctx, entry);
     return KSBONJSON_DECODE_OK;
 }
@@ -1093,8 +814,7 @@ static ksbonjson_decodeStatus mapScanUnsignedInt(KSBONJSONMapContext* ctx, uint8
 {
     MAP_SHOULD_HAVE_ENTRY_SPACE();
 
-    // Byte count is in lower 3 bits + 1 (0xd0-0xd7 -> 1-8 bytes)
-    size_t byteCount = (size_t)(typeCode & 0x07) + 1;
+    size_t byteCount = intByteCounts[typeCode & 0x03];
     MAP_SHOULD_HAVE_ROOM_FOR_BYTES(byteCount);
 
     uint64_t value = mapDecodeUnsignedInt(ctx, byteCount);
@@ -1112,8 +832,7 @@ static ksbonjson_decodeStatus mapScanSignedInt(KSBONJSONMapContext* ctx, uint8_t
 {
     MAP_SHOULD_HAVE_ENTRY_SPACE();
 
-    // Byte count is in lower 3 bits + 1 (0xd8-0xdf -> 1-8 bytes)
-    size_t byteCount = (size_t)(typeCode & 0x07) + 1;
+    size_t byteCount = intByteCounts[typeCode & 0x03];
     MAP_SHOULD_HAVE_ROOM_FOR_BYTES(byteCount);
 
     int64_t value = mapDecodeSignedInt(ctx, byteCount);
@@ -1121,22 +840,6 @@ static ksbonjson_decodeStatus mapScanSignedInt(KSBONJSONMapContext* ctx, uint8_t
     KSBONJSONMapEntry entry = {
         .type = KSBONJSON_TYPE_INT,
         .data.intValue = value
-    };
-    *outIndex = mapAddEntry(ctx, entry);
-    return KSBONJSON_DECODE_OK;
-}
-
-// Scan a float16
-static ksbonjson_decodeStatus mapScanFloat16(KSBONJSONMapContext* ctx, size_t* outIndex)
-{
-    MAP_SHOULD_HAVE_ENTRY_SPACE();
-    MAP_SHOULD_HAVE_ROOM_FOR_BYTES(2);
-
-    double value = mapDecodeFloat16(ctx);
-
-    KSBONJSONMapEntry entry = {
-        .type = KSBONJSON_TYPE_FLOAT,
-        .data.floatValue = value
     };
     *outIndex = mapAddEntry(ctx, entry);
     return KSBONJSON_DECODE_OK;
@@ -1174,55 +877,47 @@ static ksbonjson_decodeStatus mapScanFloat64(KSBONJSONMapContext* ctx, size_t* o
     return KSBONJSON_DECODE_OK;
 }
 
-// Scan a big number
+// Scan a big number (zigzag LEB128 exponent + zigzag LEB128 signed significand)
 static ksbonjson_decodeStatus mapScanBigNumber(KSBONJSONMapContext* ctx, size_t* outIndex)
 {
     MAP_SHOULD_HAVE_ENTRY_SPACE();
-    MAP_SHOULD_HAVE_ROOM_FOR_BYTES(1);
 
-    const uint8_t header = ctx->input[ctx->position++];
+    size_t available = ctx->inputLength - ctx->position;
 
-    const int sign = fillWithBit0(header);
-    const size_t exponentLength = (header >> 1) & 3;
-    const size_t significandLength = header >> 3;
-
-    unlikely_if(significandLength > 8)
+    int64_t exponent;
+    size_t bytesRead = ksbonjson_readZigzagLEB128(ctx->input + ctx->position, available, &exponent);
+    unlikely_if(bytesRead == 0)
     {
-        return KSBONJSON_DECODE_VALUE_OUT_OF_RANGE;
+        return KSBONJSON_DECODE_INCOMPLETE;
     }
+    ctx->position += bytesRead;
+    available -= bytesRead;
 
-    // Special BigNumber encodings (NaN/Infinity): significandLength == 0 with non-zero exponentLength
-    // exponentLength encodes the special value type: 1=Infinity (sign determines +/-), 3=NaN
-    const uint8_t specialType = (significandLength == 0 && exponentLength != 0) ? (uint8_t)exponentLength : 0;
-    unlikely_if(specialType != 0 && ctx->flags.rejectNaNInfinity)
+    int64_t signedSignificand;
+    bytesRead = ksbonjson_readZigzagLEB128(ctx->input + ctx->position, available, &signedSignificand);
+    unlikely_if(bytesRead == 0)
     {
-        return KSBONJSON_DECODE_INVALID_DATA;
+        return KSBONJSON_DECODE_INCOMPLETE;
     }
+    ctx->position += bytesRead;
 
-    int32_t exponent = 0;
-    uint64_t significand = 0;
-
-    if (significandLength > 0)
-    {
-        MAP_SHOULD_HAVE_ROOM_FOR_BYTES(exponentLength + significandLength);
-        exponent = (int32_t)mapDecodeSignedInt(ctx, exponentLength);
-        significand = mapDecodeUnsignedInt(ctx, significandLength);
-    }
+    // Extract sign and absolute significand
+    int32_t sign = signedSignificand < 0 ? -1 : 0;
+    uint64_t significand = signedSignificand < 0 ? (uint64_t)(-signedSignificand) : (uint64_t)signedSignificand;
 
     KSBONJSONMapEntry entry = {
         .type = KSBONJSON_TYPE_BIGNUMBER,
         .data.bigNumber = {
             .significand = significand,
-            .exponent = exponent,
-            .sign = sign,
-            .specialType = specialType
+            .exponent = (int32_t)exponent,
+            .sign = sign
         }
     };
     *outIndex = mapAddEntry(ctx, entry);
     return KSBONJSON_DECODE_OK;
 }
 
-// Scan an array container (chunked format)
+// Scan an array container (delimiter-terminated)
 static ksbonjson_decodeStatus mapScanArray(KSBONJSONMapContext* ctx, size_t* outIndex)
 {
     MAP_SHOULD_HAVE_ENTRY_SPACE();
@@ -1251,36 +946,24 @@ static ksbonjson_decodeStatus mapScanArray(KSBONJSONMapContext* ctx, size_t* out
     uint32_t totalCount = 0;
     size_t maxContSize = ctx->flags.maxContainerSize < SIZE_MAX ? ctx->flags.maxContainerSize : KSBONJSON_DEFAULT_MAX_CONTAINER_SIZE;
 
-    // Read chunks until continuation bit is 0
-    bool moreChunks = true;
-    while (moreChunks)
+    // Read values until TYPE_END encountered
+    while (true)
     {
-        // Read chunk header (length field with count and continuation bit)
-        uint64_t payload;
-        ksbonjson_decodeStatus status = mapDecodeLengthPayload(ctx, &payload);
-        unlikely_if(status != KSBONJSON_DECODE_OK) return status;
-
-        uint64_t chunkCount = payload >> 1;
-        moreChunks = (payload & 1) != 0;
-
-        // Empty chunk with continuation is invalid (DOS protection)
-        unlikely_if(chunkCount == 0 && moreChunks)
+        MAP_SHOULD_HAVE_ROOM_FOR_BYTES(1);
+        if (ctx->input[ctx->position] == TYPE_END)
         {
-            return KSBONJSON_DECODE_EMPTY_CHUNK_CONTINUATION;
+            ctx->position++; // consume end marker
+            break;
         }
 
-        // Read 'chunkCount' elements from this chunk
-        for (uint64_t i = 0; i < chunkCount; i++)
-        {
-            size_t childIndex;
-            status = mapScanValue(ctx, &childIndex);
-            unlikely_if(status != KSBONJSON_DECODE_OK) return status;
-            totalCount++;
+        size_t childIndex;
+        ksbonjson_decodeStatus status = mapScanValue(ctx, &childIndex);
+        unlikely_if(status != KSBONJSON_DECODE_OK) return status;
+        totalCount++;
 
-            unlikely_if(totalCount > maxContSize)
-            {
-                return KSBONJSON_DECODE_MAX_CONTAINER_SIZE_EXCEEDED;
-            }
+        unlikely_if(totalCount > maxContSize)
+        {
+            return KSBONJSON_DECODE_MAX_CONTAINER_SIZE_EXCEEDED;
         }
     }
 
@@ -1301,13 +984,13 @@ static ksbonjson_decodeStatus mapScanObjectName(KSBONJSONMapContext* ctx, size_t
     MAP_SHOULD_HAVE_ROOM_FOR_BYTES(1);
     uint8_t typeCode = ctx->input[ctx->position++];
 
-    // Short string: 0xe0-0xef (mask-based detection)
+    // Short string: 0xD0-0xDF (mask-based detection)
     if ((typeCode & TYPE_MASK_SHORT_STRING) == TYPE_SHORT_STRING_BASE)
     {
         return mapScanShortString(ctx, typeCode, outIndex);
     }
-    // Long string: 0xf0
-    if (typeCode == TYPE_STRING)
+    // Long string: 0xFF
+    if (typeCode == TYPE_STRING_LONG)
     {
         return mapScanLongString(ctx, outIndex);
     }
@@ -1338,7 +1021,7 @@ static inline bool stringsEqual(
 // Objects with more keys than this will cause an error if duplicate detection is enabled.
 #define MAX_TRACKED_KEYS 256
 
-// Scan an object container
+// Scan an object container (delimiter-terminated)
 static ksbonjson_decodeStatus mapScanObject(KSBONJSONMapContext* ctx, size_t* outIndex)
 {
     MAP_SHOULD_HAVE_ENTRY_SPACE();
@@ -1372,67 +1055,54 @@ static ksbonjson_decodeStatus mapScanObject(KSBONJSONMapContext* ctx, size_t* ou
     size_t keyIndices[MAX_TRACKED_KEYS];
     size_t keyCount = 0;
 
-    // Read chunks until continuation bit is 0
-    // Note: chunk count for objects is the number of key-value PAIRS
-    bool moreChunks = true;
-    while (moreChunks)
+    // Read key-value pairs until TYPE_END encountered
+    while (true)
     {
-        // Read chunk header (length field with count and continuation bit)
-        uint64_t payload;
-        ksbonjson_decodeStatus status = mapDecodeLengthPayload(ctx, &payload);
-        unlikely_if(status != KSBONJSON_DECODE_OK) return status;
-
-        uint64_t pairCount = payload >> 1;  // Number of key-value pairs in this chunk
-        moreChunks = (payload & 1) != 0;
-
-        // Empty chunk with continuation is invalid (DOS protection)
-        unlikely_if(pairCount == 0 && moreChunks)
+        MAP_SHOULD_HAVE_ROOM_FOR_BYTES(1);
+        if (ctx->input[ctx->position] == TYPE_END)
         {
-            return KSBONJSON_DECODE_EMPTY_CHUNK_CONTINUATION;
+            ctx->position++; // consume end marker
+            break;
         }
 
-        // Read 'pairCount' key-value pairs from this chunk
-        for (uint64_t i = 0; i < pairCount; i++)
+        // Scan key (must be string)
+        size_t keyIndex;
+        ksbonjson_decodeStatus status = mapScanObjectName(ctx, &keyIndex);
+        unlikely_if(status != KSBONJSON_DECODE_OK) return status;
+
+        // Check for duplicate keys if required
+        if (checkDuplicates)
         {
-            // Scan key (must be string)
-            size_t keyIndex;
-            status = mapScanObjectName(ctx, &keyIndex);
-            unlikely_if(status != KSBONJSON_DECODE_OK) return status;
-
-            // Check for duplicate keys if required
-            if (checkDuplicates)
+            // Error if object has more keys than we can track
+            unlikely_if(keyCount >= MAX_TRACKED_KEYS)
             {
-                // Error if object has more keys than we can track
-                unlikely_if(keyCount >= MAX_TRACKED_KEYS)
-                {
-                    return KSBONJSON_DECODE_TOO_MANY_KEYS;
-                }
-
-                const KSBONJSONMapEntry* newKey = &ctx->entries[keyIndex];
-                // Check against all previous keys in this object
-                for (size_t j = 0; j < keyCount; j++)
-                {
-                    const KSBONJSONMapEntry* existingKey = &ctx->entries[keyIndices[j]];
-                    unlikely_if(stringsEqual(ctx, newKey, existingKey))
-                    {
-                        return KSBONJSON_DECODE_DUPLICATE_OBJECT_NAME;
-                    }
-                }
-                keyIndices[keyCount++] = keyIndex;
+                return KSBONJSON_DECODE_TOO_MANY_KEYS;
             }
 
-            // Scan value
-            size_t valueIndex;
-            status = mapScanValue(ctx, &valueIndex);
-            unlikely_if(status != KSBONJSON_DECODE_OK) return status;
-
-            entryCount += 2; // key + value
-
-            // Check max container size (entryCount/2 = number of key-value pairs)
-            unlikely_if((entryCount / 2) > maxContSize)
+            const KSBONJSONMapEntry* newKey = &ctx->entries[keyIndex];
+            // Check against all previous keys in this object
+            for (size_t j = 0; j < keyCount; j++)
             {
-                return KSBONJSON_DECODE_MAX_CONTAINER_SIZE_EXCEEDED;
+                const KSBONJSONMapEntry* existingKey = &ctx->entries[keyIndices[j]];
+                unlikely_if(stringsEqual(ctx, newKey, existingKey))
+                {
+                    return KSBONJSON_DECODE_DUPLICATE_OBJECT_NAME;
+                }
             }
+            keyIndices[keyCount++] = keyIndex;
+        }
+
+        // Scan value
+        size_t valueIndex;
+        status = mapScanValue(ctx, &valueIndex);
+        unlikely_if(status != KSBONJSON_DECODE_OK) return status;
+
+        entryCount += 2; // key + value
+
+        // Check max container size (entryCount/2 = number of key-value pairs)
+        unlikely_if((entryCount / 2) > maxContSize)
+        {
+            return KSBONJSON_DECODE_MAX_CONTAINER_SIZE_EXCEEDED;
         }
     }
 
@@ -1453,7 +1123,7 @@ static ksbonjson_decodeStatus mapScanValue(KSBONJSONMapContext* ctx, size_t* out
     MAP_SHOULD_HAVE_ROOM_FOR_BYTES(1);
     uint8_t typeCode = ctx->input[ctx->position++];
 
-    // Small integers: 0x00-0xc8 (most common case)
+    // Small integers: 0x00-0xC8 (most common case)
     if (typeCode <= TYPE_SMALLINT_MAX)
     {
         MAP_SHOULD_HAVE_ENTRY_SPACE();
@@ -1465,33 +1135,31 @@ static ksbonjson_decodeStatus mapScanValue(KSBONJSONMapContext* ctx, size_t* out
         return KSBONJSON_DECODE_OK;
     }
 
-    // Short strings: 0xe0-0xef (mask-based detection)
+    // Short strings: 0xD0-0xDF (mask-based detection)
     if ((typeCode & TYPE_MASK_SHORT_STRING) == TYPE_SHORT_STRING_BASE)
     {
         return mapScanShortString(ctx, typeCode, outIndex);
     }
 
-    // Unsigned integers: 0xd0-0xd7 (mask-based detection)
-    if ((typeCode & TYPE_MASK_INT) == TYPE_UINT_BASE)
+    // Unsigned integers: 0xE0-0xE3 (mask-based detection)
+    if ((typeCode & TYPE_MASK_UINT) == TYPE_UINT_BASE)
     {
         return mapScanUnsignedInt(ctx, typeCode, outIndex);
     }
 
-    // Signed integers: 0xd8-0xdf (mask-based detection)
-    if ((typeCode & TYPE_MASK_INT) == TYPE_SINT_BASE)
+    // Signed integers: 0xE4-0xE7 (mask-based detection)
+    if ((typeCode & TYPE_MASK_SINT) == TYPE_SINT_BASE)
     {
         return mapScanSignedInt(ctx, typeCode, outIndex);
     }
 
-    // Remaining types: 0xf0-0xf9 (individual checks)
+    // Remaining types (individual checks)
     switch (typeCode)
     {
-        case TYPE_STRING:
+        case TYPE_STRING_LONG:
             return mapScanLongString(ctx, outIndex);
         case TYPE_BIG_NUMBER:
             return mapScanBigNumber(ctx, outIndex);
-        case TYPE_FLOAT16:
-            return mapScanFloat16(ctx, outIndex);
         case TYPE_FLOAT32:
             return mapScanFloat32(ctx, outIndex);
         case TYPE_FLOAT64:
@@ -1522,7 +1190,6 @@ static ksbonjson_decodeStatus mapScanValue(KSBONJSONMapContext* ctx, size_t* out
         case TYPE_OBJECT:
             return mapScanObject(ctx, outIndex);
         default:
-            // Reserved type codes: 0xc9-0xcf, 0xfa-0xff
             return KSBONJSON_DECODE_INVALID_DATA;
     }
 }

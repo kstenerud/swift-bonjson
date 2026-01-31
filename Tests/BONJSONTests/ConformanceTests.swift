@@ -158,7 +158,6 @@ struct TestOptions: Decodable {
     let maxDepth: Int?
     let maxContainerSize: Int?
     let maxStringLength: Int?
-    let maxChunks: Int?
     let maxDocumentSize: Int?
     // New string-based options per spec
     let nanInfinityBehavior: String?  // "allow", "stringify"
@@ -175,7 +174,6 @@ struct TestOptions: Decodable {
         case maxDepth = "max_depth"
         case maxContainerSize = "max_container_size"
         case maxStringLength = "max_string_length"
-        case maxChunks = "max_chunks"
         case maxDocumentSize = "max_document_size"
         case nanInfinityBehavior = "nan_infinity_behavior"
         case duplicateKey = "duplicate_key"
@@ -190,7 +188,6 @@ struct TestOptions: Decodable {
         maxDepth = try container.decodeIfPresent(Int.self, forKey: .maxDepth)
         maxContainerSize = try container.decodeIfPresent(Int.self, forKey: .maxContainerSize)
         maxStringLength = try container.decodeIfPresent(Int.self, forKey: .maxStringLength)
-        maxChunks = try container.decodeIfPresent(Int.self, forKey: .maxChunks)
         maxDocumentSize = try container.decodeIfPresent(Int.self, forKey: .maxDocumentSize)
         nanInfinityBehavior = try container.decodeIfPresent(String.self, forKey: .nanInfinityBehavior)
         duplicateKey = try container.decodeIfPresent(String.self, forKey: .duplicateKey)
@@ -1181,7 +1178,6 @@ final class ConformanceTests: XCTestCase {
         if let maxStringLength = options.maxStringLength {
             encoder.maxStringLength = maxStringLength
         }
-        // Note: maxChunks is decode-only
         if let maxDocumentSize = options.maxDocumentSize {
             encoder.maxDocumentSize = maxDocumentSize
         }
@@ -1211,9 +1207,6 @@ final class ConformanceTests: XCTestCase {
         }
         if let maxStringLength = options.maxStringLength {
             decoder.maxStringLength = maxStringLength
-        }
-        if let maxChunks = options.maxChunks {
-            decoder.maxChunks = maxChunks
         }
         if let maxDocumentSize = options.maxDocumentSize {
             decoder.maxDocumentSize = maxDocumentSize

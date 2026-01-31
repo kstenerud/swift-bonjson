@@ -41,7 +41,7 @@ This library uses two different approaches optimized for their respective tasks:
 3. Value's `Encodable.encode(to:)` calls container methods
 4. Container methods call C buffer functions (`ksbonjson_encodeToBuffer_*`)
 5. Swift checks capacity before each write, grows buffer if needed via `ksbonjson_encodeToBuffer_setBuffer`
-6. Container finalization is deferred until next sibling or parent completion
+6. Container end markers (0xFE) are written when containers are closed
 
 ### Decoding Flow
 
@@ -68,82 +68,67 @@ The C `KSBONJSONMapEntry` stores decoded values inline:
 ## Type Codes
 
 Key type code ranges (defined in `KSBONJSONCommon.h`):
-- `0x00-0xc8`: Small integers (-100 to 100), value = type_code - 100
-- `0xc9-0xcf`: Reserved
-- `0xd0-0xd7`: Unsigned integers (1-8 bytes)
-- `0xd8-0xdf`: Signed integers (1-8 bytes)
-- `0xe0-0xef`: Short strings (0-15 bytes, length in lower nibble)
-- `0xf0`: Long string (followed by length-prefixed chunks)
-- `0xf1`: Big number (for arbitrary precision decimals)
-- `0xf2-0xf4`: Floats (16-bit, 32-bit, 64-bit)
-- `0xf5`: Null
-- `0xf6-0xf7`: Boolean (false, true)
-- `0xf8`: Array (followed by chunked elements)
-- `0xf9`: Object (followed by chunked key-value pairs)
-- `0xfa-0xff`: Reserved
+- `0x00-0xC8`: Small integers (-100 to 100), value = type_code - 100
+- `0xC9`: Reserved
+- `0xCA`: Big number (zigzag LEB128 exponent + zigzag LEB128 signed significand)
+- `0xCB`: Float32
+- `0xCC`: Float64
+- `0xCD`: Null
+- `0xCE`: False
+- `0xCF`: True
+- `0xD0-0xDF`: Short strings (0-15 bytes, length = type_code - 0xD0)
+- `0xE0-0xE3`: Unsigned integers (CPU-native sizes: 1, 2, 4, 8 bytes)
+- `0xE4-0xE7`: Signed integers (CPU-native sizes: 1, 2, 4, 8 bytes)
+- `0xE8-0xFB`: Reserved
+- `0xFC`: Array start (delimiter-terminated with 0xFE)
+- `0xFD`: Object start (delimiter-terminated with 0xFE)
+- `0xFE`: Container end marker
+- `0xFF`: Long string (FF-terminated: 0xFF + data + 0xFF)
 
-The new layout is optimized for mask-based type detection:
-- Small integers: `type_code < 0xc9`
-- Short strings: `type_code >= 0xe0 && type_code <= 0xef`
-- Long types: `type_code >= 0xf0`
+Type detection ranges:
+- Small integers: `type_code < 0xC9`
+- Short strings: `type_code >= 0xD0 && type_code <= 0xDF`
 
-## Length Field Encoding
+## Container Encoding (Delimiter-Terminated)
 
-Length fields use variable-width encoding with a continuation bit for chunking:
-- Format: `payload = (count << 1) | continuation_flag`
-- Trailing zeros in first byte indicate total byte count
-- Single byte encodes counts 0-63 (after bit manipulation)
-- Multi-byte for larger values
-- Continuation flag (bit 0 of payload) indicates if more chunks follow
-- **Validation rule**: Empty chunk (count=0) with continuation=1 is invalid (DOS protection)
+Containers (arrays and objects) use a start marker and end delimiter:
+- Format: `[type_code] [elements...] [0xFE]`
+- Arrays: `0xFC` + values + `0xFE`
+- Objects: `0xFD` + key-value pairs + `0xFE`
 
-## Container Encoding (Chunked Format)
-
-Containers (arrays and objects) use chunked encoding without an end marker:
-- Format: `[type_code] [chunk]...`
-- Each chunk: `[length_field] [elements...]`
-- Length field's count = number of elements (arrays) or key-value pairs (objects)
-- Final chunk has continuation bit = 0; intermediate chunks have continuation bit = 1
-
-This allows:
-- **Pre-allocation**: Decoder can sum chunk counts for total size
-- **Streaming**: Encoder can write chunks before knowing total size
-- **Efficient detection**: No need to scan for end markers
+There is no length prefix or chunking; the decoder scans until it encounters the end marker.
 
 ## Integer Encoding
 
 Integers are encoded using the smallest representation:
 1. Small int range (-100 to 100): Single byte type code, value = type_code - 100
-   - Type code 0x00 = -100, 0x64 = 0, 0xc8 = 100
+   - Type code 0x00 = -100, 0x64 = 0, 0xC8 = 100
 2. Larger values: Type code indicates sign and byte count, followed by little-endian bytes
-   - Unsigned: 0xd0-0xd7 (1-8 bytes)
-   - Signed: 0xd8-0xdf (1-8 bytes)
-3. Unsigned values try signed encoding when MSB allows (saves type code range)
+   - Unsigned: 0xE0-0xE3 (CPU-native sizes: 1, 2, 4, 8 bytes)
+   - Signed: 0xE4-0xE7 (CPU-native sizes: 1, 2, 4, 8 bytes)
+3. Values are rounded up to the next CPU-native size (e.g. a 3-byte value uses 4 bytes)
 
 ## Float Encoding
 
 Float encoding attempts smallest lossless representation:
 1. If value is a whole number, encode as integer
-2. Try bfloat16 if no precision loss
-3. Try float32 if no precision loss
-4. Fall back to float64
+2. Try float32 if no precision loss
+3. Fall back to float64
+
+Note: bfloat16 is no longer supported.
 
 ## String Encoding
 
-- Short strings (0-15 bytes): Type codes 0xe0-0xef encode length (length = type_code - 0xe0), followed by UTF-8 bytes
-- Long strings: Type code 0xf0, followed by length-field-prefixed UTF-8 chunks
-- Length field includes continuation bit for chunked encoding
-- Chunks may split UTF-8 sequences; only the assembled string must be valid UTF-8
+- Short strings (0-15 bytes): Type codes 0xD0-0xDF encode length (length = type_code - 0xD0), followed by UTF-8 bytes
+- Long strings: 0xFF + UTF-8 data + 0xFF (FF-terminated, no chunking)
 
 ## Big Number Format
 
-Big numbers use a header byte followed by data:
-- Header: `SSSSS EE N` where:
-  - N (bit 0): sign (0 = positive, 1 = negative)
-  - EE (bits 1-2): exponent length (0-3 bytes)
-  - SSSSS (bits 3-7): significand length (0-31 bytes)
-- Followed by exponent bytes (little-endian signed)
-- Followed by significand bytes (little-endian unsigned)
+Big numbers use zigzag LEB128 encoding for both exponent and significand:
+- Format: `0xCA` + zigzag LEB128 exponent + zigzag LEB128 signed significand
+- Zigzag encoding maps signed integers to unsigned: `n -> (n << 1) ^ (n >> 63)`
+- LEB128 uses 7 bits per byte with high bit as continuation flag
+- The significand is signed (negative values represent negative numbers)
 
 ### Swift Decimal Support
 
@@ -182,10 +167,6 @@ Configure via `unicodeDecodingStrategy`:
 
 Note: The `.ignore` mode from the BONJSON spec is not supported because Swift's `String`
 type only accepts valid UTF-8. Use `.replace` as a permissive alternative.
-
-**Chunked string handling**: For multi-chunk strings, UTF-8 validation happens on the final
-assembled string, not per-chunk. Individual chunks may split UTF-8 sequences; only the
-complete string must be valid.
 
 ### NUL Character Handling
 
@@ -242,7 +223,6 @@ All limits default to BONJSON spec-recommended values:
 | `maxStringLength` | 10,000,000 | Maximum string length in bytes |
 | `maxContainerSize` | 1,000,000 | Maximum elements in a container |
 | `maxDocumentSize` | 2,000,000,000 | Maximum document size in bytes |
-| `maxChunks` | 100 | Maximum string chunks (decoder only) |
 
 All limits are configurable on both `BONJSONEncoder` and `BONJSONDecoder`.
 
@@ -311,7 +291,7 @@ swift test --filter Conformance
 
 **Supported test options:**
 - `allow_nul`, `allow_nan_infinity`, `allow_trailing_bytes`
-- `max_depth`, `max_container_size`, `max_string_length`, `max_chunks`, `max_document_size`
+- `max_depth`, `max_container_size`, `max_string_length`, `max_document_size`
 - `nan_infinity`: "allow" (pass through), "stringify" is skipped (converts floats to strings, not supported)
 - `duplicate_key`: "keep_first", "keep_last"
 - `invalid_utf8`: "replace", "delete"

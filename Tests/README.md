@@ -12,8 +12,8 @@ The universal test suite contains:
 The main conformance tests that verify correct BONJSON encoding/decoding behavior. These test files cover:
 - Basic types (null, boolean, empty containers)
 - Integers (all sizes, boundaries)
-- Floats (16/32/64-bit, special values)
-- Strings (short, long, chunked, UTF-8)
+- Floats (32/64-bit, special values)
+- Strings (short, long, UTF-8)
 - BigNumbers (arbitrary precision)
 - Containers (arrays, objects, nesting)
 - Error handling (truncation, invalid data)
