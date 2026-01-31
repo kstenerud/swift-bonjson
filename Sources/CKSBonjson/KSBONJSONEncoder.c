@@ -31,6 +31,7 @@
 #include "KSBONJSONCommon.h"
 #include <math.h>
 #include <string.h>
+#include "KSBONJSONSimd.h"
 #ifdef _MSC_VER
 #include <intrin.h>
 #endif
@@ -383,12 +384,9 @@ ssize_t ksbonjson_encodeToBuffer_string(KSBONJSONBufferEncodeContext* ctx,
 
     if (ctx->flags.rejectNUL)
     {
-        for (size_t i = 0; i < length; i++)
+        unlikely_if(ksbonjson_simd_containsByte((const uint8_t*)value, length, 0x00))
         {
-            unlikely_if(value[i] == '\0')
-            {
-                return -KSBONJSON_ENCODE_NUL_CHARACTER;
-            }
+            return -KSBONJSON_ENCODE_NUL_CHARACTER;
         }
     }
 
@@ -674,14 +672,9 @@ ssize_t ksbonjson_encodeToBuffer_stringArray(
     {
         for (size_t i = 0; i < count; i++)
         {
-            const char* str = strings[i];
-            size_t len = lengths[i];
-            for (size_t j = 0; j < len; j++)
+            unlikely_if(ksbonjson_simd_containsByte((const uint8_t*)strings[i], lengths[i], 0x00))
             {
-                unlikely_if(str[j] == '\0')
-                {
-                    return -KSBONJSON_ENCODE_NUL_CHARACTER;
-                }
+                return -KSBONJSON_ENCODE_NUL_CHARACTER;
             }
         }
     }

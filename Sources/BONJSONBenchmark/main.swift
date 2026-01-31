@@ -33,6 +33,13 @@ struct LargeObject: Codable, Equatable {
     var values: [Double]
 }
 
+struct StringHeavyObject: Codable, Equatable {
+    var id: Int
+    var biography: String
+    var notes: String
+    var address: String
+}
+
 // MARK: - Test Data Generation
 
 func makeSmallObjects(count: Int) -> [SmallObject] {
@@ -66,6 +73,29 @@ func makeLargeObject() -> LargeObject {
         counts: Array(0..<100),
         values: (0..<100).map { Double($0) * 0.1 }
     )
+}
+
+func makeLongStrings(count: Int, length: Int) -> [String] {
+    let base = "The quick brown fox jumps over the lazy dog. "
+    let repeated = String(repeating: base, count: (length / base.count) + 1)
+    let template = String(repeated.prefix(length))
+    return (0..<count).map { i in
+        var s = template
+        let suffix = " [\(i)]"
+        s.replaceSubrange(s.index(s.endIndex, offsetBy: -suffix.count)..<s.endIndex, with: suffix)
+        return s
+    }
+}
+
+func makeStringHeavyObjects(count: Int) -> [StringHeavyObject] {
+    return (0..<count).map { i in
+        StringHeavyObject(
+            id: i,
+            biography: String(repeating: "Lorem ipsum dolor sit amet, consectetur adipiscing elit. ", count: 5) + "Person \(i).",
+            notes: String(repeating: "Note entry with various details and observations. ", count: 4) + "Item \(i).",
+            address: "\(i) Example Street, Suite \(i * 10), Springfield, IL 62704, United States of America"
+        )
+    }
 }
 
 // MARK: - Benchmark Helpers
@@ -232,6 +262,50 @@ do {
     printComparison(bonjsonResult, jsonResult)
 }
 
+do {
+    let strings = makeLongStrings(count: 1000, length: 200)
+    let bonjsonEncoder = BONJSONEncoder()
+    let jsonEncoder = JSONEncoder()
+
+    _ = try bonjsonEncoder.encode(strings)
+    _ = try jsonEncoder.encode(strings)
+
+    let bonjsonData = try bonjsonEncoder.encode(strings)
+    let jsonData = try jsonEncoder.encode(strings)
+
+    let bonjsonResult = try benchmark(name: "Encode 1000 Long Strings (200B)", iterations: iterations, dataSize: bonjsonData.count) {
+        _ = try bonjsonEncoder.encode(strings)
+    }
+
+    let jsonResult = try benchmark(name: "Encode 1000 Long Strings (200B)", iterations: iterations, dataSize: jsonData.count) {
+        _ = try jsonEncoder.encode(strings)
+    }
+
+    printComparison(bonjsonResult, jsonResult)
+}
+
+do {
+    let objects = makeStringHeavyObjects(count: 500)
+    let bonjsonEncoder = BONJSONEncoder()
+    let jsonEncoder = JSONEncoder()
+
+    _ = try bonjsonEncoder.encode(objects)
+    _ = try jsonEncoder.encode(objects)
+
+    let bonjsonData = try bonjsonEncoder.encode(objects)
+    let jsonData = try jsonEncoder.encode(objects)
+
+    let bonjsonResult = try benchmark(name: "Encode 500 String-Heavy Objects", iterations: iterations, dataSize: bonjsonData.count) {
+        _ = try bonjsonEncoder.encode(objects)
+    }
+
+    let jsonResult = try benchmark(name: "Encode 500 String-Heavy Objects", iterations: iterations, dataSize: jsonData.count) {
+        _ = try jsonEncoder.encode(objects)
+    }
+
+    printComparison(bonjsonResult, jsonResult)
+}
+
 // MARK: - Decoding Benchmarks
 
 print("\n▶ DECODING BENCHMARKS")
@@ -298,6 +372,50 @@ do {
 
     let jsonResult = try benchmark(name: "Decode Large Object", iterations: iterations, dataSize: jsonData.count) {
         _ = try jsonDecoder.decode(LargeObject.self, from: jsonData)
+    }
+
+    printComparison(bonjsonResult, jsonResult)
+}
+
+do {
+    let strings = makeLongStrings(count: 1000, length: 200)
+    let bonjsonData = try BONJSONEncoder().encode(strings)
+    let jsonData = try JSONEncoder().encode(strings)
+
+    let bonjsonDecoder = BONJSONDecoder()
+    let jsonDecoder = JSONDecoder()
+
+    _ = try bonjsonDecoder.decode([String].self, from: bonjsonData)
+    _ = try jsonDecoder.decode([String].self, from: jsonData)
+
+    let bonjsonResult = try benchmark(name: "Decode 1000 Long Strings (200B)", iterations: iterations, dataSize: bonjsonData.count) {
+        _ = try bonjsonDecoder.decode([String].self, from: bonjsonData)
+    }
+
+    let jsonResult = try benchmark(name: "Decode 1000 Long Strings (200B)", iterations: iterations, dataSize: jsonData.count) {
+        _ = try jsonDecoder.decode([String].self, from: jsonData)
+    }
+
+    printComparison(bonjsonResult, jsonResult)
+}
+
+do {
+    let objects = makeStringHeavyObjects(count: 500)
+    let bonjsonData = try BONJSONEncoder().encode(objects)
+    let jsonData = try JSONEncoder().encode(objects)
+
+    let bonjsonDecoder = BONJSONDecoder()
+    let jsonDecoder = JSONDecoder()
+
+    _ = try bonjsonDecoder.decode([StringHeavyObject].self, from: bonjsonData)
+    _ = try jsonDecoder.decode([StringHeavyObject].self, from: jsonData)
+
+    let bonjsonResult = try benchmark(name: "Decode 500 String-Heavy Objects", iterations: iterations, dataSize: bonjsonData.count) {
+        _ = try bonjsonDecoder.decode([StringHeavyObject].self, from: bonjsonData)
+    }
+
+    let jsonResult = try benchmark(name: "Decode 500 String-Heavy Objects", iterations: iterations, dataSize: jsonData.count) {
+        _ = try jsonDecoder.decode([StringHeavyObject].self, from: jsonData)
     }
 
     printComparison(bonjsonResult, jsonResult)

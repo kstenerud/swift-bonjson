@@ -181,6 +181,7 @@ typedef enum {
 
 typedef struct {
     KSBONJSONValueType type;
+    uint32_t subtreeSize; // Total entries in subtree (1 for primitives, 1+children for containers)
     union {
         int64_t intValue;
         uint64_t uintValue;

@@ -555,30 +555,16 @@ final class _PositionMap {
         self.nextSibling = computeNextSiblingIndices()
     }
 
-    /// Compute next sibling indices for all entries.
-    /// nextSibling[i] = index of the entry after the subtree rooted at i.
+    /// Build next sibling indices from precomputed subtree sizes in map entries.
+    /// nextSibling[i] = i + subtreeSize[i]
     private func computeNextSiblingIndices() -> ContiguousArray<Int> {
-        var sizes = ContiguousArray<Int>(repeating: 1, count: entryCount)
-
-        // Process in reverse order so children are computed before parents
-        for i in stride(from: entryCount - 1, through: 0, by: -1) {
-            let entry = entries[i]
-            if entry.type == KSBONJSON_TYPE_ARRAY || entry.type == KSBONJSON_TYPE_OBJECT {
-                var totalSize = 1  // Include self
-                var childPos = Int(entry.data.container.firstChild)
-                for _ in 0..<entry.data.container.count {
-                    if childPos < entryCount {
-                        totalSize += sizes[childPos]
-                        childPos += sizes[childPos]
-                    }
-                }
-                sizes[i] = totalSize
+        let result = ContiguousArray<Int>(unsafeUninitializedCapacity: entryCount) { buffer, count in
+            for i in 0..<entryCount {
+                buffer[i] = i + Int(entries[i].subtreeSize)
             }
-            // Primitives already have size 1
+            count = entryCount
         }
-
-        // Convert sizes to next sibling indices: nextSibling[i] = i + size[i]
-        return ContiguousArray(sizes.enumerated().map { $0.offset + $0.element })
+        return result
     }
 
     /// Get entry at index - inlined for performance.

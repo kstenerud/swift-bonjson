@@ -31,6 +31,7 @@
 #include "KSBONJSONCommon.h"
 #include <string.h> // For memcpy() and strnlen()
 #include <math.h>   // For pow()
+#include "KSBONJSONSimd.h"
 #ifdef _MSC_VER
 #include <intrin.h>
 #endif
@@ -55,12 +56,24 @@
  */
 static ksbonjson_decodeStatus validateString(const uint8_t* data, size_t length, bool rejectNUL, bool rejectInvalidUTF8)
 {
-    // Fast path: if only checking NUL, just scan for 0x00
+    // Fast path: if only checking NUL, use SIMD scan for 0x00
     if (rejectNUL && !rejectInvalidUTF8)
     {
-        for (size_t i = 0; i < length; i++)
+        unlikely_if(ksbonjson_simd_containsByte(data, length, 0x00))
         {
-            unlikely_if(data[i] == 0x00)
+            return KSBONJSON_DECODE_NUL_CHARACTER;
+        }
+        return KSBONJSON_DECODE_OK;
+    }
+
+    // Full UTF-8 validation (with optional NUL check)
+
+    // SIMD fast path: if entire string is ASCII, only need NUL check
+    if (ksbonjson_simd_isAllAscii(data, length))
+    {
+        if (rejectNUL)
+        {
+            unlikely_if(ksbonjson_simd_containsByte(data, length, 0x00))
             {
                 return KSBONJSON_DECODE_NUL_CHARACTER;
             }
@@ -68,7 +81,7 @@ static ksbonjson_decodeStatus validateString(const uint8_t* data, size_t length,
         return KSBONJSON_DECODE_OK;
     }
 
-    // Full UTF-8 validation (with optional NUL check)
+    // Slow path: byte-by-byte UTF-8 validation for strings with non-ASCII
     const uint8_t* end = data + length;
 
     while (data < end)
@@ -384,20 +397,17 @@ static ksbonjson_decodeStatus decodeAndReportLongString(DecodeContext* const ctx
     // Long string: data bytes until 0xFF terminator
     // 0xFF cannot appear in valid UTF-8, so it's a safe terminator
     const uint8_t* start = ctx->bufferCurrent;
-    const uint8_t* end = ctx->bufferEnd;
+    size_t remaining = (size_t)(ctx->bufferEnd - start);
 
-    // Scan for terminator
-    const uint8_t* pos = start;
-    while (pos < end && *pos != TYPE_STRING_LONG)
-    {
-        pos++;
-    }
-    unlikely_if(pos >= end)
+    // SIMD-accelerated scan for 0xFF terminator
+    size_t offset = ksbonjson_simd_findByte(start, remaining, TYPE_STRING_LONG);
+    unlikely_if(offset >= remaining)
     {
         return KSBONJSON_DECODE_INCOMPLETE;
     }
 
-    size_t length = (size_t)(pos - start);
+    const uint8_t* pos = start + offset;
+    size_t length = offset;
     ctx->bufferCurrent = pos + 1; // skip terminator
 
     SHOULD_NOT_CONTAIN_NUL_CHARS(start, length);
@@ -666,10 +676,11 @@ const char* ksbonjson_describeDecodeStatus(const ksbonjson_decodeStatus status)
     unlikely_if(ctx->entriesCount >= ctx->entriesCapacity) \
         return KSBONJSON_DECODE_MAP_FULL
 
-// Helper to add an entry and return its index
+// Helper to add an entry and return its index (subtreeSize defaults to 1)
 static inline size_t mapAddEntry(KSBONJSONMapContext* ctx, KSBONJSONMapEntry entry)
 {
     size_t index = ctx->entriesCount;
+    entry.subtreeSize = 1;
     ctx->entries[index] = entry;
     ctx->entriesCount++;
     return index;
@@ -766,16 +777,15 @@ static ksbonjson_decodeStatus mapScanLongString(KSBONJSONMapContext* ctx, size_t
 
     size_t startOffset = ctx->position;
 
-    // Scan for 0xFF terminator
-    while (ctx->position < ctx->inputLength && ctx->input[ctx->position] != TYPE_STRING_LONG)
-    {
-        ctx->position++;
-    }
-    unlikely_if(ctx->position >= ctx->inputLength)
+    // SIMD-accelerated scan for 0xFF terminator
+    size_t remaining = ctx->inputLength - ctx->position;
+    size_t offset = ksbonjson_simd_findByte(ctx->input + ctx->position, remaining, TYPE_STRING_LONG);
+    unlikely_if(offset >= remaining)
     {
         return KSBONJSON_DECODE_INCOMPLETE;
     }
 
+    ctx->position += offset;
     size_t length = ctx->position - startOffset;
     ctx->position++; // skip terminator
 
@@ -967,9 +977,10 @@ static ksbonjson_decodeStatus mapScanArray(KSBONJSONMapContext* ctx, size_t* out
         }
     }
 
-    // Update the array entry with child info
+    // Update the array entry with child info and subtree size
     ctx->entries[arrayIndex].data.container.firstChild = (uint32_t)firstChild;
     ctx->entries[arrayIndex].data.container.count = totalCount;
+    ctx->entries[arrayIndex].subtreeSize = (uint32_t)(ctx->entriesCount - arrayIndex);
 
     // Pop container
     ctx->containerDepth--;
@@ -1106,9 +1117,10 @@ static ksbonjson_decodeStatus mapScanObject(KSBONJSONMapContext* ctx, size_t* ou
         }
     }
 
-    // Update the object entry with child info
+    // Update the object entry with child info and subtree size
     ctx->entries[objectIndex].data.container.firstChild = (uint32_t)firstChild;
     ctx->entries[objectIndex].data.container.count = entryCount;
+    ctx->entries[objectIndex].subtreeSize = (uint32_t)(ctx->entriesCount - objectIndex);
 
     // Pop container
     ctx->containerDepth--;
@@ -1310,35 +1322,14 @@ const char* ksbonjson_map_getString(
     return (const char*)(ctx->input + entry->data.string.offset);
 }
 
-// Helper to compute the size of a subtree rooted at a given index.
-// This returns the total number of entries in the subtree (including the root).
-static size_t mapSubtreeSize(KSBONJSONMapContext* ctx, size_t index)
+// Helper to get the subtree size (precomputed during scan)
+static inline size_t mapSubtreeSize(KSBONJSONMapContext* ctx, size_t index)
 {
     if (index >= ctx->entriesCount)
     {
         return 0;
     }
-
-    const KSBONJSONMapEntry* entry = &ctx->entries[index];
-
-    if (entry->type == KSBONJSON_TYPE_ARRAY || entry->type == KSBONJSON_TYPE_OBJECT)
-    {
-        // For containers, size = 1 (self) + sum of child subtree sizes
-        size_t totalSize = 1;
-        size_t childPos = entry->data.container.firstChild;
-        for (uint32_t i = 0; i < entry->data.container.count; i++)
-        {
-            size_t childSize = mapSubtreeSize(ctx, childPos);
-            totalSize += childSize;
-            childPos += childSize;
-        }
-        return totalSize;
-    }
-    else
-    {
-        // Primitives have size 1
-        return 1;
-    }
+    return ctx->entries[index].subtreeSize;
 }
 
 size_t ksbonjson_map_getChild(

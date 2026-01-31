@@ -48,7 +48,7 @@ This library uses two different approaches optimized for their respective tasks:
 1. User calls `decoder.decode(Type.self, from: data)`
 2. `_PositionMap` copies data to stable storage, allocates entry buffer
 3. Single C scan (`ksbonjson_map_scan`) builds map of all entries
-4. Swift computes subtree sizes and next-sibling indices for fast child access
+4. Swift builds next-sibling indices from precomputed subtree sizes for fast child access
 5. Decoder containers use the map for random access:
    - Primitives: read pre-decoded value directly from entry
    - Strings: create String from offset/length in original data
@@ -64,6 +64,7 @@ The C `KSBONJSONMapEntry` stores decoded values inline:
 - `KSBONJSON_TYPE_BIGNUMBER`: significand/exponent/sign stored
 - `KSBONJSON_TYPE_STRING`: offset and length into original input
 - `KSBONJSON_TYPE_ARRAY`, `_OBJECT`: firstChild index and count
+- All entries: `subtreeSize` (precomputed during scan for O(1) sibling navigation)
 
 ## Type Codes
 
@@ -327,12 +328,14 @@ swift test --filter Benchmark
 
 ### Speed Comparison
 
-**BONJSON decoder is now 2.56x FASTER than Apple's JSON decoder!**
+**BONJSON decoder is 1.5-2.2x faster than Apple's JSON decoder** across different workloads.
 
-| Metric | BONJSON | JSON | Ratio |
-|--------|---------|------|-------|
-| Decode 1000 objects | 490 µs | 1.26 ms | 0.39x (BONJSON 2.56x faster) |
-| Throughput | 53 MB/s | 35 MB/s | 1.5x faster |
+| Metric | BONJSON | JSON | Speedup |
+|--------|---------|------|---------|
+| Decode 1000 small objects | 414 µs | 823 µs | 1.99x |
+| Decode 500 medium objects | 941 µs | 1.42 ms | 1.51x |
+| Decode 1000 long strings | 155 µs | 342 µs | 2.20x |
+| Decode 500 string-heavy objects | 516 µs | 766 µs | 1.48x |
 
 Encoder performance is roughly equal to JSON.
 
@@ -388,6 +391,27 @@ Increased threshold from 8 to 12 fields. Linear search is 1.5x faster than dicti
 |--------|--------|-------|-------------|
 | 10-field objects | 1.66 ms | 865 µs | **1.9x faster** |
 | vs JSON | 2.4x faster | 2.56x faster | **+7%** |
+
+#### Phase 5: SIMD String Scanning
+
+Added platform-specific SIMD (NEON/SSE2) with scalar fallback in `KSBONJSONSimd.h`:
+- `ksbonjson_simd_findByte()` for 0xFF terminator search in long strings
+- `ksbonjson_simd_containsByte()` for NUL byte detection
+- `ksbonjson_simd_isAllAscii()` for UTF-8 validation fast path
+
+No measurable impact on current benchmarks (strings too short). Benefits large strings/documents.
+
+#### Phase 6: Precomputed Subtree Sizes in C
+
+Moved subtree size computation from Swift post-processing into C scan pass:
+- Added `subtreeSize` field to `KSBONJSONMapEntry`, set during scan at zero extra cost
+- Swift post-processing reduced from reverse-order walk to simple `i + subtreeSize` loop
+- Recursive `mapSubtreeSize()` replaced with inline lookup
+
+| Metric | Before | After | Improvement |
+|--------|--------|-------|-------------|
+| Decode 500 medium objects | 1.42x vs JSON | 1.51x vs JSON | **+6%** |
+| Decode 500 string-heavy | 1.39x vs JSON | 1.48x vs JSON | **+6%** |
 
 ### Current Performance Characteristics
 
