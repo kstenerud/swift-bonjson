@@ -334,8 +334,8 @@ ssize_t ksbonjson_encodeToBuffer_bigNumber(KSBONJSONBufferEncodeContext* ctx, KS
     {
         return -KSBONJSON_ENCODE_EXPECTED_OBJECT_NAME;
     }
-    // Max bignum: type(1) + exp zigzag LEB128(10) + sig zigzag LEB128(10) = 21
-    unlikely_if(bufferWouldExceedDocumentSize(ctx, 21))
+    // Max bignum: type(1) + exp zigzag LEB128(10) + signed_length zigzag LEB128(10) + magnitude(8) = 29
+    unlikely_if(bufferWouldExceedDocumentSize(ctx, 29))
     {
         return -KSBONJSON_ENCODE_MAX_DOCUMENT_SIZE_EXCEEDED;
     }
@@ -347,15 +347,41 @@ ssize_t ksbonjson_encodeToBuffer_bigNumber(KSBONJSONBufferEncodeContext* ctx, KS
     size_t totalBytes = 1;
 
     // Exponent as zigzag LEB128
-    totalBytes += ksbonjson_writeZigzagLEB128(ctx->buffer + ctx->position, (int64_t)value.exponent);
-    ctx->position += totalBytes - 1;
+    size_t expBytes = ksbonjson_writeZigzagLEB128(ctx->buffer + ctx->position, (int64_t)value.exponent);
+    ctx->position += expBytes;
+    totalBytes += expBytes;
 
-    // Signed significand as zigzag LEB128 (sign embedded in zigzag)
-    int64_t signedSig = (int64_t)value.significand;
-    if (value.significandSign < 0) signedSig = -signedSig;
-    size_t sigBytes = ksbonjson_writeZigzagLEB128(ctx->buffer + ctx->position, signedSig);
-    ctx->position += sigBytes;
-    totalBytes += sigBytes;
+    if (value.significand == 0)
+    {
+        // Zero significand: signed_length = 0, no magnitude bytes
+        ctx->buffer[ctx->position] = 0x00;
+        ctx->position += 1;
+        totalBytes += 1;
+    }
+    else
+    {
+        // Convert significand to LE bytes and find normalized length
+        uint8_t magnitude[8];
+        uint64_t sig = value.significand;
+        size_t byteCount = 0;
+        while (sig != 0)
+        {
+            magnitude[byteCount++] = (uint8_t)(sig & 0xFF);
+            sig >>= 8;
+        }
+
+        // Write signed_length as zigzag LEB128
+        int64_t signedLength = (int64_t)byteCount;
+        if (value.significandSign < 0) signedLength = -signedLength;
+        size_t lenBytes = ksbonjson_writeZigzagLEB128(ctx->buffer + ctx->position, signedLength);
+        ctx->position += lenBytes;
+        totalBytes += lenBytes;
+
+        // Write raw LE magnitude bytes
+        memcpy(ctx->buffer + ctx->position, magnitude, byteCount);
+        ctx->position += byteCount;
+        totalBytes += byteCount;
+    }
 
     return (ssize_t)totalBytes;
 }
@@ -911,16 +937,38 @@ ksbonjson_encodeStatus ksbonjson_addBigNumber(KSBONJSONEncodeContext* const ctx,
 
     container->isExpectingName = true;
 
-    // Zigzag LEB128 encoding: type_code + exponent + signed significand
-    uint8_t buf[21]; // 1 + 10 + 10 max
+    // BigNumber: type_code + zigzag_leb128(exponent) + zigzag_leb128(signed_length) + magnitude
+    uint8_t buf[29]; // 1 + 10 + 10 + 8 max
     buf[0] = TYPE_BIG_NUMBER;
     size_t pos = 1;
 
     pos += ksbonjson_writeZigzagLEB128(buf + pos, (int64_t)value.exponent);
 
-    int64_t signedSig = (int64_t)value.significand;
-    if (value.significandSign < 0) signedSig = -signedSig;
-    pos += ksbonjson_writeZigzagLEB128(buf + pos, signedSig);
+    if (value.significand == 0)
+    {
+        buf[pos++] = 0x00; // signed_length = 0, no magnitude bytes
+    }
+    else
+    {
+        // Convert significand to LE bytes and find normalized length
+        uint8_t magnitude[8];
+        uint64_t sig = value.significand;
+        size_t byteCount = 0;
+        while (sig != 0)
+        {
+            magnitude[byteCount++] = (uint8_t)(sig & 0xFF);
+            sig >>= 8;
+        }
+
+        // Write signed_length as zigzag LEB128
+        int64_t signedLength = (int64_t)byteCount;
+        if (value.significandSign < 0) signedLength = -signedLength;
+        pos += ksbonjson_writeZigzagLEB128(buf + pos, signedLength);
+
+        // Write raw LE magnitude bytes
+        memcpy(buf + pos, magnitude, byteCount);
+        pos += byteCount;
+    }
 
     return addEncodedBytes(ctx, buf, pos);
 }

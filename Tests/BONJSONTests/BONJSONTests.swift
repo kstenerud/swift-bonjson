@@ -2935,16 +2935,17 @@ final class BONJSONBigNumberTests: XCTestCase {
     // Test big number decoding as Double in keyed container
     func testBigNumberAsDoubleInKeyedContainer() throws {
         // Create raw BONJSON: { "value": <big number 12345> }
-        // BigNumber format: TYPE_BIG_NUMBER (0xCA) + zigzag LEB128 exponent + zigzag LEB128 significand
-        // Exponent 0: zigzag=0, LEB128=[0x00]
-        // Significand 12345: zigzag=24690, LEB128=[0xF2, 0xC0, 0x01]
+        // BigNumber format: TYPE_BIG_NUMBER (0xCA) + zigzag LEB128 exponent + zigzag LEB128 signed_length + LE magnitude
+        // Exponent 0: zigzag(0)=0x00
+        // 12345 = 0x3039, LE bytes: [0x39, 0x30], signed_length=+2, zigzag(2)=0x04
 
         let bonjsonData = Data([
             0xfd,                           // Object start
             0xd5, 0x76, 0x61, 0x6c, 0x75, 0x65, // Key "value" (short string, 5 bytes: 0xd0 + 5)
             0xca,                           // Big number type
             0x00,                           // Exponent: 0
-            0xf2, 0xc0, 0x01,              // Significand: 12345
+            0x04,                           // signed_length: +2 (zigzag=4)
+            0x39, 0x30,                     // Magnitude: 12345 LE
             0xfe                            // Container end
         ])
 
@@ -2964,7 +2965,8 @@ final class BONJSONBigNumberTests: XCTestCase {
             0xfc,                           // Array start
             0xca,                           // Big number type
             0x00,                           // Exponent: 0
-            0xf2, 0xc0, 0x01,              // Significand: 12345
+            0x04,                           // signed_length: +2 (zigzag=4)
+            0x39, 0x30,                     // Magnitude: 12345 LE
             0xfe                            // Container end
         ])
 
@@ -2988,7 +2990,8 @@ final class BONJSONBigNumberTests: XCTestCase {
         let bonjsonData = Data([
             0xca,                           // Big number type
             0x00,                           // Exponent: 0
-            0xf2, 0xc0, 0x01               // Significand: 12345
+            0x04,                           // signed_length: +2 (zigzag=4)
+            0x39, 0x30                      // Magnitude: 12345 LE
         ])
 
         let decoder = BONJSONDecoder()
@@ -2998,11 +3001,12 @@ final class BONJSONBigNumberTests: XCTestCase {
 
     // Test big number with negative sign
     func testNegativeBigNumber() throws {
-        // Big number -12345: significand is -12345, zigzag=24689
+        // Big number -12345: signed_length=-2 (zigzag=3), magnitude=12345 LE
         let bonjsonData = Data([
             0xca,                           // Big number type
             0x00,                           // Exponent: 0
-            0xf1, 0xc0, 0x01               // Significand: -12345 (zigzag=24689)
+            0x03,                           // signed_length: -2 (zigzag=3, negative)
+            0x39, 0x30                      // Magnitude: 12345 LE
         ])
 
         let decoder = BONJSONDecoder()
@@ -3013,12 +3017,13 @@ final class BONJSONBigNumberTests: XCTestCase {
     // Test big number with exponent (e.g., 123.45 = 12345 * 10^-2)
     func testBigNumberWithExponent() throws {
         // Big number 123.45 = 12345 * 10^-2
-        // Exponent -2: zigzag=3, LEB128=[0x03]
-        // Significand 12345: zigzag=24690, LEB128=[0xF2, 0xC0, 0x01]
+        // Exponent -2: zigzag(-2)=3 → 0x03
+        // 12345 = 0x3039, LE bytes: [0x39, 0x30], signed_length=+2, zigzag(2)=0x04
         let bonjsonData = Data([
             0xca,                           // Big number type
             0x03,                           // Exponent: -2 (zigzag=3)
-            0xf2, 0xc0, 0x01               // Significand: 12345
+            0x04,                           // signed_length: +2 (zigzag=4)
+            0x39, 0x30                      // Magnitude: 12345 LE
         ])
 
         let decoder = BONJSONDecoder()
@@ -3029,12 +3034,12 @@ final class BONJSONBigNumberTests: XCTestCase {
     // Test big number as Date (goes through _MapDecoder.decodeDouble via decodeDate)
     func testBigNumberAsDate() throws {
         // Big number representing timestamp 1000000 seconds since 1970
-        // Exponent 0: zigzag=0, LEB128=[0x00]
-        // Significand 1000000: zigzag=2000000, LEB128=[0x80, 0x89, 0x7A]
+        // 1000000 = 0x0F4240, LE bytes: [0x40, 0x42, 0x0F], signed_length=+3, zigzag(3)=0x06
         let bonjsonData = Data([
             0xca,                           // Big number type
             0x00,                           // Exponent: 0
-            0x80, 0x89, 0x7a               // Significand: 1000000
+            0x06,                           // signed_length: +3 (zigzag=6)
+            0x40, 0x42, 0x0f               // Magnitude: 1000000 LE
         ])
 
         let decoder = BONJSONDecoder()

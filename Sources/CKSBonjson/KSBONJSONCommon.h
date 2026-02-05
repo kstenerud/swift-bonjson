@@ -112,7 +112,7 @@ enum
     TYPE_SMALLINT_ZERO = 0x64,  // 0
     TYPE_SMALLINT_MAX  = 0xC8,  // 100
 
-    // Big number (zigzag LEB128 exponent + signed significand)
+    // Big number (zigzag LEB128 exponent + zigzag LEB128 signed_length + LE magnitude)
     TYPE_BIG_NUMBER = 0xCA,
 
     // Floats (float32 and float64 only)

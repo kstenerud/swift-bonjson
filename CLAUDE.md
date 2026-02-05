@@ -71,7 +71,7 @@ The C `KSBONJSONMapEntry` stores decoded values inline:
 Key type code ranges (defined in `KSBONJSONCommon.h`):
 - `0x00-0xC8`: Small integers (-100 to 100), value = type_code - 100
 - `0xC9`: Reserved
-- `0xCA`: Big number (zigzag LEB128 exponent + zigzag LEB128 signed significand)
+- `0xCA`: Big number (zigzag LEB128 exponent + zigzag LEB128 signed_length + LE magnitude bytes)
 - `0xCB`: Float32
 - `0xCC`: Float64
 - `0xCD`: Null
@@ -125,11 +125,15 @@ Note: bfloat16 is no longer supported.
 
 ## Big Number Format
 
-Big numbers use zigzag LEB128 encoding for both exponent and significand:
-- Format: `0xCA` + zigzag LEB128 exponent + zigzag LEB128 signed significand
-- Zigzag encoding maps signed integers to unsigned: `n -> (n << 1) ^ (n >> 63)`
-- LEB128 uses 7 bits per byte with high bit as continuation flag
-- The significand is signed (negative values represent negative numbers)
+Big numbers use zigzag LEB128 metadata and little-endian magnitude bytes:
+- Format: `0xCA` + zigzag_leb128(exponent) + zigzag_leb128(signed_length) + magnitude_bytes
+- The exponent is a zigzag LEB128 signed integer (base-10 exponent)
+- The signed_length is a zigzag LEB128 signed integer encoding both sign and byte count:
+  positive N = positive significand with N magnitude bytes, negative -N = negative significand
+  with N magnitude bytes, zero = significand is zero (no magnitude bytes)
+- The magnitude_bytes are an unsigned integer in little-endian byte order (abs(signed_length) bytes)
+- Magnitude must be normalized: the last byte (most significant) must be non-zero
+- Value = sign(signed_length) x magnitude x 10^exponent
 
 ### Swift Decimal Support
 

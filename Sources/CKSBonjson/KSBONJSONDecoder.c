@@ -354,7 +354,7 @@ static ksbonjson_decodeStatus decodeAndReportFloat64(DecodeContext* const ctx)
 
 static ksbonjson_decodeStatus decodeAndReportBigNumber(DecodeContext* const ctx)
 {
-    // BigNumber: zigzag LEB128 exponent + zigzag LEB128 signed significand
+    // BigNumber: zigzag LEB128 exponent + zigzag LEB128 signed_length + LE magnitude bytes
     size_t available = (size_t)(ctx->bufferEnd - ctx->bufferCurrent);
 
     int64_t exponent;
@@ -366,17 +366,47 @@ static ksbonjson_decodeStatus decodeAndReportBigNumber(DecodeContext* const ctx)
     ctx->bufferCurrent += bytesRead;
     available -= bytesRead;
 
-    int64_t signedSignificand;
-    bytesRead = ksbonjson_readZigzagLEB128(ctx->bufferCurrent, available, &signedSignificand);
+    int64_t signedLength;
+    bytesRead = ksbonjson_readZigzagLEB128(ctx->bufferCurrent, available, &signedLength);
     unlikely_if(bytesRead == 0)
     {
         return KSBONJSON_DECODE_INCOMPLETE;
     }
     ctx->bufferCurrent += bytesRead;
+    available -= bytesRead;
 
-    // Extract sign and absolute significand
-    int sign = signedSignificand < 0 ? -1 : 0;
-    uint64_t significand = signedSignificand < 0 ? (uint64_t)(-signedSignificand) : (uint64_t)signedSignificand;
+    if (signedLength == 0)
+    {
+        // Zero significand
+        return ctx->callbacks->onBigNumber(ksbonjson_newBigNumber(0, 0, (int32_t)exponent), ctx->userData);
+    }
+
+    int sign = signedLength < 0 ? -1 : 0;
+    size_t byteCount = (size_t)(signedLength < 0 ? -signedLength : signedLength);
+
+    unlikely_if(byteCount > available)
+    {
+        return KSBONJSON_DECODE_INCOMPLETE;
+    }
+
+    unlikely_if(byteCount > 8)
+    {
+        return KSBONJSON_DECODE_VALUE_OUT_OF_RANGE;
+    }
+
+    // Validate normalization: last byte (most significant) must be non-zero
+    unlikely_if(ctx->bufferCurrent[byteCount - 1] == 0)
+    {
+        return KSBONJSON_DECODE_INVALID_DATA;
+    }
+
+    // Read LE magnitude bytes into uint64_t
+    uint64_t significand = 0;
+    for (size_t i = 0; i < byteCount; i++)
+    {
+        significand |= (uint64_t)ctx->bufferCurrent[i] << (i * 8);
+    }
+    ctx->bufferCurrent += byteCount;
 
     return ctx->callbacks->onBigNumber(ksbonjson_newBigNumber(sign, significand, (int32_t)exponent), ctx->userData);
 }
@@ -887,7 +917,7 @@ static ksbonjson_decodeStatus mapScanFloat64(KSBONJSONMapContext* ctx, size_t* o
     return KSBONJSON_DECODE_OK;
 }
 
-// Scan a big number (zigzag LEB128 exponent + zigzag LEB128 signed significand)
+// Scan a big number (zigzag LEB128 exponent + zigzag LEB128 signed_length + LE magnitude)
 static ksbonjson_decodeStatus mapScanBigNumber(KSBONJSONMapContext* ctx, size_t* outIndex)
 {
     MAP_SHOULD_HAVE_ENTRY_SPACE();
@@ -903,17 +933,46 @@ static ksbonjson_decodeStatus mapScanBigNumber(KSBONJSONMapContext* ctx, size_t*
     ctx->position += bytesRead;
     available -= bytesRead;
 
-    int64_t signedSignificand;
-    bytesRead = ksbonjson_readZigzagLEB128(ctx->input + ctx->position, available, &signedSignificand);
+    int64_t signedLength;
+    bytesRead = ksbonjson_readZigzagLEB128(ctx->input + ctx->position, available, &signedLength);
     unlikely_if(bytesRead == 0)
     {
         return KSBONJSON_DECODE_INCOMPLETE;
     }
     ctx->position += bytesRead;
+    available -= bytesRead;
 
-    // Extract sign and absolute significand
-    int32_t sign = signedSignificand < 0 ? -1 : 0;
-    uint64_t significand = signedSignificand < 0 ? (uint64_t)(-signedSignificand) : (uint64_t)signedSignificand;
+    int32_t sign = 0;
+    uint64_t significand = 0;
+
+    if (signedLength != 0)
+    {
+        sign = signedLength < 0 ? -1 : 0;
+        size_t byteCount = (size_t)(signedLength < 0 ? -signedLength : signedLength);
+
+        unlikely_if(byteCount > available)
+        {
+            return KSBONJSON_DECODE_INCOMPLETE;
+        }
+
+        unlikely_if(byteCount > 8)
+        {
+            return KSBONJSON_DECODE_VALUE_OUT_OF_RANGE;
+        }
+
+        // Validate normalization: last byte (most significant) must be non-zero
+        unlikely_if(ctx->input[ctx->position + byteCount - 1] == 0)
+        {
+            return KSBONJSON_DECODE_INVALID_DATA;
+        }
+
+        // Read LE magnitude bytes into uint64_t
+        for (size_t i = 0; i < byteCount; i++)
+        {
+            significand |= (uint64_t)ctx->input[ctx->position + i] << (i * 8);
+        }
+        ctx->position += byteCount;
+    }
 
     KSBONJSONMapEntry entry = {
         .type = KSBONJSON_TYPE_BIGNUMBER,
