@@ -136,6 +136,24 @@ public final class BONJSONDecoder {
         case keepLast
     }
 
+    /// The strategy to use when a BigNumber value exceeds configured resource limits.
+    public enum OutOfRangeBigNumberDecodingStrategy {
+        /// Throw an error when the BigNumber exceeds limits (default).
+        case `throw`
+
+        /// Present the out-of-range BigNumber as a string representation.
+        case stringify
+    }
+
+    /// The strategy to use for Unicode normalization of decoded strings.
+    public enum UnicodeNormalizationStrategy {
+        /// No normalization (default). Strings are returned as-is.
+        case none
+
+        /// Apply NFC (Canonical Decomposition followed by Canonical Composition).
+        case nfc
+    }
+
     /// The strategy to use for handling trailing bytes after the root value.
     public enum TrailingBytesDecodingStrategy {
         /// Reject documents with trailing bytes (default, most secure).
@@ -187,6 +205,18 @@ public final class BONJSONDecoder {
     /// Maximum document size in bytes. Default is 2,000,000,000 (BONJSON spec recommendation).
     public var maxDocumentSize: Int = 2_000_000_000
 
+    /// Maximum allowed BigNumber exponent (absolute value). Default is nil (no limit).
+    public var maxBigNumberExponent: Int? = nil
+
+    /// Maximum allowed BigNumber magnitude in bytes. Default is nil (no limit).
+    public var maxBigNumberMagnitude: Int? = nil
+
+    /// The strategy for handling BigNumber values that exceed resource limits.
+    public var outOfRangeBigNumberDecodingStrategy: OutOfRangeBigNumberDecodingStrategy = .throw
+
+    /// The strategy for Unicode normalization of decoded strings.
+    public var unicodeNormalizationStrategy: UnicodeNormalizationStrategy = .none
+
     /// Contextual user info for decoding.
     public var userInfo: [CodingUserInfoKey: Any] = [:]
 
@@ -210,8 +240,15 @@ public final class BONJSONDecoder {
             flags: decodeFlags,
             unicodeStrategy: unicodeDecodingStrategy,
             nulStrategy: nulDecodingStrategy,
-            duplicateKeyStrategy: duplicateKeyDecodingStrategy
+            duplicateKeyStrategy: duplicateKeyDecodingStrategy,
+            normalizationStrategy: unicodeNormalizationStrategy
         )
+
+        // When NFC normalization is active, C-layer duplicate detection is deferred
+        // because byte-equal keys may become equal after NFC normalization
+        if unicodeNormalizationStrategy == .nfc && duplicateKeyDecodingStrategy == .reject {
+            try map.validateNFCDuplicateKeys()
+        }
 
         let rootIndex = map.rootIndex
 
@@ -229,7 +266,10 @@ public final class BONJSONDecoder {
             keyDecodingStrategy: keyDecodingStrategy,
             unicodeDecodingStrategy: unicodeDecodingStrategy,
             nulDecodingStrategy: nulDecodingStrategy,
-            duplicateKeyDecodingStrategy: duplicateKeyDecodingStrategy
+            duplicateKeyDecodingStrategy: duplicateKeyDecodingStrategy,
+            maxBigNumberExponent: maxBigNumberExponent,
+            maxBigNumberMagnitude: maxBigNumberMagnitude,
+            outOfRangeBigNumberDecodingStrategy: outOfRangeBigNumberDecodingStrategy
         )
 
         let decoder = _MapDecoder(state: state, entryIndex: rootIndex, lazyPath: .root)
@@ -336,7 +376,9 @@ public final class BONJSONDecoder {
         // and handle in Swift when creating strings
         flags.rejectNUL = (nulDecodingStrategy == .reject)
         flags.rejectInvalidUTF8 = (unicodeDecodingStrategy == .reject)
-        flags.rejectDuplicateKeys = (duplicateKeyDecodingStrategy == .reject)
+        // When NFC normalization is active, defer duplicate key detection to Swift
+        // because byte-equal check won't catch NFC-equivalent keys
+        flags.rejectDuplicateKeys = (duplicateKeyDecodingStrategy == .reject && unicodeNormalizationStrategy == .none)
         flags.rejectTrailingBytes = (trailingBytesDecodingStrategy == .reject)
 
         // NaN/Infinity: allow at C level for .allow and .convertFromString strategies
@@ -386,6 +428,8 @@ public enum BONJSONDecodingError: Error, CustomStringConvertible {
     case decimalCannotRepresentNaN
     case decimalCannotRepresentInfinity
     case bigNumberExponentOutOfRange(Int32)
+    case bigNumberExponentExceeded(Int32)
+    case bigNumberMagnitudeExceeded(Int)
 
     public var description: String {
         switch self {
@@ -437,6 +481,10 @@ public enum BONJSONDecodingError: Error, CustomStringConvertible {
             return "Decimal cannot represent Infinity"
         case .bigNumberExponentOutOfRange(let exp):
             return "BigNumber exponent \(exp) is outside Decimal's supported range (-128 to 127)"
+        case .bigNumberExponentExceeded(let exp):
+            return "BigNumber exponent \(exp) exceeds maximum allowed"
+        case .bigNumberMagnitudeExceeded(let bytes):
+            return "BigNumber magnitude \(bytes) bytes exceeds maximum allowed"
         }
     }
 }
@@ -472,6 +520,7 @@ final class _PositionMap {
     let unicodeStrategy: BONJSONDecoder.UnicodeDecodingStrategy
     let nulStrategy: BONJSONDecoder.NULDecodingStrategy
     let duplicateKeyStrategy: BONJSONDecoder.DuplicateKeyDecodingStrategy
+    let normalizationStrategy: BONJSONDecoder.UnicodeNormalizationStrategy
 
     /// Convenience initializer with default (secure) settings.
     convenience init(data: Data) throws {
@@ -480,7 +529,8 @@ final class _PositionMap {
             flags: ksbonjson_defaultDecodeFlags(),
             unicodeStrategy: .reject,
             nulStrategy: .reject,
-            duplicateKeyStrategy: .reject
+            duplicateKeyStrategy: .reject,
+            normalizationStrategy: .none
         )
     }
 
@@ -490,12 +540,14 @@ final class _PositionMap {
         flags: KSBONJSONDecodeFlags,
         unicodeStrategy: BONJSONDecoder.UnicodeDecodingStrategy,
         nulStrategy: BONJSONDecoder.NULDecodingStrategy,
-        duplicateKeyStrategy: BONJSONDecoder.DuplicateKeyDecodingStrategy
+        duplicateKeyStrategy: BONJSONDecoder.DuplicateKeyDecodingStrategy,
+        normalizationStrategy: BONJSONDecoder.UnicodeNormalizationStrategy = .none
     ) throws {
         // Store strategies for later use in string creation
         self.unicodeStrategy = unicodeStrategy
         self.nulStrategy = nulStrategy
         self.duplicateKeyStrategy = duplicateKeyStrategy
+        self.normalizationStrategy = normalizationStrategy
 
         // Copy to contiguous array to ensure stable pointer
         self.inputBytes = ContiguousArray(data)
@@ -621,10 +673,11 @@ final class _PositionMap {
 
     /// Create a string from contiguous bytes at the given offset/length.
     private func createString(offset: Int, length: Int) -> String {
+        var result: String
         switch unicodeStrategy {
         case .reject, .replace:
             // C layer already validated for .reject; .replace uses Swift's behavior
-            return inputBytes.withUnsafeBufferPointer { ptr in
+            result = inputBytes.withUnsafeBufferPointer { ptr in
                 let start = ptr.baseAddress! + offset
                 let buffer = UnsafeBufferPointer(start: start, count: length)
                 return String(decoding: buffer, as: UTF8.self)
@@ -632,8 +685,14 @@ final class _PositionMap {
 
         case .delete:
             // Filter out invalid UTF-8 bytes before creating string
-            return createStringDeletingInvalidUTF8(offset: offset, length: length)
+            result = createStringDeletingInvalidUTF8(offset: offset, length: length)
         }
+
+        if normalizationStrategy == .nfc {
+            result = result.precomposedStringWithCanonicalMapping
+        }
+
+        return result
     }
 
     /// Create a string by filtering out invalid UTF-8 sequences.
@@ -706,6 +765,36 @@ final class _PositionMap {
         }
 
         return String(decoding: validBytes, as: UTF8.self)
+    }
+
+    /// Check for duplicate keys in objects after NFC normalization.
+    /// Only needed when NFC normalization is active and duplicate rejection is desired.
+    func validateNFCDuplicateKeys() throws {
+        for i in 0..<entryCount {
+            let entry = entries[i]
+            guard entry.type == KSBONJSON_TYPE_OBJECT else { continue }
+
+            let pairCount = Int(entry.data.container.count) / 2
+            guard pairCount > 1 else { continue }
+
+            var seenKeys = Set<String>()
+            seenKeys.reserveCapacity(pairCount)
+            var currentIndex = Int(entry.data.container.firstChild)
+
+            for _ in 0..<pairCount {
+                let keyIndex = currentIndex
+                let valueIndex = nextSiblingIndex(keyIndex)
+                currentIndex = nextSiblingIndex(valueIndex)
+
+                if let key = getString(at: size_t(keyIndex)) {
+                    // getString already applies NFC normalization
+                    if seenKeys.contains(key) {
+                        throw BONJSONDecodingError.duplicateObjectKey(key)
+                    }
+                    seenKeys.insert(key)
+                }
+            }
+        }
     }
 
     /// Get entry count.
@@ -928,6 +1017,9 @@ final class _MapDecoderState {
     let unicodeDecodingStrategy: BONJSONDecoder.UnicodeDecodingStrategy
     let nulDecodingStrategy: BONJSONDecoder.NULDecodingStrategy
     let duplicateKeyDecodingStrategy: BONJSONDecoder.DuplicateKeyDecodingStrategy
+    let maxBigNumberExponent: Int?
+    let maxBigNumberMagnitude: Int?
+    let outOfRangeBigNumberDecodingStrategy: BONJSONDecoder.OutOfRangeBigNumberDecodingStrategy
 
     init(
         map: _PositionMap,
@@ -938,7 +1030,10 @@ final class _MapDecoderState {
         keyDecodingStrategy: BONJSONDecoder.KeyDecodingStrategy,
         unicodeDecodingStrategy: BONJSONDecoder.UnicodeDecodingStrategy = .reject,
         nulDecodingStrategy: BONJSONDecoder.NULDecodingStrategy = .reject,
-        duplicateKeyDecodingStrategy: BONJSONDecoder.DuplicateKeyDecodingStrategy = .reject
+        duplicateKeyDecodingStrategy: BONJSONDecoder.DuplicateKeyDecodingStrategy = .reject,
+        maxBigNumberExponent: Int? = nil,
+        maxBigNumberMagnitude: Int? = nil,
+        outOfRangeBigNumberDecodingStrategy: BONJSONDecoder.OutOfRangeBigNumberDecodingStrategy = .throw
     ) {
         self.map = map
         self.userInfo = userInfo
@@ -949,6 +1044,9 @@ final class _MapDecoderState {
         self.unicodeDecodingStrategy = unicodeDecodingStrategy
         self.nulDecodingStrategy = nulDecodingStrategy
         self.duplicateKeyDecodingStrategy = duplicateKeyDecodingStrategy
+        self.maxBigNumberExponent = maxBigNumberExponent
+        self.maxBigNumberMagnitude = maxBigNumberMagnitude
+        self.outOfRangeBigNumberDecodingStrategy = outOfRangeBigNumberDecodingStrategy
     }
 
     /// Validate and return a float value according to the non-conforming float strategy.
@@ -991,9 +1089,34 @@ final class _MapDecoderState {
         }
     }
 
+    /// Try to stringify a non-conforming float value (NaN/Inf) when the
+    /// convertFromString strategy is active. Returns nil if not applicable.
+    @inline(__always)
+    func tryStringifyNonConformingFloat(_ value: Double) -> String? {
+        guard !value.isFinite else { return nil }
+        switch nonConformingFloatDecodingStrategy {
+        case .convertFromString(let posInf, let negInf, let nan):
+            if value.isNaN { return nan }
+            if value == .infinity { return posInf }
+            if value == -.infinity { return negInf }
+            return nil
+        case .throw, .allow:
+            return nil
+        }
+    }
+
     /// Decode a BigNumber entry to a Double value.
+    /// Checks resource limits and throws or stringifies as configured.
     @inline(__always)
     func decodeBigNumber(_ bn: (significand: UInt64, exponent: Int32, sign: Int32)) throws -> Double {
+        if let violation = validateBigNumberLimits(bn) {
+            switch violation {
+            case .exponent(let exp):
+                throw BONJSONDecodingError.bigNumberExponentExceeded(exp)
+            case .magnitude(let bytes):
+                throw BONJSONDecodingError.bigNumberMagnitudeExceeded(bytes)
+            }
+        }
         let significand = Double(bn.significand)
         let result = significand * pow(10.0, Double(bn.exponent))
         return bn.sign < 0 ? -result : result
@@ -1003,19 +1126,55 @@ final class _MapDecoderState {
     /// Throws if the exponent is outside Decimal's supported range (-128 to 127).
     @inline(__always)
     func decodeBigNumberAsDecimal(_ bn: (significand: UInt64, exponent: Int32, sign: Int32)) throws -> Decimal {
+        if let violation = validateBigNumberLimits(bn) {
+            switch violation {
+            case .exponent(let exp):
+                throw BONJSONDecodingError.bigNumberExponentExceeded(exp)
+            case .magnitude(let bytes):
+                throw BONJSONDecodingError.bigNumberMagnitudeExceeded(bytes)
+            }
+        }
         // Check exponent range - Decimal supports -128 to 127
         guard bn.exponent >= -128 && bn.exponent <= 127 else {
             throw BONJSONDecodingError.bigNumberExponentOutOfRange(bn.exponent)
         }
 
         // Build Decimal from components
-        // Decimal(sign:exponent:significand:) expects:
-        // - sign: FloatingPointSign
-        // - exponent: Int (the power of 10)
-        // - significand: Decimal (we convert UInt64 to Decimal first)
         let sign: FloatingPointSign = bn.sign < 0 ? .minus : .plus
         let significandDecimal = Decimal(bn.significand)
         return Decimal(sign: sign, exponent: Int(bn.exponent), significand: significandDecimal)
+    }
+
+    /// Validate BigNumber against configured resource limits.
+    /// Returns nil if within limits, or a BigNumberLimitViolation if exceeded.
+    @inline(__always)
+    func validateBigNumberLimits(_ bn: (significand: UInt64, exponent: Int32, sign: Int32)) -> BigNumberLimitViolation? {
+        if let maxExp = maxBigNumberExponent {
+            if abs(Int(bn.exponent)) > maxExp {
+                return .exponent(bn.exponent)
+            }
+        }
+        if let maxMag = maxBigNumberMagnitude {
+            let magBytes = bn.significand == 0 ? 0 : (64 - bn.significand.leadingZeroBitCount + 7) / 8
+            if magBytes > maxMag {
+                return .magnitude(magBytes)
+            }
+        }
+        return nil
+    }
+
+    /// Stringify a BigNumber value for out-of-range presentation.
+    func stringifyBigNumber(_ bn: (significand: UInt64, exponent: Int32, sign: Int32)) -> String {
+        let signStr = bn.sign < 0 ? "-" : ""
+        if bn.exponent == 0 {
+            return "\(signStr)\(bn.significand)"
+        }
+        return "\(signStr)\(bn.significand)e\(bn.exponent)"
+    }
+
+    enum BigNumberLimitViolation {
+        case exponent(Int32)
+        case magnitude(Int)
     }
 }
 
@@ -1509,6 +1668,22 @@ struct _MapKeyedDecodingContainer<Key: CodingKey>: KeyedDecodingContainerProtoco
     @inline(__always)
     func decode(_ type: String.Type, forKey key: Key) throws -> String {
         let idx = try valueIndex(forKey: key)
+        let entry = state.map.getEntryUnchecked(at: Int(idx))
+        if entry.type == KSBONJSON_TYPE_FLOAT {
+            if let str = state.tryStringifyNonConformingFloat(entry.data.floatValue) {
+                return str
+            }
+        }
+        if entry.type == KSBONJSON_TYPE_BIGNUMBER {
+            let bn = entry.data.bigNumber
+            if state.outOfRangeBigNumberDecodingStrategy == .stringify,
+               state.validateBigNumberLimits((bn.significand, bn.exponent, bn.sign)) != nil {
+                return state.stringifyBigNumber((bn.significand, bn.exponent, bn.sign))
+            }
+        }
+        guard entry.type == KSBONJSON_TYPE_STRING else {
+            throw BONJSONDecodingError.typeMismatch(expected: "string", actual: describeType(entry.type))
+        }
         guard let string = state.map.getString(at: idx) else {
             throw BONJSONDecodingError.invalidUTF8String
         }
@@ -1774,6 +1949,18 @@ struct _MapUnkeyedDecodingContainer: UnkeyedDecodingContainer {
     @inline(__always)
     mutating func decode(_ type: String.Type) throws -> String {
         let (idx, entry) = try nextEntry()
+        if entry.type == KSBONJSON_TYPE_FLOAT {
+            if let str = state.tryStringifyNonConformingFloat(entry.data.floatValue) {
+                return str
+            }
+        }
+        if entry.type == KSBONJSON_TYPE_BIGNUMBER {
+            let bn = entry.data.bigNumber
+            if state.outOfRangeBigNumberDecodingStrategy == .stringify,
+               state.validateBigNumberLimits((bn.significand, bn.exponent, bn.sign)) != nil {
+                return state.stringifyBigNumber((bn.significand, bn.exponent, bn.sign))
+            }
+        }
         guard entry.type == KSBONJSON_TYPE_STRING else {
             throw BONJSONDecodingError.typeMismatch(expected: "string", actual: describeType(entry.type))
         }
@@ -1956,8 +2143,23 @@ struct _MapSingleValueDecodingContainer: SingleValueDecodingContainer {
 
     @inline(__always)
     func decode(_ type: String.Type) throws -> String {
-        guard let entry = entry, entry.type == KSBONJSON_TYPE_STRING else {
-            throw BONJSONDecodingError.typeMismatch(expected: "string", actual: entry.map { describeType($0.type) } ?? "nil")
+        guard let entry = entry else {
+            throw BONJSONDecodingError.unexpectedEndOfData
+        }
+        if entry.type == KSBONJSON_TYPE_FLOAT {
+            if let str = state.tryStringifyNonConformingFloat(entry.data.floatValue) {
+                return str
+            }
+        }
+        if entry.type == KSBONJSON_TYPE_BIGNUMBER {
+            let bn = entry.data.bigNumber
+            if state.outOfRangeBigNumberDecodingStrategy == .stringify,
+               state.validateBigNumberLimits((bn.significand, bn.exponent, bn.sign)) != nil {
+                return state.stringifyBigNumber((bn.significand, bn.exponent, bn.sign))
+            }
+        }
+        guard entry.type == KSBONJSON_TYPE_STRING else {
+            throw BONJSONDecodingError.typeMismatch(expected: "string", actual: describeType(entry.type))
         }
         guard let string = state.map.getString(at: entryIndex) else {
             throw BONJSONDecodingError.invalidUTF8String

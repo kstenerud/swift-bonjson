@@ -163,6 +163,10 @@ struct TestOptions: Decodable {
     let nanInfinityBehavior: String?  // "allow", "stringify"
     let duplicateKey: String?         // "keep_first", "keep_last"
     let invalidUtf8: String?          // "replace", "delete"
+    let maxBigNumberExponent: Int?
+    let maxBigNumberMagnitude: Int?
+    let outOfRange: String?           // "stringify"
+    let unicodeNormalization: String?  // "none", "nfc"
 
     // Track unrecognized options for skip detection
     var hasUnrecognizedOptions: Bool = false
@@ -178,6 +182,10 @@ struct TestOptions: Decodable {
         case nanInfinityBehavior = "nan_infinity_behavior"
         case duplicateKey = "duplicate_key"
         case invalidUtf8 = "invalid_utf8"
+        case maxBigNumberExponent = "max_bignumber_exponent"
+        case maxBigNumberMagnitude = "max_bignumber_magnitude"
+        case outOfRange = "out_of_range"
+        case unicodeNormalization = "unicode_normalization"
     }
 
     init(from decoder: Decoder) throws {
@@ -192,6 +200,10 @@ struct TestOptions: Decodable {
         nanInfinityBehavior = try container.decodeIfPresent(String.self, forKey: .nanInfinityBehavior)
         duplicateKey = try container.decodeIfPresent(String.self, forKey: .duplicateKey)
         invalidUtf8 = try container.decodeIfPresent(String.self, forKey: .invalidUtf8)
+        maxBigNumberExponent = try container.decodeIfPresent(Int.self, forKey: .maxBigNumberExponent)
+        maxBigNumberMagnitude = try container.decodeIfPresent(Int.self, forKey: .maxBigNumberMagnitude)
+        outOfRange = try container.decodeIfPresent(String.self, forKey: .outOfRange)
+        unicodeNormalization = try container.decodeIfPresent(String.self, forKey: .unicodeNormalization)
 
         // Check for unrecognized options by comparing key counts
         let dynamicContainer = try decoder.container(keyedBy: DynamicCodingKey.self)
@@ -558,6 +570,8 @@ enum StandardErrorType: String {
     case nanNotAllowed = "nan_not_allowed"
     case infinityNotAllowed = "infinity_not_allowed"
     case invalidObjectKey = "invalid_object_key"
+    case maxBigNumberExponentExceeded = "max_bignumber_exponent_exceeded"
+    case maxBigNumberMagnitudeExceeded = "max_bignumber_magnitude_exceeded"
 }
 
 // MARK: - Hex String Parsing
@@ -658,6 +672,12 @@ func mapErrorToStandardType(_ error: Error) -> StandardErrorType? {
     // C error: "Expected to find a string for an object element name"
     if desc.contains("object") && desc.contains("name") && desc.contains("string") {
         return .invalidObjectKey
+    }
+    if desc.contains("bignumber exponent") && desc.contains("exceeds") {
+        return .maxBigNumberExponentExceeded
+    }
+    if desc.contains("bignumber magnitude") && desc.contains("exceeds") {
+        return .maxBigNumberMagnitudeExceeded
     }
 
     return nil
@@ -1113,9 +1133,12 @@ final class ConformanceTests: XCTestCase {
     /// Capabilities supported by this implementation.
     /// Tests with `requires` containing capabilities not in this set will be skipped.
     private static let supportedCapabilities: Set<String> = [
-        // Swift's Decimal supports exponents -128 to 127
-        // Swift's UInt64 significand supports ~19 significant digits
-        // NaN/Infinity stringify is not supported (Swift has native NaN/Infinity)
+        "int64",
+        "encode_nul_rejection",
+        "nan_infinity_stringify",
+        "bignumber_resource_limits",
+        "out_of_range_stringify",
+        "unicode_normalization",
     ]
 
     private func runTest(_ test: TestCase, testId: String) throws {
@@ -1245,6 +1268,33 @@ final class ConformanceTests: XCTestCase {
                 decoder.unicodeDecodingStrategy = .replace
             case "delete":
                 decoder.unicodeDecodingStrategy = .delete
+            default:
+                break
+            }
+        }
+
+        if let maxBigNumberExponent = options.maxBigNumberExponent {
+            decoder.maxBigNumberExponent = maxBigNumberExponent
+        }
+        if let maxBigNumberMagnitude = options.maxBigNumberMagnitude {
+            decoder.maxBigNumberMagnitude = maxBigNumberMagnitude
+        }
+
+        if let outOfRange = options.outOfRange {
+            switch outOfRange {
+            case "stringify":
+                decoder.outOfRangeBigNumberDecodingStrategy = .stringify
+            default:
+                break
+            }
+        }
+
+        if let unicodeNormalization = options.unicodeNormalization {
+            switch unicodeNormalization {
+            case "nfc":
+                decoder.unicodeNormalizationStrategy = .nfc
+            case "none":
+                decoder.unicodeNormalizationStrategy = .none
             default:
                 break
             }

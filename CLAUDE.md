@@ -140,17 +140,19 @@ Big numbers use zigzag LEB128 metadata and little-endian magnitude bytes:
 Swift's `Decimal` type is used for encoding and decoding BigNumber values:
 
 **Encoding**: When encoding a `Decimal` value, it is automatically encoded as a BONJSON BigNumber,
-preserving precision that would be lost with Double conversion.
+preserving precision that would be lost with Double conversion. Values with mantissa > 64 bits
+(e.g., 2^64) are encoded by writing raw magnitude bytes directly from the Decimal's internal
+mantissa words.
 
 **Decoding**: When decoding a BigNumber to `Decimal`, the full precision is preserved within
 implementation limits.
 
 **Implementation Limits**:
-- Significand: up to 19 decimal digits (limited by UInt64 internal storage)
+- Significand: up to 19 decimal digits for roundtrip (limited by UInt64 internal storage)
 - Exponent: -128 to 127 (limited by Swift Decimal's exponent range)
 
-Values exceeding these limits cannot be roundtrip-tested with this implementation, but can still
-be decoded to Double (with precision loss) or to a custom type.
+Values exceeding these limits can be decoded to Double (with precision loss), or presented as
+strings using the `outOfRangeBigNumberDecodingStrategy = .stringify` option.
 
 ## Security Features
 
@@ -217,6 +219,36 @@ The BONJSON spec provides three options for handling these values, all supported
 
 Note: Using `.allow` creates BONJSON data that cannot be converted to JSON. The `.convertToString`
 and `.convertFromString` strategies maintain JSON compatibility by using string representations.
+
+When using `.convertFromString` on the decoder, NaN/Infinity float values encountered as BONJSON
+floats are automatically presented as their string representation when decoded as `String.Type`.
+This allows decode-only stringify behavior without separate encoding.
+
+### BigNumber Resource Limits
+
+Configurable limits for BigNumber values (decoder only):
+
+| Property | Default | Description |
+|----------|---------|-------------|
+| `maxBigNumberExponent` | nil (no limit) | Maximum absolute exponent value |
+| `maxBigNumberMagnitude` | nil (no limit) | Maximum magnitude in bytes |
+
+When limits are exceeded, behavior depends on `outOfRangeBigNumberDecodingStrategy`:
+- `.throw` (default): Throw error
+- `.stringify`: Present the value as a string when decoded as `String.Type`
+
+### Unicode Normalization
+
+Configure via `unicodeNormalizationStrategy`:
+- `.none` (default): No normalization, strings returned as-is
+- `.nfc`: Apply NFC (Canonical Decomposition followed by Canonical Composition)
+
+When NFC normalization is active with `.reject` duplicate key strategy, duplicate detection
+occurs after normalization so that NFC-equivalent keys are correctly detected as duplicates.
+
+Note: Swift's `String` type internally normalizes Unicode, so the `.none` strategy cannot
+distinguish differently-encoded forms of the same character (e.g., precomposed vs decomposed)
+at the String comparison level. This is a fundamental limitation of Swift's String type.
 
 ### Resource Limits
 
@@ -297,15 +329,26 @@ swift test --filter Conformance
 **Supported test options:**
 - `allow_nul`, `allow_nan_infinity`, `allow_trailing_bytes`
 - `max_depth`, `max_container_size`, `max_string_length`, `max_document_size`
-- `nan_infinity`: "allow" (pass through), "stringify" is skipped (converts floats to strings, not supported)
+- `nan_infinity_behavior`: "allow", "stringify" (NaN/Inf floats presented as strings when decoded as String)
 - `duplicate_key`: "keep_first", "keep_last"
 - `invalid_utf8`: "replace", "delete"
+- `max_bignumber_exponent`, `max_bignumber_magnitude`
+- `out_of_range`: "stringify" (out-of-range BigNumbers presented as strings)
+- `unicode_normalization`: "none", "nfc"
 
-**Skipped tests (24 total):**
-- 21 BigNumber tests that exceed implementation limits:
-  - Tests with >19 significant digits (exceeds UInt64 significand limit)
-  - Tests with exponents outside -128 to 127 (exceeds Swift Decimal range)
-- 3 `nan_infinity: "stringify"` tests (would require converting float NaN/Infinity to strings)
+**Supported capabilities:**
+- `int64`, `encode_nul_rejection`, `nan_infinity_stringify`
+- `bignumber_resource_limits`, `out_of_range_stringify`, `unicode_normalization`
+
+**Skipped tests (27 total):**
+- 15 `arbitrary_precision_bignumber` tests (C layer stores UInt64 significand)
+- 2 `signaling_nan` tests (Swift doesn't distinguish sNaN vs qNaN)
+- 2 `raw_string_bytes` tests (Swift String requires valid UTF-8)
+- 8 BigNumber exponent tests outside -128 to 127 (exceeds Swift Decimal range)
+
+**Known failures (1):**
+- `unicode_normalization_none_different_keys`: Swift's String type normalizes Unicode internally,
+  so differently-encoded forms of the same character are equal at the String level
 
 ## Build Commands
 

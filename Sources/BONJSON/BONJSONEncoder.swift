@@ -596,36 +596,107 @@ final class _BufferEncoder: Encoder {
         let sign: Int32 = value.sign == .minus ? -1 : 1
         let exponent = Int32(truncatingIfNeeded: value.exponent)
 
-        // Get the significand as a Decimal and convert to UInt64
-        // The significand property returns the mantissa without the exponent
-        let significandDecimal = value.significand
-        var significand: UInt64 = 0
-
+        // Get the significand as a Decimal and convert to UInt64.
         // Decimal structure layout (Darwin/NSDecimal):
         // bytes[0-3]: packed fields (_exponent:8, _length:4, _isNegative:1, _isCompact:1, _reserved:18)
         // bytes[4-19]: _mantissa (8 x UInt16, little-endian)
+        let significandDecimal = value.significand
         var sigDecimal = significandDecimal
+
+        var mantissaLength = 0
+        var significand: UInt64 = 0
+        var mantissaWords = [UInt16](repeating: 0, count: 8)
+
         withUnsafeBytes(of: &sigDecimal) { bytes in
-            // Extract length from bits 8-11 of the first 4 bytes
             let packedFields = bytes.load(fromByteOffset: 0, as: UInt32.self)
-            let length = (packedFields >> 8) & 0xF
-
-            // Mantissa starts at byte offset 4
+            mantissaLength = Int((packedFields >> 8) & 0xF)
             let mantissaOffset = 4
-            let usedDigits = min(Int(length), 4) // We can only fit 4 UInt16s in UInt64
 
-            for i in 0..<usedDigits {
-                let digit = bytes.load(fromByteOffset: mantissaOffset + i * 2, as: UInt16.self)
-                significand |= UInt64(digit) << (i * 16)
+            if mantissaLength <= 4 {
+                for i in 0..<mantissaLength {
+                    let digit = bytes.load(fromByteOffset: mantissaOffset + i * 2, as: UInt16.self)
+                    significand |= UInt64(digit) << (i * 16)
+                }
+            } else {
+                for i in 0..<min(mantissaLength, 8) {
+                    mantissaWords[i] = bytes.load(fromByteOffset: mantissaOffset + i * 2, as: UInt16.self)
+                }
             }
         }
 
-        // Create KSBigNumber and encode
-        // Max bignumber size: 13 bytes (type + header + 3 exp + 8 sig)
-        let bigNumber = ksbonjson_newBigNumber(sign, significand, exponent)
-        state.ensureCapacity(13)
-        let result = ksbonjson_encodeToBuffer_bigNumber(&state.context, bigNumber)
-        try throwIfEncodingFailed(result)
+        if mantissaLength <= 4 {
+            let bigNumber = ksbonjson_newBigNumber(sign, significand, exponent)
+            state.ensureCapacity(13)
+            let result = ksbonjson_encodeToBuffer_bigNumber(&state.context, bigNumber)
+            try throwIfEncodingFailed(result)
+        } else {
+            try encodeDecimalLargeMantissa(
+                mantissaWords: mantissaWords,
+                mantissaLength: mantissaLength,
+                exponent: exponent,
+                sign: sign
+            )
+        }
+    }
+
+    /// Fallback encoding for Decimal values whose mantissa exceeds UInt64.
+    /// Writes BigNumber bytes directly to the buffer using mantissa words.
+    private func encodeDecimalLargeMantissa(
+        mantissaWords: [UInt16],
+        mantissaLength: Int,
+        exponent: Int32,
+        sign: Int32
+    ) throws {
+        // Build magnitude bytes from mantissa words (little-endian)
+        var magnitudeBytes = [UInt8]()
+        magnitudeBytes.reserveCapacity(mantissaLength * 2)
+        for i in 0..<mantissaLength {
+            magnitudeBytes.append(UInt8(mantissaWords[i] & 0xFF))
+            magnitudeBytes.append(UInt8(mantissaWords[i] >> 8))
+        }
+        // Strip trailing zero bytes (normalize)
+        while magnitudeBytes.last == 0 && !magnitudeBytes.isEmpty {
+            magnitudeBytes.removeLast()
+        }
+
+        let signedLength = sign < 0 ? -Int64(magnitudeBytes.count) : Int64(magnitudeBytes.count)
+
+        // Encode zigzag LEB128 helper
+        func zigzagEncode(_ value: Int64) -> UInt64 {
+            return UInt64(bitPattern: (value << 1) ^ (value >> 63))
+        }
+        func leb128Bytes(_ value: UInt64) -> [UInt8] {
+            var result = [UInt8]()
+            var v = value
+            repeat {
+                var byte = UInt8(v & 0x7F)
+                v >>= 7
+                if v != 0 { byte |= 0x80 }
+                result.append(byte)
+            } while v != 0
+            return result
+        }
+
+        let expBytes = leb128Bytes(zigzagEncode(Int64(exponent)))
+        let lenBytes = leb128Bytes(zigzagEncode(signedLength))
+
+        // Build the complete BigNumber encoding
+        var encoded = [UInt8]()
+        encoded.reserveCapacity(1 + expBytes.count + lenBytes.count + magnitudeBytes.count)
+        encoded.append(0xCA)  // TYPE_BIG_NUMBER
+        encoded.append(contentsOf: expBytes)
+        encoded.append(contentsOf: lenBytes)
+        encoded.append(contentsOf: magnitudeBytes)
+
+        // Write directly into the buffer and advance position
+        state.ensureCapacity(encoded.count)
+        state.buffer.withUnsafeMutableBufferPointer { bufferPtr in
+            let pos = Int(state.context.position)
+            for i in 0..<encoded.count {
+                bufferPtr[pos + i] = encoded[i]
+            }
+            state.context.position = size_t(pos + encoded.count)
+        }
     }
 }
 
