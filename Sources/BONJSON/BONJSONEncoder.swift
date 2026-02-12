@@ -156,8 +156,55 @@ public final class BONJSONEncoder {
             try state.encodeBatchInt64Array(int64Array)
         } else if let doubleArray = value as? [Double] {
             try state.encodeBatchDoubleArray(doubleArray)
+        } else if let floatArray = value as? [Float] {
+            try state.encodeBatchFloat32Array(floatArray)
+        } else if let int32Array = value as? [Int32] {
+            try state.encodeBatchInt32Array(int32Array)
+        } else if let int16Array = value as? [Int16] {
+            try state.encodeBatchInt16Array(int16Array)
+        } else if let int8Array = value as? [Int8] {
+            try state.encodeBatchInt8Array(int8Array)
+        } else if let uint64Array = value as? [UInt64] {
+            try state.encodeBatchUInt64Array(uint64Array)
+        } else if let uintArray = value as? [UInt] {
+            try state.encodeBatchUIntArray(uintArray)
+        } else if let uint32Array = value as? [UInt32] {
+            try state.encodeBatchUInt32Array(uint32Array)
+        } else if let uint16Array = value as? [UInt16] {
+            try state.encodeBatchUInt16Array(uint16Array)
+        } else if let uint8Array = value as? [UInt8] {
+            try state.encodeBatchUInt8Array(uint8Array)
+        } else if let boolArray = value as? [Bool] {
+            try state.encodeBatchBoolArray(boolArray)
         } else if let stringArray = value as? [String] {
             try state.encodeBatchStringArray(stringArray)
+        } else if let candidate = value as? _RecordCandidateArray, candidate._recordCandidateCount >= 2,
+                  let keys = try candidate._probeFirstElementKeys(using: keyEncodingStrategy),
+                  !keys.isEmpty {
+            // Try record encoding for arrays of keyed objects
+            let savedPosition = state.context.position
+            let savedDepth = state.currentDepth
+            do {
+                try state.encodeRecordDefinition(keys: keys)
+                state.recordSchema = keys
+                // Write array begin
+                state.ensureCapacity(Int(KSBONJSON_MAX_ENCODED_SIZE_CONTAINER_BEGIN))
+                let beginResult = ksbonjson_encodeToBuffer_beginArray(&state.context)
+                try throwIfEncodingFailed(beginResult)
+                try candidate._encodeRecordElements(to: state, codingPath: [])
+                // Write array end
+                state.ensureCapacity(Int(KSBONJSON_MAX_ENCODED_SIZE_CONTAINER_END))
+                let endResult = ksbonjson_encodeToBuffer_endContainer(&state.context)
+                try throwIfEncodingFailed(endResult)
+                state.recordSchema = nil
+            } catch is _RecordEncodingFallback {
+                // Schema mismatch — reset buffer and fall through to regular Codable
+                state.recordSchema = nil
+                state.context.position = savedPosition
+                state.context.containerDepth = Int32(savedDepth)
+                let encoder = _BufferEncoder(state: state, codingPath: [])
+                try encoder.encodeValue(value)
+            }
         } else {
             // Default path through Codable
             let encoder = _BufferEncoder(state: state, codingPath: [])
@@ -254,6 +301,9 @@ final class _BufferEncoderState {
     let nonConformingFloatEncodingStrategy: BONJSONEncoder.NonConformingFloatEncodingStrategy
     let keyEncodingStrategy: BONJSONEncoder.KeyEncodingStrategy
     let nulEncodingStrategy: BONJSONEncoder.NULEncodingStrategy
+
+    /// Record mode state: when set, keyed containers use record instance encoding.
+    var recordSchema: [String]?
 
     /// Initial buffer size.
     private static let initialCapacity = 256
@@ -397,6 +447,98 @@ final class _BufferEncoderState {
         try throwIfEncodingFailed(result)
     }
 
+    /// Batch encode an array of Float values as typed float32 array.
+    func encodeBatchFloat32Array(_ values: [Float]) throws {
+        ensureCapacity(Int(ksbonjson_maxEncodedSize_float32Array(values.count)))
+        let result = values.withUnsafeBufferPointer { ptr in
+            ksbonjson_encodeToBuffer_float32Array(&context, ptr.baseAddress, values.count)
+        }
+        try throwIfEncodingFailed(result)
+    }
+
+    /// Batch encode an array of UInt8 values as typed uint8 array.
+    func encodeBatchUInt8Array(_ values: [UInt8]) throws {
+        ensureCapacity(Int(ksbonjson_maxEncodedSize_uint8Array(values.count)))
+        let result = values.withUnsafeBufferPointer { ptr in
+            ksbonjson_encodeToBuffer_uint8Array(&context, ptr.baseAddress, values.count)
+        }
+        try throwIfEncodingFailed(result)
+    }
+
+    /// Batch encode an array of UInt16 values as typed uint16 array.
+    func encodeBatchUInt16Array(_ values: [UInt16]) throws {
+        ensureCapacity(Int(ksbonjson_maxEncodedSize_uint16Array(values.count)))
+        let result = values.withUnsafeBufferPointer { ptr in
+            ksbonjson_encodeToBuffer_uint16Array(&context, ptr.baseAddress, values.count)
+        }
+        try throwIfEncodingFailed(result)
+    }
+
+    /// Batch encode an array of UInt32 values as typed uint32 array.
+    func encodeBatchUInt32Array(_ values: [UInt32]) throws {
+        ensureCapacity(Int(ksbonjson_maxEncodedSize_uint32Array(values.count)))
+        let result = values.withUnsafeBufferPointer { ptr in
+            ksbonjson_encodeToBuffer_uint32Array(&context, ptr.baseAddress, values.count)
+        }
+        try throwIfEncodingFailed(result)
+    }
+
+    /// Batch encode an array of UInt64 values as typed uint64 array.
+    func encodeBatchUInt64Array(_ values: [UInt64]) throws {
+        ensureCapacity(Int(ksbonjson_maxEncodedSize_uint64Array(values.count)))
+        let result = values.withUnsafeBufferPointer { ptr in
+            ksbonjson_encodeToBuffer_uint64Array(&context, ptr.baseAddress, values.count)
+        }
+        try throwIfEncodingFailed(result)
+    }
+
+    /// Batch encode an array of UInt values as typed uint64 array.
+    func encodeBatchUIntArray(_ values: [UInt]) throws {
+        ensureCapacity(Int(ksbonjson_maxEncodedSize_uint64Array(values.count)))
+        let result = values.withUnsafeBufferPointer { ptr in
+            ptr.baseAddress!.withMemoryRebound(to: UInt64.self, capacity: values.count) { uint64Ptr in
+                ksbonjson_encodeToBuffer_uint64Array(&context, uint64Ptr, values.count)
+            }
+        }
+        try throwIfEncodingFailed(result)
+    }
+
+    /// Batch encode an array of Int8 values as typed sint8 array.
+    func encodeBatchInt8Array(_ values: [Int8]) throws {
+        ensureCapacity(Int(ksbonjson_maxEncodedSize_int8Array(values.count)))
+        let result = values.withUnsafeBufferPointer { ptr in
+            ksbonjson_encodeToBuffer_int8Array(&context, ptr.baseAddress, values.count)
+        }
+        try throwIfEncodingFailed(result)
+    }
+
+    /// Batch encode an array of Int16 values as typed sint16 array.
+    func encodeBatchInt16Array(_ values: [Int16]) throws {
+        ensureCapacity(Int(ksbonjson_maxEncodedSize_int16Array(values.count)))
+        let result = values.withUnsafeBufferPointer { ptr in
+            ksbonjson_encodeToBuffer_int16Array(&context, ptr.baseAddress, values.count)
+        }
+        try throwIfEncodingFailed(result)
+    }
+
+    /// Batch encode an array of Int32 values as typed sint32 array.
+    func encodeBatchInt32Array(_ values: [Int32]) throws {
+        ensureCapacity(Int(ksbonjson_maxEncodedSize_int32Array(values.count)))
+        let result = values.withUnsafeBufferPointer { ptr in
+            ksbonjson_encodeToBuffer_int32Array(&context, ptr.baseAddress, values.count)
+        }
+        try throwIfEncodingFailed(result)
+    }
+
+    /// Batch encode an array of Bool values as regular array.
+    func encodeBatchBoolArray(_ values: [Bool]) throws {
+        ensureCapacity(Int(ksbonjson_maxEncodedSize_boolArray(values.count)))
+        let result = values.withUnsafeBufferPointer { ptr in
+            ksbonjson_encodeToBuffer_boolArray(&context, ptr.baseAddress, values.count)
+        }
+        try throwIfEncodingFailed(result)
+    }
+
     /// Batch encode an array of String values.
     func encodeBatchStringArray(_ values: [String]) throws {
         // Calculate total UTF-8 length for capacity estimation
@@ -449,6 +591,75 @@ final class _BufferEncoderState {
 
         try throwIfEncodingFailed(result)
     }
+
+    /// Write a record definition directly to the buffer.
+    /// Record definitions are written outside container tracking, so we write raw bytes
+    /// to avoid corrupting the C encoder's container state.
+    func encodeRecordDefinition(keys: [String]) throws {
+        // Estimate capacity: 1 (def marker) + keys + 1 (end marker)
+        var totalKeyBytes = 0
+        for key in keys {
+            totalKeyBytes += Int(ksbonjson_maxEncodedSize_string(key.utf8.count))
+        }
+        ensureCapacity(2 + totalKeyBytes)
+
+        buffer.withUnsafeMutableBufferPointer { bufferPtr in
+            var pos = Int(context.position)
+
+            // TYPE_RECORD_DEF (0xB9)
+            bufferPtr[pos] = 0xB9
+            pos += 1
+
+            // Write each key string using BONJSON string encoding
+            for key in keys {
+                let utf8 = Array(key.utf8)
+                let length = utf8.count
+                if length <= 66 {
+                    // Short string: type_code encodes length
+                    bufferPtr[pos] = UInt8(0x65 + length)
+                    pos += 1
+                    for (j, byte) in utf8.enumerated() {
+                        bufferPtr[pos + j] = byte
+                    }
+                    pos += length
+                } else {
+                    // Long string: 0xFF + data + 0xFF
+                    bufferPtr[pos] = 0xFF
+                    pos += 1
+                    for (j, byte) in utf8.enumerated() {
+                        bufferPtr[pos + j] = byte
+                    }
+                    pos += length
+                    bufferPtr[pos] = 0xFF
+                    pos += 1
+                }
+            }
+
+            // TYPE_END (0xB6)
+            bufferPtr[pos] = 0xB6
+            pos += 1
+
+            context.position = size_t(pos)
+        }
+    }
+
+    /// Try batch encoding a value as a primitive array. Returns true if handled.
+    func tryBatchEncode<T: Encodable>(_ value: T) throws -> Bool {
+        if let v = value as? [Int]    { try encodeBatchInt64Array(v); return true }
+        if let v = value as? [Int64]  { try encodeBatchInt64Array(v); return true }
+        if let v = value as? [Double] { try encodeBatchDoubleArray(v); return true }
+        if let v = value as? [Float]  { try encodeBatchFloat32Array(v); return true }
+        if let v = value as? [Int32]  { try encodeBatchInt32Array(v); return true }
+        if let v = value as? [Int16]  { try encodeBatchInt16Array(v); return true }
+        if let v = value as? [Int8]   { try encodeBatchInt8Array(v); return true }
+        if let v = value as? [UInt64] { try encodeBatchUInt64Array(v); return true }
+        if let v = value as? [UInt]   { try encodeBatchUIntArray(v); return true }
+        if let v = value as? [UInt32] { try encodeBatchUInt32Array(v); return true }
+        if let v = value as? [UInt16] { try encodeBatchUInt16Array(v); return true }
+        if let v = value as? [UInt8]  { try encodeBatchUInt8Array(v); return true }
+        if let v = value as? [Bool]   { try encodeBatchBoolArray(v); return true }
+        return false
+    }
 }
 
 // MARK: - Buffer-Based Encoder
@@ -466,6 +677,14 @@ final class _BufferEncoder: Encoder {
     }
 
     func container<Key: CodingKey>(keyedBy type: Key.Type) -> KeyedEncodingContainer<Key> {
+        if let schema = state.recordSchema {
+            let container = _RecordKeyedEncodingContainer<Key>(
+                state: state,
+                codingPath: codingPath,
+                schema: schema
+            )
+            return KeyedEncodingContainer(container)
+        }
         let container = _BufferKeyedEncodingContainer<Key>(
             state: state,
             codingPath: codingPath
@@ -889,6 +1108,7 @@ struct _BufferKeyedEncodingContainer<Key: CodingKey>: KeyedEncodingContainerProt
     mutating func encode<T: Encodable>(_ value: T, forKey key: Key) throws {
         try prepareToEncode()
         try encodeKey(key)
+        if try state.tryBatchEncode(value) { return }
         let encoder = _BufferEncoder(state: state, codingPath: codingPath + [key])
         try encoder.encodeValue(value)
     }
@@ -1115,6 +1335,7 @@ struct _BufferUnkeyedEncodingContainer: UnkeyedEncodingContainer {
 
     mutating func encode<T: Encodable>(_ value: T) throws {
         try prepareToEncode()
+        if try state.tryBatchEncode(value) { return }
         let encoder = _BufferEncoder(state: state, codingPath: codingPath + [_BONJSONIndexKey(index: count - 1)])
         try encoder.encodeValue(value)
     }
@@ -1265,6 +1486,431 @@ struct _BufferSingleValueEncodingContainer: SingleValueEncodingContainer {
     mutating func encode<T: Encodable>(_ value: T) throws {
         let encoder = _BufferEncoder(state: state, codingPath: codingPath)
         try encoder.encodeValue(value)
+    }
+}
+
+// MARK: - Record Encoding Support
+
+/// Sentinel error used when record encoding fails and needs fallback.
+private struct _RecordEncodingFallback: Error {}
+
+/// Protocol to detect arrays of Encodable elements without existential boxing.
+private protocol _RecordCandidateArray {
+    var _recordCandidateCount: Int { get }
+    func _probeFirstElementKeys(using keyEncodingStrategy: BONJSONEncoder.KeyEncodingStrategy) throws -> [String]?
+    func _encodeRecordElements(to state: _BufferEncoderState, codingPath: [CodingKey]) throws
+}
+
+extension Array: _RecordCandidateArray where Element: Encodable {
+    fileprivate var _recordCandidateCount: Int { count }
+
+    fileprivate func _probeFirstElementKeys(using keyEncodingStrategy: BONJSONEncoder.KeyEncodingStrategy) throws -> [String]? {
+        guard let first = self.first else { return nil }
+        // Skip types that encodeValue intercepts before encode(to:)
+        if first is Date || first is Data || first is URL || first is Decimal { return nil }
+        let probe = _KeyCaptureEncoder(keyEncodingStrategy: keyEncodingStrategy)
+        try first.encode(to: probe)
+        return probe.capturedKeys
+    }
+
+    fileprivate func _encodeRecordElements(to state: _BufferEncoderState, codingPath: [CodingKey]) throws {
+        for (i, element) in self.enumerated() {
+            // Begin record instance (def index 0)
+            state.ensureCapacity(11) // type byte + ULEB128
+            let result = ksbonjson_encodeToBuffer_beginRecordInstance(&state.context, 0)
+            try throwIfEncodingFailed(result)
+
+            let recordInstanceDepth = state.currentDepth
+
+            // Encode element — container(keyedBy:) returns _RecordKeyedEncodingContainer
+            let encoder = _BufferEncoder(
+                state: state,
+                codingPath: codingPath + [_BONJSONIndexKey(index: i)]
+            )
+            try encoder.encodeValue(element)
+
+            // Close any deferred inner containers, then close the record instance
+            try state.closeContainersToDepth(recordInstanceDepth)
+            state.ensureCapacity(Int(KSBONJSON_MAX_ENCODED_SIZE_CONTAINER_END))
+            let endResult = ksbonjson_encodeToBuffer_endContainer(&state.context)
+            try throwIfEncodingFailed(endResult)
+        }
+    }
+}
+
+/// Lightweight encoder that captures key names without encoding values.
+private final class _KeyCaptureEncoder: Encoder {
+    let codingPath: [CodingKey] = []
+    let userInfo: [CodingUserInfoKey: Any] = [:]
+    let keyEncodingStrategy: BONJSONEncoder.KeyEncodingStrategy
+    var capturedKeys: [String]?
+
+    init(keyEncodingStrategy: BONJSONEncoder.KeyEncodingStrategy) {
+        self.keyEncodingStrategy = keyEncodingStrategy
+    }
+
+    func container<Key: CodingKey>(keyedBy type: Key.Type) -> KeyedEncodingContainer<Key> {
+        let container = _KeyCaptureKeyedContainer<Key>(encoder: self)
+        return KeyedEncodingContainer(container)
+    }
+
+    func unkeyedContainer() -> UnkeyedEncodingContainer {
+        return _KeyCaptureDummyUnkeyedContainer()
+    }
+
+    func singleValueContainer() -> SingleValueEncodingContainer {
+        return _KeyCaptureDummySingleValueContainer()
+    }
+}
+
+private struct _KeyCaptureKeyedContainer<Key: CodingKey>: KeyedEncodingContainerProtocol {
+    let codingPath: [CodingKey] = []
+    let encoder: _KeyCaptureEncoder
+
+    init(encoder: _KeyCaptureEncoder) {
+        self.encoder = encoder
+    }
+
+    private func convertedKey(_ key: Key) -> String {
+        switch encoder.keyEncodingStrategy {
+        case .useDefaultKeys:
+            return key.stringValue
+        case .convertToSnakeCase:
+            return key.stringValue.convertToSnakeCase()
+        case .custom(let converter):
+            return converter(codingPath + [key]).stringValue
+        }
+    }
+
+    private mutating func recordKey(_ key: Key) {
+        if encoder.capturedKeys == nil {
+            encoder.capturedKeys = []
+        }
+        encoder.capturedKeys!.append(convertedKey(key))
+    }
+
+    mutating func encodeNil(forKey key: Key) throws { recordKey(key) }
+    mutating func encode(_ value: Bool, forKey key: Key) throws { recordKey(key) }
+    mutating func encode(_ value: String, forKey key: Key) throws { recordKey(key) }
+    mutating func encode(_ value: Double, forKey key: Key) throws { recordKey(key) }
+    mutating func encode(_ value: Float, forKey key: Key) throws { recordKey(key) }
+    mutating func encode(_ value: Int, forKey key: Key) throws { recordKey(key) }
+    mutating func encode(_ value: Int8, forKey key: Key) throws { recordKey(key) }
+    mutating func encode(_ value: Int16, forKey key: Key) throws { recordKey(key) }
+    mutating func encode(_ value: Int32, forKey key: Key) throws { recordKey(key) }
+    mutating func encode(_ value: Int64, forKey key: Key) throws { recordKey(key) }
+    mutating func encode(_ value: UInt, forKey key: Key) throws { recordKey(key) }
+    mutating func encode(_ value: UInt8, forKey key: Key) throws { recordKey(key) }
+    mutating func encode(_ value: UInt16, forKey key: Key) throws { recordKey(key) }
+    mutating func encode(_ value: UInt32, forKey key: Key) throws { recordKey(key) }
+    mutating func encode(_ value: UInt64, forKey key: Key) throws { recordKey(key) }
+    mutating func encode<T: Encodable>(_ value: T, forKey key: Key) throws { recordKey(key) }
+
+    mutating func nestedContainer<NestedKey: CodingKey>(
+        keyedBy keyType: NestedKey.Type,
+        forKey key: Key
+    ) -> KeyedEncodingContainer<NestedKey> {
+        recordKey(key)
+        return KeyedEncodingContainer(_KeyCaptureDummyKeyedContainer<NestedKey>())
+    }
+
+    mutating func nestedUnkeyedContainer(forKey key: Key) -> UnkeyedEncodingContainer {
+        recordKey(key)
+        return _KeyCaptureDummyUnkeyedContainer()
+    }
+
+    mutating func superEncoder() -> Encoder { _KeyCaptureDummyEncoder() }
+    mutating func superEncoder(forKey key: Key) -> Encoder { recordKey(key); return _KeyCaptureDummyEncoder() }
+}
+
+/// Dummy containers for key capture probe — all operations are no-ops.
+private struct _KeyCaptureDummyKeyedContainer<Key: CodingKey>: KeyedEncodingContainerProtocol {
+    let codingPath: [CodingKey] = []
+    mutating func encodeNil(forKey key: Key) throws {}
+    mutating func encode(_ value: Bool, forKey key: Key) throws {}
+    mutating func encode(_ value: String, forKey key: Key) throws {}
+    mutating func encode(_ value: Double, forKey key: Key) throws {}
+    mutating func encode(_ value: Float, forKey key: Key) throws {}
+    mutating func encode(_ value: Int, forKey key: Key) throws {}
+    mutating func encode(_ value: Int8, forKey key: Key) throws {}
+    mutating func encode(_ value: Int16, forKey key: Key) throws {}
+    mutating func encode(_ value: Int32, forKey key: Key) throws {}
+    mutating func encode(_ value: Int64, forKey key: Key) throws {}
+    mutating func encode(_ value: UInt, forKey key: Key) throws {}
+    mutating func encode(_ value: UInt8, forKey key: Key) throws {}
+    mutating func encode(_ value: UInt16, forKey key: Key) throws {}
+    mutating func encode(_ value: UInt32, forKey key: Key) throws {}
+    mutating func encode(_ value: UInt64, forKey key: Key) throws {}
+    mutating func encode<T: Encodable>(_ value: T, forKey key: Key) throws {}
+    mutating func nestedContainer<NestedKey: CodingKey>(keyedBy keyType: NestedKey.Type, forKey key: Key) -> KeyedEncodingContainer<NestedKey> {
+        KeyedEncodingContainer(_KeyCaptureDummyKeyedContainer<NestedKey>())
+    }
+    mutating func nestedUnkeyedContainer(forKey key: Key) -> UnkeyedEncodingContainer { _KeyCaptureDummyUnkeyedContainer() }
+    mutating func superEncoder() -> Encoder { _KeyCaptureDummyEncoder() }
+    mutating func superEncoder(forKey key: Key) -> Encoder { _KeyCaptureDummyEncoder() }
+}
+
+private struct _KeyCaptureDummyUnkeyedContainer: UnkeyedEncodingContainer {
+    let codingPath: [CodingKey] = []
+    var count: Int = 0
+    mutating func encodeNil() throws {}
+    mutating func encode(_ value: Bool) throws {}
+    mutating func encode(_ value: String) throws {}
+    mutating func encode(_ value: Double) throws {}
+    mutating func encode(_ value: Float) throws {}
+    mutating func encode(_ value: Int) throws {}
+    mutating func encode(_ value: Int8) throws {}
+    mutating func encode(_ value: Int16) throws {}
+    mutating func encode(_ value: Int32) throws {}
+    mutating func encode(_ value: Int64) throws {}
+    mutating func encode(_ value: UInt) throws {}
+    mutating func encode(_ value: UInt8) throws {}
+    mutating func encode(_ value: UInt16) throws {}
+    mutating func encode(_ value: UInt32) throws {}
+    mutating func encode(_ value: UInt64) throws {}
+    mutating func encode<T: Encodable>(_ value: T) throws {}
+    mutating func nestedContainer<NestedKey: CodingKey>(keyedBy keyType: NestedKey.Type) -> KeyedEncodingContainer<NestedKey> {
+        KeyedEncodingContainer(_KeyCaptureDummyKeyedContainer<NestedKey>())
+    }
+    mutating func nestedUnkeyedContainer() -> UnkeyedEncodingContainer { _KeyCaptureDummyUnkeyedContainer() }
+    mutating func superEncoder() -> Encoder { _KeyCaptureDummyEncoder() }
+}
+
+private struct _KeyCaptureDummySingleValueContainer: SingleValueEncodingContainer {
+    let codingPath: [CodingKey] = []
+    mutating func encodeNil() throws {}
+    mutating func encode(_ value: Bool) throws {}
+    mutating func encode(_ value: String) throws {}
+    mutating func encode(_ value: Double) throws {}
+    mutating func encode(_ value: Float) throws {}
+    mutating func encode(_ value: Int) throws {}
+    mutating func encode(_ value: Int8) throws {}
+    mutating func encode(_ value: Int16) throws {}
+    mutating func encode(_ value: Int32) throws {}
+    mutating func encode(_ value: Int64) throws {}
+    mutating func encode(_ value: UInt) throws {}
+    mutating func encode(_ value: UInt8) throws {}
+    mutating func encode(_ value: UInt16) throws {}
+    mutating func encode(_ value: UInt32) throws {}
+    mutating func encode(_ value: UInt64) throws {}
+    mutating func encode<T: Encodable>(_ value: T) throws {}
+}
+
+private final class _KeyCaptureDummyEncoder: Encoder {
+    let codingPath: [CodingKey] = []
+    let userInfo: [CodingUserInfoKey: Any] = [:]
+    func container<Key: CodingKey>(keyedBy type: Key.Type) -> KeyedEncodingContainer<Key> {
+        KeyedEncodingContainer(_KeyCaptureDummyKeyedContainer<Key>())
+    }
+    func unkeyedContainer() -> UnkeyedEncodingContainer { _KeyCaptureDummyUnkeyedContainer() }
+    func singleValueContainer() -> SingleValueEncodingContainer { _KeyCaptureDummySingleValueContainer() }
+}
+
+/// Keyed container for record instances — writes only values, not keys.
+/// Keys must arrive in schema order; mismatch triggers fallback.
+struct _RecordKeyedEncodingContainer<Key: CodingKey>: KeyedEncodingContainerProtocol {
+    let state: _BufferEncoderState
+    let codingPath: [CodingKey]
+    let schema: [String]
+    let containerDepth: Int
+    private var nextKeyIndex: Int = 0
+
+    init(state: _BufferEncoderState, codingPath: [CodingKey], schema: [String]) {
+        self.state = state
+        self.codingPath = codingPath
+        self.schema = schema
+        self.containerDepth = state.currentDepth
+    }
+
+    /// Close any deferred inner containers from previous nested values.
+    private func closeDeferred() throws {
+        try state.closeContainersToDepth(containerDepth)
+    }
+
+    private func convertedKey(_ key: Key) -> String {
+        switch state.keyEncodingStrategy {
+        case .useDefaultKeys:
+            return key.stringValue
+        case .convertToSnakeCase:
+            return key.stringValue.convertToSnakeCase()
+        case .custom(let converter):
+            return converter(codingPath + [key]).stringValue
+        }
+    }
+
+    /// Validate that the key matches the expected schema position.
+    private mutating func validateKey(_ key: Key) throws {
+        let keyString = convertedKey(key)
+        guard nextKeyIndex < schema.count, schema[nextKeyIndex] == keyString else {
+            throw _RecordEncodingFallback()
+        }
+        nextKeyIndex += 1
+    }
+
+    mutating func encodeNil(forKey key: Key) throws {
+        try closeDeferred()
+        try validateKey(key)
+        state.ensureCapacity(Int(KSBONJSON_MAX_ENCODED_SIZE_NULL))
+        let result = ksbonjson_encodeToBuffer_null(&state.context)
+        try throwIfEncodingFailed(result)
+    }
+
+    mutating func encode(_ value: Bool, forKey key: Key) throws {
+        try closeDeferred()
+        try validateKey(key)
+        state.ensureCapacity(Int(KSBONJSON_MAX_ENCODED_SIZE_BOOL))
+        let result = ksbonjson_encodeToBuffer_bool(&state.context, value)
+        try throwIfEncodingFailed(result)
+    }
+
+    mutating func encode(_ value: String, forKey key: Key) throws {
+        try closeDeferred()
+        try validateKey(key)
+        let utf8Count = value.utf8.count
+        state.ensureCapacity(Int(ksbonjson_maxEncodedSize_string(utf8Count)))
+        let result = value.withCString { cString in
+            ksbonjson_encodeToBuffer_string(&state.context, cString, utf8Count)
+        }
+        try throwIfEncodingFailed(result)
+    }
+
+    mutating func encode(_ value: Double, forKey key: Key) throws {
+        try closeDeferred()
+        try validateKey(key)
+        let encoder = _BufferEncoder(state: state, codingPath: codingPath + [key])
+        try encoder.encodeFloat(value)
+    }
+
+    mutating func encode(_ value: Float, forKey key: Key) throws {
+        try encode(Double(value), forKey: key)
+    }
+
+    mutating func encode(_ value: Int, forKey key: Key) throws {
+        try closeDeferred()
+        try validateKey(key)
+        state.ensureCapacity(Int(KSBONJSON_MAX_ENCODED_SIZE_INT))
+        let result = ksbonjson_encodeToBuffer_int(&state.context, Int64(value))
+        try throwIfEncodingFailed(result)
+    }
+
+    mutating func encode(_ value: Int8, forKey key: Key) throws {
+        try closeDeferred()
+        try validateKey(key)
+        state.ensureCapacity(Int(KSBONJSON_MAX_ENCODED_SIZE_INT))
+        let result = ksbonjson_encodeToBuffer_int(&state.context, Int64(value))
+        try throwIfEncodingFailed(result)
+    }
+
+    mutating func encode(_ value: Int16, forKey key: Key) throws {
+        try closeDeferred()
+        try validateKey(key)
+        state.ensureCapacity(Int(KSBONJSON_MAX_ENCODED_SIZE_INT))
+        let result = ksbonjson_encodeToBuffer_int(&state.context, Int64(value))
+        try throwIfEncodingFailed(result)
+    }
+
+    mutating func encode(_ value: Int32, forKey key: Key) throws {
+        try closeDeferred()
+        try validateKey(key)
+        state.ensureCapacity(Int(KSBONJSON_MAX_ENCODED_SIZE_INT))
+        let result = ksbonjson_encodeToBuffer_int(&state.context, Int64(value))
+        try throwIfEncodingFailed(result)
+    }
+
+    mutating func encode(_ value: Int64, forKey key: Key) throws {
+        try closeDeferred()
+        try validateKey(key)
+        state.ensureCapacity(Int(KSBONJSON_MAX_ENCODED_SIZE_INT))
+        let result = ksbonjson_encodeToBuffer_int(&state.context, value)
+        try throwIfEncodingFailed(result)
+    }
+
+    mutating func encode(_ value: UInt, forKey key: Key) throws {
+        try closeDeferred()
+        try validateKey(key)
+        state.ensureCapacity(Int(KSBONJSON_MAX_ENCODED_SIZE_INT))
+        let result = ksbonjson_encodeToBuffer_uint(&state.context, UInt64(value))
+        try throwIfEncodingFailed(result)
+    }
+
+    mutating func encode(_ value: UInt8, forKey key: Key) throws {
+        try closeDeferred()
+        try validateKey(key)
+        state.ensureCapacity(Int(KSBONJSON_MAX_ENCODED_SIZE_INT))
+        let result = ksbonjson_encodeToBuffer_uint(&state.context, UInt64(value))
+        try throwIfEncodingFailed(result)
+    }
+
+    mutating func encode(_ value: UInt16, forKey key: Key) throws {
+        try closeDeferred()
+        try validateKey(key)
+        state.ensureCapacity(Int(KSBONJSON_MAX_ENCODED_SIZE_INT))
+        let result = ksbonjson_encodeToBuffer_uint(&state.context, UInt64(value))
+        try throwIfEncodingFailed(result)
+    }
+
+    mutating func encode(_ value: UInt32, forKey key: Key) throws {
+        try closeDeferred()
+        try validateKey(key)
+        state.ensureCapacity(Int(KSBONJSON_MAX_ENCODED_SIZE_INT))
+        let result = ksbonjson_encodeToBuffer_uint(&state.context, UInt64(value))
+        try throwIfEncodingFailed(result)
+    }
+
+    mutating func encode(_ value: UInt64, forKey key: Key) throws {
+        try closeDeferred()
+        try validateKey(key)
+        state.ensureCapacity(Int(KSBONJSON_MAX_ENCODED_SIZE_INT))
+        let result = ksbonjson_encodeToBuffer_uint(&state.context, value)
+        try throwIfEncodingFailed(result)
+    }
+
+    mutating func encode<T: Encodable>(_ value: T, forKey key: Key) throws {
+        try closeDeferred()
+        try validateKey(key)
+        if try state.tryBatchEncode(value) { return }
+        // Disable record mode for nested values
+        let savedSchema = state.recordSchema
+        state.recordSchema = nil
+        let encoder = _BufferEncoder(state: state, codingPath: codingPath + [key])
+        try encoder.encodeValue(value)
+        state.recordSchema = savedSchema
+    }
+
+    mutating func nestedContainer<NestedKey: CodingKey>(
+        keyedBy keyType: NestedKey.Type,
+        forKey key: Key
+    ) -> KeyedEncodingContainer<NestedKey> {
+        do { try validateKey(key) } catch {
+            assertionFailure("Record key validation failed in nestedContainer")
+        }
+        // Nested containers use regular encoding
+        let savedSchema = state.recordSchema
+        state.recordSchema = nil
+        let container = _BufferKeyedEncodingContainer<NestedKey>(
+            state: state,
+            codingPath: codingPath + [key]
+        )
+        state.recordSchema = savedSchema
+        return KeyedEncodingContainer(container)
+    }
+
+    mutating func nestedUnkeyedContainer(forKey key: Key) -> UnkeyedEncodingContainer {
+        do { try validateKey(key) } catch {
+            assertionFailure("Record key validation failed in nestedUnkeyedContainer")
+        }
+        return _BufferUnkeyedEncodingContainer(
+            state: state,
+            codingPath: codingPath + [key]
+        )
+    }
+
+    mutating func superEncoder() -> Encoder {
+        _BufferEncoder(state: state, codingPath: codingPath + [_BONJSONStringKey(stringValue: "super")])
+    }
+
+    mutating func superEncoder(forKey key: Key) -> Encoder {
+        _BufferEncoder(state: state, codingPath: codingPath + [key])
     }
 }
 

@@ -208,10 +208,9 @@ final class BONJSONEncoderTests: XCTestCase {
         let encoder = BONJSONEncoder()
         let data = try encoder.encode([[1, 2], [3, 4]])
 
-        // Delimiter-terminated: arrayStart + nested arrays + containerEnd
+        // Outer is a regular array, inner arrays are typed sint64 arrays (batch encoded)
         XCTAssertEqual(data[0], TestTypeCode.arrayStart)
-        XCTAssertEqual(data[1], TestTypeCode.arrayStart)
-        // ... nested content
+        XCTAssertEqual(data[1], 0xF7) // TYPE_TYPED_SINT64 (inner [Int] batch encoded)
     }
 
     // MARK: - Objects (Dictionaries/Structs)
@@ -3318,5 +3317,380 @@ final class BONJSONSecurityTests: XCTestCase {
         decoder.duplicateKeyDecodingStrategy = .keepFirst
         let decoded = try decoder.decode([String: Int].self, from: bonjsonData)
         XCTAssertEqual(decoded.count, 300)
+    }
+}
+
+// MARK: - Typed Array Encoding Tests
+
+final class BONJSONTypedArrayEncoderTests: XCTestCase {
+
+    // Roundtrip tests for all numeric array types
+    func testRoundtripFloatArray() throws {
+        let values: [Float] = [1.5, 2.5, 3.5]
+        let data = try BONJSONEncoder().encode(values)
+        let decoded = try BONJSONDecoder().decode([Float].self, from: data)
+        XCTAssertEqual(decoded, values)
+    }
+
+    func testRoundtripInt8Array() throws {
+        let values: [Int8] = [-128, -1, 0, 1, 127]
+        let data = try BONJSONEncoder().encode(values)
+        let decoded = try BONJSONDecoder().decode([Int8].self, from: data)
+        XCTAssertEqual(decoded, values)
+    }
+
+    func testRoundtripInt16Array() throws {
+        let values: [Int16] = [-32768, -1, 0, 1, 32767]
+        let data = try BONJSONEncoder().encode(values)
+        let decoded = try BONJSONDecoder().decode([Int16].self, from: data)
+        XCTAssertEqual(decoded, values)
+    }
+
+    func testRoundtripInt32Array() throws {
+        let values: [Int32] = [Int32.min, -1, 0, 1, Int32.max]
+        let data = try BONJSONEncoder().encode(values)
+        let decoded = try BONJSONDecoder().decode([Int32].self, from: data)
+        XCTAssertEqual(decoded, values)
+    }
+
+    func testRoundtripUInt8Array() throws {
+        let values: [UInt8] = [0, 1, 127, 128, 255]
+        let data = try BONJSONEncoder().encode(values)
+        let decoded = try BONJSONDecoder().decode([UInt8].self, from: data)
+        XCTAssertEqual(decoded, values)
+    }
+
+    func testRoundtripUInt16Array() throws {
+        let values: [UInt16] = [0, 1, 32767, 32768, 65535]
+        let data = try BONJSONEncoder().encode(values)
+        let decoded = try BONJSONDecoder().decode([UInt16].self, from: data)
+        XCTAssertEqual(decoded, values)
+    }
+
+    func testRoundtripUInt32Array() throws {
+        let values: [UInt32] = [0, 1, UInt32.max / 2, UInt32.max]
+        let data = try BONJSONEncoder().encode(values)
+        let decoded = try BONJSONDecoder().decode([UInt32].self, from: data)
+        XCTAssertEqual(decoded, values)
+    }
+
+    func testRoundtripUInt64Array() throws {
+        let values: [UInt64] = [0, 1, UInt64.max / 2, UInt64.max]
+        let data = try BONJSONEncoder().encode(values)
+        let decoded = try BONJSONDecoder().decode([UInt64].self, from: data)
+        XCTAssertEqual(decoded, values)
+    }
+
+    func testRoundtripUIntArray() throws {
+        let values: [UInt] = [0, 1, 1000, UInt(Int.max)]
+        let data = try BONJSONEncoder().encode(values)
+        let decoded = try BONJSONDecoder().decode([UInt].self, from: data)
+        XCTAssertEqual(decoded, values)
+    }
+
+    func testRoundtripBoolArray() throws {
+        let values: [Bool] = [true, false, true, true, false]
+        let data = try BONJSONEncoder().encode(values)
+        let decoded = try BONJSONDecoder().decode([Bool].self, from: data)
+        XCTAssertEqual(decoded, values)
+    }
+
+    // Wire format verification
+    func testFloat32ArrayWireFormat() throws {
+        let values: [Float] = [1.0, 2.0]
+        let data = try BONJSONEncoder().encode(values)
+        XCTAssertEqual(data[0], 0xF6) // TYPE_TYPED_FLOAT32
+        XCTAssertEqual(data[1], 2)    // ULEB128 count = 2
+        // Remaining bytes should be 2 × 4 = 8 bytes of raw float data
+        XCTAssertEqual(data.count, 2 + 8)
+    }
+
+    func testUInt8ArrayWireFormat() throws {
+        let values: [UInt8] = [10, 20, 30]
+        let data = try BONJSONEncoder().encode(values)
+        XCTAssertEqual(data[0], 0xFE) // TYPE_TYPED_UINT8
+        XCTAssertEqual(data[1], 3)    // ULEB128 count = 3
+        XCTAssertEqual(data[2], 10)
+        XCTAssertEqual(data[3], 20)
+        XCTAssertEqual(data[4], 30)
+    }
+
+    func testInt32ArrayWireFormat() throws {
+        let values: [Int32] = [1]
+        let data = try BONJSONEncoder().encode(values)
+        XCTAssertEqual(data[0], 0xF8) // TYPE_TYPED_SINT32
+        XCTAssertEqual(data[1], 1)    // ULEB128 count = 1
+        // 4 bytes of LE int32 data for value 1
+        XCTAssertEqual(data.count, 2 + 4)
+    }
+
+    func testBoolArrayWireFormat() throws {
+        let values: [Bool] = [true, false]
+        let data = try BONJSONEncoder().encode(values)
+        // Bool arrays use regular array format (not typed array)
+        XCTAssertEqual(data[0], 0xB7) // TYPE_ARRAY
+        XCTAssertEqual(data[1], 0xB5) // TYPE_TRUE
+        XCTAssertEqual(data[2], 0xB4) // TYPE_FALSE
+        XCTAssertEqual(data[3], 0xB6) // TYPE_END
+    }
+
+    // Empty array tests
+    func testEmptyFloat32Array() throws {
+        let values: [Float] = []
+        let data = try BONJSONEncoder().encode(values)
+        let decoded = try BONJSONDecoder().decode([Float].self, from: data)
+        XCTAssertEqual(decoded, values)
+    }
+
+    func testEmptyUInt8Array() throws {
+        let values: [UInt8] = []
+        let data = try BONJSONEncoder().encode(values)
+        let decoded = try BONJSONDecoder().decode([UInt8].self, from: data)
+        XCTAssertEqual(decoded, values)
+    }
+}
+
+// MARK: - Nested Batch Encoding Tests
+
+final class BONJSONNestedBatchEncoderTests: XCTestCase {
+
+    func testObjectWithIntArrayField() throws {
+        struct Wrapper: Codable, Equatable {
+            var numbers: [Int]
+        }
+        let value = Wrapper(numbers: [1, 2, 3])
+        let data = try BONJSONEncoder().encode(value)
+        let decoded = try BONJSONDecoder().decode(Wrapper.self, from: data)
+        XCTAssertEqual(decoded, value)
+    }
+
+    func testObjectWithDoubleArrayField() throws {
+        struct Wrapper: Codable, Equatable {
+            var values: [Double]
+        }
+        let value = Wrapper(values: [1.5, 2.5, 3.5])
+        let data = try BONJSONEncoder().encode(value)
+        let decoded = try BONJSONDecoder().decode(Wrapper.self, from: data)
+        XCTAssertEqual(decoded, value)
+    }
+
+    func testObjectWithFloat32ArrayField() throws {
+        struct Wrapper: Codable, Equatable {
+            var values: [Float]
+        }
+        let value = Wrapper(values: [1.5, 2.5])
+        let data = try BONJSONEncoder().encode(value)
+        let decoded = try BONJSONDecoder().decode(Wrapper.self, from: data)
+        XCTAssertEqual(decoded, value)
+    }
+
+    func testObjectWithUInt8ArrayField() throws {
+        struct Wrapper: Codable, Equatable {
+            var bytes: [UInt8]
+        }
+        let value = Wrapper(bytes: [0, 127, 255])
+        let data = try BONJSONEncoder().encode(value)
+        let decoded = try BONJSONDecoder().decode(Wrapper.self, from: data)
+        XCTAssertEqual(decoded, value)
+    }
+
+    func testObjectWithBoolArrayField() throws {
+        struct Wrapper: Codable, Equatable {
+            var flags: [Bool]
+        }
+        let value = Wrapper(flags: [true, false, true])
+        let data = try BONJSONEncoder().encode(value)
+        let decoded = try BONJSONDecoder().decode(Wrapper.self, from: data)
+        XCTAssertEqual(decoded, value)
+    }
+
+    func testNestedIntArrayUsesTypedArray() throws {
+        struct Wrapper: Codable {
+            var numbers: [Int]
+        }
+        let value = Wrapper(numbers: [1, 2, 3])
+        let data = try BONJSONEncoder().encode(value)
+        // Object: objectStart + key + typed_array + containerEnd
+        XCTAssertEqual(data[0], 0xB8) // TYPE_OBJECT
+        // After key "numbers" (short string), the array should be typed
+        // Find the typed array byte: it should be 0xF7 (TYPE_TYPED_SINT64)
+        let bytes = Array(data)
+        XCTAssertTrue(bytes.contains(0xF7), "Expected TYPE_TYPED_SINT64 in encoded data")
+    }
+
+    func testDoublyNestedIntArray() throws {
+        // [[Int]] at root level - outer goes through Codable, inner gets batch encoded
+        let values: [[Int]] = [[1, 2], [3, 4]]
+        let data = try BONJSONEncoder().encode(values)
+        let decoded = try BONJSONDecoder().decode([[Int]].self, from: data)
+        XCTAssertEqual(decoded, values)
+    }
+
+    func testObjectWithMixedArrayFields() throws {
+        struct MixedArrays: Codable, Equatable {
+            var ints: [Int]
+            var floats: [Float]
+            var strings: [String]
+            var name: String
+        }
+        let value = MixedArrays(ints: [1, 2], floats: [1.5, 2.5], strings: ["a", "b"], name: "test")
+        let data = try BONJSONEncoder().encode(value)
+        let decoded = try BONJSONDecoder().decode(MixedArrays.self, from: data)
+        XCTAssertEqual(decoded, value)
+    }
+
+    func testArrayInUnkeyedContainer() throws {
+        // Array of arrays in unkeyed container
+        let values: [[Double]] = [[1.0, 2.0], [3.0, 4.0]]
+        let data = try BONJSONEncoder().encode(values)
+        let decoded = try BONJSONDecoder().decode([[Double]].self, from: data)
+        XCTAssertEqual(decoded, values)
+    }
+}
+
+// MARK: - Record Encoding Tests
+
+final class BONJSONRecordEncoderTests: XCTestCase {
+
+    func testRecordEncodingRoundtrip() throws {
+        struct Person: Codable, Equatable {
+            var name: String
+            var age: Int
+        }
+        let people = [Person(name: "Alice", age: 30), Person(name: "Bob", age: 25)]
+        let data = try BONJSONEncoder().encode(people)
+        let decoded = try BONJSONDecoder().decode([Person].self, from: data)
+        XCTAssertEqual(decoded, people)
+    }
+
+    func testRecordWireFormat() throws {
+        struct Item: Codable {
+            var x: Int
+        }
+        let items = [Item(x: 1), Item(x: 2)]
+        let data = try BONJSONEncoder().encode(items)
+        let bytes = Array(data)
+        // Should start with record definition
+        XCTAssertEqual(bytes[0], 0xB9, "Expected TYPE_RECORD_DEF")
+        // Then key "x" as short string: 0x66 0x78
+        XCTAssertEqual(bytes[1], 0x66) // stringShort(length: 1)
+        XCTAssertEqual(bytes[2], 0x78) // 'x'
+        // Then TYPE_END for record definition
+        XCTAssertEqual(bytes[3], 0xB6)
+        // Then TYPE_ARRAY
+        XCTAssertEqual(bytes[4], 0xB7)
+        // Then first record instance: 0xBA
+        XCTAssertEqual(bytes[5], 0xBA)
+    }
+
+    func testSingleElementArrayDoesNotUseRecords() throws {
+        struct Item: Codable {
+            var x: Int
+        }
+        let items = [Item(x: 1)]
+        let data = try BONJSONEncoder().encode(items)
+        let bytes = Array(data)
+        // Should NOT start with record definition (need ≥2 elements)
+        XCTAssertNotEqual(bytes[0], 0xB9, "Single element array should not use records")
+    }
+
+    func testEmptyArrayDoesNotUseRecords() throws {
+        struct Item: Codable {
+            var x: Int
+        }
+        let items: [Item] = []
+        let data = try BONJSONEncoder().encode(items)
+        let decoded = try BONJSONDecoder().decode([Item].self, from: data)
+        XCTAssertEqual(decoded.count, 0)
+    }
+
+    func testRecordWithMultipleFields() throws {
+        struct Person: Codable, Equatable {
+            var name: String
+            var age: Int
+            var active: Bool
+        }
+        let people = [
+            Person(name: "Alice", age: 30, active: true),
+            Person(name: "Bob", age: 25, active: false),
+            Person(name: "Carol", age: 35, active: true)
+        ]
+        let data = try BONJSONEncoder().encode(people)
+        let decoded = try BONJSONDecoder().decode([Person].self, from: data)
+        XCTAssertEqual(decoded, people)
+    }
+
+    func testRecordWithNestedObject() throws {
+        struct Address: Codable, Equatable {
+            var city: String
+        }
+        struct Person: Codable, Equatable {
+            var name: String
+            var address: Address
+        }
+        let people = [
+            Person(name: "Alice", address: Address(city: "NYC")),
+            Person(name: "Bob", address: Address(city: "LA"))
+        ]
+        let data = try BONJSONEncoder().encode(people)
+        let decoded = try BONJSONDecoder().decode([Person].self, from: data)
+        XCTAssertEqual(decoded, people)
+    }
+
+    func testRecordWithArrayField() throws {
+        struct Container: Codable, Equatable {
+            var name: String
+            var values: [Int]
+        }
+        let items = [
+            Container(name: "a", values: [1, 2, 3]),
+            Container(name: "b", values: [4, 5, 6])
+        ]
+        let data = try BONJSONEncoder().encode(items)
+        let decoded = try BONJSONDecoder().decode([Container].self, from: data)
+        XCTAssertEqual(decoded, items)
+    }
+
+    func testRecordSmallerThanRegularEncoding() throws {
+        struct Item: Codable {
+            var name: String
+            var value: Int
+        }
+        let items = (0..<10).map { Item(name: "item\($0)", value: $0) }
+
+        // Encode with records
+        let recordData = try BONJSONEncoder().encode(items)
+
+        // Verify records are used (starts with 0xB9)
+        XCTAssertEqual(Array(recordData)[0], 0xB9, "Expected record encoding")
+
+        // Verify roundtrip works
+        let decoded = try BONJSONDecoder().decode([Item].self, from: recordData)
+        XCTAssertEqual(decoded.count, 10)
+        XCTAssertEqual(decoded[0].name, "item0")
+        XCTAssertEqual(decoded[9].value, 9)
+    }
+
+    func testURLArrayDoesNotUseRecords() throws {
+        // URL is intercepted by encodeValue — should not be treated as record candidate
+        let urls = [URL(string: "https://example.com")!, URL(string: "https://test.com")!]
+        let data = try BONJSONEncoder().encode(urls)
+        let bytes = Array(data)
+        XCTAssertNotEqual(bytes[0], 0xB9, "URL arrays should not use records")
+
+        // Should still roundtrip correctly
+        let decoded = try BONJSONDecoder().decode([URL].self, from: data)
+        XCTAssertEqual(decoded, urls)
+    }
+
+    func testLargeRecordArray() throws {
+        struct Item: Codable, Equatable {
+            var id: Int
+            var name: String
+        }
+        let items = (0..<100).map { Item(id: $0, name: "item\($0)") }
+        let data = try BONJSONEncoder().encode(items)
+        let decoded = try BONJSONDecoder().decode([Item].self, from: data)
+        XCTAssertEqual(decoded, items)
     }
 }

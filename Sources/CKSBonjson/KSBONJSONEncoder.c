@@ -661,6 +661,283 @@ ssize_t ksbonjson_encodeToBuffer_doubleArray(
     return (ssize_t)totalBytes;
 }
 
+ssize_t ksbonjson_encodeToBuffer_float32Array(
+    KSBONJSONBufferEncodeContext* ctx,
+    const float* values,
+    size_t count)
+{
+    KSBONJSONContainerState* const container = getBufferContainer(ctx);
+    unlikely_if(container->isObject & container->isExpectingName)
+    {
+        return -KSBONJSON_ENCODE_EXPECTED_OBJECT_NAME;
+    }
+    container->isExpectingName = true;
+    incrementContainerCount(ctx);
+
+    // Typed array: TYPE_TYPED_FLOAT32 + ULEB128(count) + raw 4-byte LE values
+    bufferWriteByte(ctx, TYPE_TYPED_FLOAT32);
+    uint8_t countBuf[10];
+    size_t countBytes = ksbonjson_writeULEB128(countBuf, (uint64_t)count);
+    bufferWriteBytes(ctx, countBuf, countBytes);
+    size_t totalBytes = 1 + countBytes;
+
+    for (size_t i = 0; i < count; i++)
+    {
+        union num32_bits bits = {.f32 = values[i]};
+        uint32_t le = bits.u32;
+#if !KSBONJSON_IS_LITTLE_ENDIAN
+        le = ((le & 0xFF) << 24) | ((le & 0xFF00) << 8) | ((le & 0xFF0000) >> 8) | ((le & 0xFF000000) >> 24);
+#endif
+        bufferWriteBytes(ctx, (const uint8_t*)&le, 4);
+    }
+    totalBytes += count * 4;
+
+    return (ssize_t)totalBytes;
+}
+
+ssize_t ksbonjson_encodeToBuffer_uint8Array(
+    KSBONJSONBufferEncodeContext* ctx,
+    const uint8_t* values,
+    size_t count)
+{
+    KSBONJSONContainerState* const container = getBufferContainer(ctx);
+    unlikely_if(container->isObject & container->isExpectingName)
+    {
+        return -KSBONJSON_ENCODE_EXPECTED_OBJECT_NAME;
+    }
+    container->isExpectingName = true;
+    incrementContainerCount(ctx);
+
+    // Typed array: TYPE_TYPED_UINT8 + ULEB128(count) + raw bytes
+    bufferWriteByte(ctx, TYPE_TYPED_UINT8);
+    uint8_t countBuf[10];
+    size_t countBytes = ksbonjson_writeULEB128(countBuf, (uint64_t)count);
+    bufferWriteBytes(ctx, countBuf, countBytes);
+    size_t totalBytes = 1 + countBytes;
+
+    bufferWriteBytes(ctx, values, count);
+    totalBytes += count;
+
+    return (ssize_t)totalBytes;
+}
+
+ssize_t ksbonjson_encodeToBuffer_uint16Array(
+    KSBONJSONBufferEncodeContext* ctx,
+    const uint16_t* values,
+    size_t count)
+{
+    KSBONJSONContainerState* const container = getBufferContainer(ctx);
+    unlikely_if(container->isObject & container->isExpectingName)
+    {
+        return -KSBONJSON_ENCODE_EXPECTED_OBJECT_NAME;
+    }
+    container->isExpectingName = true;
+    incrementContainerCount(ctx);
+
+    // Typed array: TYPE_TYPED_UINT16 + ULEB128(count) + raw 2-byte LE values
+    bufferWriteByte(ctx, TYPE_TYPED_UINT16);
+    uint8_t countBuf[10];
+    size_t countBytes = ksbonjson_writeULEB128(countBuf, (uint64_t)count);
+    bufferWriteBytes(ctx, countBuf, countBytes);
+    size_t totalBytes = 1 + countBytes;
+
+    for (size_t i = 0; i < count; i++)
+    {
+        uint16_t le = values[i];
+#if !KSBONJSON_IS_LITTLE_ENDIAN
+        le = ((le & 0xFF) << 8) | ((le & 0xFF00) >> 8);
+#endif
+        bufferWriteBytes(ctx, (const uint8_t*)&le, 2);
+    }
+    totalBytes += count * 2;
+
+    return (ssize_t)totalBytes;
+}
+
+ssize_t ksbonjson_encodeToBuffer_uint32Array(
+    KSBONJSONBufferEncodeContext* ctx,
+    const uint32_t* values,
+    size_t count)
+{
+    KSBONJSONContainerState* const container = getBufferContainer(ctx);
+    unlikely_if(container->isObject & container->isExpectingName)
+    {
+        return -KSBONJSON_ENCODE_EXPECTED_OBJECT_NAME;
+    }
+    container->isExpectingName = true;
+    incrementContainerCount(ctx);
+
+    // Typed array: TYPE_TYPED_UINT32 + ULEB128(count) + raw 4-byte LE values
+    bufferWriteByte(ctx, TYPE_TYPED_UINT32);
+    uint8_t countBuf[10];
+    size_t countBytes = ksbonjson_writeULEB128(countBuf, (uint64_t)count);
+    bufferWriteBytes(ctx, countBuf, countBytes);
+    size_t totalBytes = 1 + countBytes;
+
+    for (size_t i = 0; i < count; i++)
+    {
+        uint32_t le = values[i];
+#if !KSBONJSON_IS_LITTLE_ENDIAN
+        le = ((le & 0xFF) << 24) | ((le & 0xFF00) << 8) | ((le & 0xFF0000) >> 8) | ((le & 0xFF000000) >> 24);
+#endif
+        bufferWriteBytes(ctx, (const uint8_t*)&le, 4);
+    }
+    totalBytes += count * 4;
+
+    return (ssize_t)totalBytes;
+}
+
+ssize_t ksbonjson_encodeToBuffer_uint64Array(
+    KSBONJSONBufferEncodeContext* ctx,
+    const uint64_t* values,
+    size_t count)
+{
+    KSBONJSONContainerState* const container = getBufferContainer(ctx);
+    unlikely_if(container->isObject & container->isExpectingName)
+    {
+        return -KSBONJSON_ENCODE_EXPECTED_OBJECT_NAME;
+    }
+    container->isExpectingName = true;
+    incrementContainerCount(ctx);
+
+    // Typed array: TYPE_TYPED_UINT64 + ULEB128(count) + raw 8-byte LE values
+    bufferWriteByte(ctx, TYPE_TYPED_UINT64);
+    uint8_t countBuf[10];
+    size_t countBytes = ksbonjson_writeULEB128(countBuf, (uint64_t)count);
+    bufferWriteBytes(ctx, countBuf, countBytes);
+    size_t totalBytes = 1 + countBytes;
+
+    for (size_t i = 0; i < count; i++)
+    {
+        uint64_t le = ksbonjson_toLittleEndian(values[i]);
+        bufferWriteBytes(ctx, (const uint8_t*)&le, 8);
+    }
+    totalBytes += count * 8;
+
+    return (ssize_t)totalBytes;
+}
+
+ssize_t ksbonjson_encodeToBuffer_int8Array(
+    KSBONJSONBufferEncodeContext* ctx,
+    const int8_t* values,
+    size_t count)
+{
+    KSBONJSONContainerState* const container = getBufferContainer(ctx);
+    unlikely_if(container->isObject & container->isExpectingName)
+    {
+        return -KSBONJSON_ENCODE_EXPECTED_OBJECT_NAME;
+    }
+    container->isExpectingName = true;
+    incrementContainerCount(ctx);
+
+    // Typed array: TYPE_TYPED_SINT8 + ULEB128(count) + raw bytes
+    bufferWriteByte(ctx, TYPE_TYPED_SINT8);
+    uint8_t countBuf[10];
+    size_t countBytes = ksbonjson_writeULEB128(countBuf, (uint64_t)count);
+    bufferWriteBytes(ctx, countBuf, countBytes);
+    size_t totalBytes = 1 + countBytes;
+
+    bufferWriteBytes(ctx, (const uint8_t*)values, count);
+    totalBytes += count;
+
+    return (ssize_t)totalBytes;
+}
+
+ssize_t ksbonjson_encodeToBuffer_int16Array(
+    KSBONJSONBufferEncodeContext* ctx,
+    const int16_t* values,
+    size_t count)
+{
+    KSBONJSONContainerState* const container = getBufferContainer(ctx);
+    unlikely_if(container->isObject & container->isExpectingName)
+    {
+        return -KSBONJSON_ENCODE_EXPECTED_OBJECT_NAME;
+    }
+    container->isExpectingName = true;
+    incrementContainerCount(ctx);
+
+    // Typed array: TYPE_TYPED_SINT16 + ULEB128(count) + raw 2-byte LE values
+    bufferWriteByte(ctx, TYPE_TYPED_SINT16);
+    uint8_t countBuf[10];
+    size_t countBytes = ksbonjson_writeULEB128(countBuf, (uint64_t)count);
+    bufferWriteBytes(ctx, countBuf, countBytes);
+    size_t totalBytes = 1 + countBytes;
+
+    for (size_t i = 0; i < count; i++)
+    {
+        uint16_t le = (uint16_t)values[i];
+#if !KSBONJSON_IS_LITTLE_ENDIAN
+        le = ((le & 0xFF) << 8) | ((le & 0xFF00) >> 8);
+#endif
+        bufferWriteBytes(ctx, (const uint8_t*)&le, 2);
+    }
+    totalBytes += count * 2;
+
+    return (ssize_t)totalBytes;
+}
+
+ssize_t ksbonjson_encodeToBuffer_int32Array(
+    KSBONJSONBufferEncodeContext* ctx,
+    const int32_t* values,
+    size_t count)
+{
+    KSBONJSONContainerState* const container = getBufferContainer(ctx);
+    unlikely_if(container->isObject & container->isExpectingName)
+    {
+        return -KSBONJSON_ENCODE_EXPECTED_OBJECT_NAME;
+    }
+    container->isExpectingName = true;
+    incrementContainerCount(ctx);
+
+    // Typed array: TYPE_TYPED_SINT32 + ULEB128(count) + raw 4-byte LE values
+    bufferWriteByte(ctx, TYPE_TYPED_SINT32);
+    uint8_t countBuf[10];
+    size_t countBytes = ksbonjson_writeULEB128(countBuf, (uint64_t)count);
+    bufferWriteBytes(ctx, countBuf, countBytes);
+    size_t totalBytes = 1 + countBytes;
+
+    for (size_t i = 0; i < count; i++)
+    {
+        uint32_t le = (uint32_t)values[i];
+#if !KSBONJSON_IS_LITTLE_ENDIAN
+        le = ((le & 0xFF) << 24) | ((le & 0xFF00) << 8) | ((le & 0xFF0000) >> 8) | ((le & 0xFF000000) >> 24);
+#endif
+        bufferWriteBytes(ctx, (const uint8_t*)&le, 4);
+    }
+    totalBytes += count * 4;
+
+    return (ssize_t)totalBytes;
+}
+
+ssize_t ksbonjson_encodeToBuffer_boolArray(
+    KSBONJSONBufferEncodeContext* ctx,
+    const bool* values,
+    size_t count)
+{
+    KSBONJSONContainerState* const container = getBufferContainer(ctx);
+    unlikely_if(container->isObject & container->isExpectingName)
+    {
+        return -KSBONJSON_ENCODE_EXPECTED_OBJECT_NAME;
+    }
+    container->isExpectingName = true;
+    incrementContainerCount(ctx);
+
+    // Regular array: TYPE_ARRAY + per-element TYPE_TRUE/TYPE_FALSE + TYPE_END
+    bufferWriteByte(ctx, TYPE_ARRAY);
+    size_t totalBytes = 1;
+
+    for (size_t i = 0; i < count; i++)
+    {
+        bufferWriteByte(ctx, values[i] ? TYPE_TRUE : TYPE_FALSE);
+    }
+    totalBytes += count;
+
+    bufferWriteByte(ctx, TYPE_END);
+    totalBytes += 1;
+
+    return (ssize_t)totalBytes;
+}
+
 // Internal: encode a single string without container state checks (for batch use)
 static inline size_t encodeStringFast(KSBONJSONBufferEncodeContext* ctx,
                                       const char* value,

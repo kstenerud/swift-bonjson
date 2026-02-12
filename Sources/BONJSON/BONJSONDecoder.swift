@@ -552,51 +552,64 @@ final class _PositionMap {
         // Copy to contiguous array to ensure stable pointer
         self.inputBytes = ContiguousArray(data)
 
-        // Estimate entry count
-        let estimatedEntries = ksbonjson_map_estimateEntries(inputBytes.count)
-        self.entries = ContiguousArray<KSBONJSONMapEntry>(repeating: KSBONJSONMapEntry(), count: Int(estimatedEntries))
+        // Estimate entry count — records may expand to more entries than data length,
+        // so retry with a larger buffer if the map fills up.
+        var currentCapacity = Int(ksbonjson_map_estimateEntries(inputBytes.count))
+        self.entries = ContiguousArray<KSBONJSONMapEntry>(repeating: KSBONJSONMapEntry(), count: currentCapacity)
         self.nextSibling = []   // Will be computed after scanning
         self.entryCount = 0
         self.context = KSBONJSONMapContext()
         self.rootIndex = 0  // Will be set after scanning
 
-        // Initialize and scan using stable pointers
-        try inputBytes.withUnsafeBufferPointer { inputPtr in
-            try entries.withUnsafeMutableBufferPointer { entriesPtr in
-                ksbonjson_map_beginWithFlags(
-                    &context,
-                    inputPtr.baseAddress,
-                    inputPtr.count,
-                    entriesPtr.baseAddress,
-                    entriesPtr.count,
-                    flags
-                )
+        // Initialize and scan using stable pointers, retrying if map is full
+        var scanSucceeded = false
+        while !scanSucceeded {
+            try inputBytes.withUnsafeBufferPointer { inputPtr in
+                try entries.withUnsafeMutableBufferPointer { entriesPtr in
+                    ksbonjson_map_beginWithFlags(
+                        &context,
+                        inputPtr.baseAddress,
+                        inputPtr.count,
+                        entriesPtr.baseAddress,
+                        entriesPtr.count,
+                        flags
+                    )
 
-                let status = ksbonjson_map_scan(&context)
-                guard status == KSBONJSON_DECODE_OK else {
-                    // Map C status codes to Swift errors
-                    switch status {
-                    case KSBONJSON_DECODE_NUL_CHARACTER:
-                        throw BONJSONDecodingError.nulCharacterInString
-                    case KSBONJSON_DECODE_INVALID_UTF8:
-                        throw BONJSONDecodingError.invalidUTF8Sequence
-                    case KSBONJSON_DECODE_DUPLICATE_OBJECT_NAME:
-                        throw BONJSONDecodingError.duplicateObjectKey("")
-                    case KSBONJSON_DECODE_TOO_MANY_KEYS:
-                        throw BONJSONDecodingError.tooManyKeys
-                    case KSBONJSON_DECODE_MAX_DEPTH_EXCEEDED:
-                        throw BONJSONDecodingError.maxDepthExceeded
-                    case KSBONJSON_DECODE_MAX_STRING_LENGTH_EXCEEDED:
-                        throw BONJSONDecodingError.maxStringLengthExceeded
-                    case KSBONJSON_DECODE_MAX_CONTAINER_SIZE_EXCEEDED:
-                        throw BONJSONDecodingError.maxContainerSizeExceeded
-                    case KSBONJSON_DECODE_MAX_DOCUMENT_SIZE_EXCEEDED:
-                        throw BONJSONDecodingError.maxDocumentSizeExceeded
-                    default:
-                        let message = ksbonjson_describeDecodeStatus(status).map { String(cString: $0) } ?? "Unknown error"
-                        throw BONJSONDecodingError.scanFailed(message)
+                    let status = ksbonjson_map_scan(&context)
+                    guard status == KSBONJSON_DECODE_OK else {
+                        if status == KSBONJSON_DECODE_MAP_FULL {
+                            return // will retry with larger buffer
+                        }
+                        // Map C status codes to Swift errors
+                        switch status {
+                        case KSBONJSON_DECODE_NUL_CHARACTER:
+                            throw BONJSONDecodingError.nulCharacterInString
+                        case KSBONJSON_DECODE_INVALID_UTF8:
+                            throw BONJSONDecodingError.invalidUTF8Sequence
+                        case KSBONJSON_DECODE_DUPLICATE_OBJECT_NAME:
+                            throw BONJSONDecodingError.duplicateObjectKey("")
+                        case KSBONJSON_DECODE_TOO_MANY_KEYS:
+                            throw BONJSONDecodingError.tooManyKeys
+                        case KSBONJSON_DECODE_MAX_DEPTH_EXCEEDED:
+                            throw BONJSONDecodingError.maxDepthExceeded
+                        case KSBONJSON_DECODE_MAX_STRING_LENGTH_EXCEEDED:
+                            throw BONJSONDecodingError.maxStringLengthExceeded
+                        case KSBONJSON_DECODE_MAX_CONTAINER_SIZE_EXCEEDED:
+                            throw BONJSONDecodingError.maxContainerSizeExceeded
+                        case KSBONJSON_DECODE_MAX_DOCUMENT_SIZE_EXCEEDED:
+                            throw BONJSONDecodingError.maxDocumentSizeExceeded
+                        default:
+                            let message = ksbonjson_describeDecodeStatus(status).map { String(cString: $0) } ?? "Unknown error"
+                            throw BONJSONDecodingError.scanFailed(message)
+                        }
                     }
+                    scanSucceeded = true
                 }
+            }
+            if !scanSucceeded {
+                // Double the entry buffer and retry
+                currentCapacity *= 2
+                self.entries = ContiguousArray<KSBONJSONMapEntry>(repeating: KSBONJSONMapEntry(), count: currentCapacity)
             }
         }
 

@@ -166,8 +166,11 @@ Typed arrays encode homogeneous numeric arrays more compactly:
 - The decoder expands typed arrays into regular array entries in the position map, so the
   Swift Codable layer requires no changes
 
-The Swift encoder automatically uses typed arrays for `[Int]` and `[Double]` batch encoding
-via `ksbonjson_encodeToBuffer_int64Array` and `ksbonjson_encodeToBuffer_doubleArray`.
+The Swift encoder automatically uses typed arrays for all numeric array types:
+`[Int]`, `[Int64]`, `[Int32]`, `[Int16]`, `[Int8]`, `[UInt64]`, `[UInt]`, `[UInt32]`, `[UInt16]`,
+`[UInt8]`, `[Double]`, `[Float]`. Bool arrays (`[Bool]`) use regular array encoding since booleans
+aren't numeric typed arrays. Batch encoding works at all levels: root-level arrays, arrays inside
+objects, and nested arrays.
 
 ## Records
 
@@ -178,8 +181,17 @@ Records provide compact encoding for repeated object schemas:
   so the Swift Codable layer requires no changes
 - Maximum 256 record definitions per document
 
-Note: Swift Codable-level record encoding (auto-detecting shared schemas) is not yet implemented.
-The C API is available for direct use.
+The Swift encoder auto-detects record encoding for root-level arrays of ≥2 same-schema objects.
+Detection works by probing the first element's keys with a lightweight `_KeyCaptureEncoder`, then
+encoding all elements as record instances. If any element's keys don't match the schema, encoding
+falls back to regular array-of-objects format by resetting the buffer position and re-encoding.
+
+Record definitions are written as raw bytes directly to the buffer (bypassing C container state)
+because the C encoder's container-aware string functions would corrupt internal state tracking.
+
+The decoder handles records transparently — the position map retry logic doubles the entry buffer
+when `KSBONJSON_DECODE_MAP_FULL` is returned, since record instances expand to more entries than
+the compact wire format suggests.
 
 ## Security Features
 

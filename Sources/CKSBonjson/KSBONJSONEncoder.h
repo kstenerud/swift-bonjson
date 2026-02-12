@@ -244,6 +244,97 @@ static inline size_t ksbonjson_maxEncodedSize_doubleArray(size_t count)
     return 11 + count * 8;
 }
 
+KSBONJSON_PUBLIC ssize_t ksbonjson_encodeToBuffer_float32Array(
+    KSBONJSONBufferEncodeContext* ctx,
+    const float* values,
+    size_t count);
+
+static inline size_t ksbonjson_maxEncodedSize_float32Array(size_t count)
+{
+    return 11 + count * 4;
+}
+
+KSBONJSON_PUBLIC ssize_t ksbonjson_encodeToBuffer_uint8Array(
+    KSBONJSONBufferEncodeContext* ctx,
+    const uint8_t* values,
+    size_t count);
+
+static inline size_t ksbonjson_maxEncodedSize_uint8Array(size_t count)
+{
+    return 11 + count;
+}
+
+KSBONJSON_PUBLIC ssize_t ksbonjson_encodeToBuffer_uint16Array(
+    KSBONJSONBufferEncodeContext* ctx,
+    const uint16_t* values,
+    size_t count);
+
+static inline size_t ksbonjson_maxEncodedSize_uint16Array(size_t count)
+{
+    return 11 + count * 2;
+}
+
+KSBONJSON_PUBLIC ssize_t ksbonjson_encodeToBuffer_uint32Array(
+    KSBONJSONBufferEncodeContext* ctx,
+    const uint32_t* values,
+    size_t count);
+
+static inline size_t ksbonjson_maxEncodedSize_uint32Array(size_t count)
+{
+    return 11 + count * 4;
+}
+
+KSBONJSON_PUBLIC ssize_t ksbonjson_encodeToBuffer_uint64Array(
+    KSBONJSONBufferEncodeContext* ctx,
+    const uint64_t* values,
+    size_t count);
+
+static inline size_t ksbonjson_maxEncodedSize_uint64Array(size_t count)
+{
+    return 11 + count * 8;
+}
+
+KSBONJSON_PUBLIC ssize_t ksbonjson_encodeToBuffer_int8Array(
+    KSBONJSONBufferEncodeContext* ctx,
+    const int8_t* values,
+    size_t count);
+
+static inline size_t ksbonjson_maxEncodedSize_int8Array(size_t count)
+{
+    return 11 + count;
+}
+
+KSBONJSON_PUBLIC ssize_t ksbonjson_encodeToBuffer_int16Array(
+    KSBONJSONBufferEncodeContext* ctx,
+    const int16_t* values,
+    size_t count);
+
+static inline size_t ksbonjson_maxEncodedSize_int16Array(size_t count)
+{
+    return 11 + count * 2;
+}
+
+KSBONJSON_PUBLIC ssize_t ksbonjson_encodeToBuffer_int32Array(
+    KSBONJSONBufferEncodeContext* ctx,
+    const int32_t* values,
+    size_t count);
+
+static inline size_t ksbonjson_maxEncodedSize_int32Array(size_t count)
+{
+    return 11 + count * 4;
+}
+
+KSBONJSON_PUBLIC ssize_t ksbonjson_encodeToBuffer_boolArray(
+    KSBONJSONBufferEncodeContext* ctx,
+    const bool* values,
+    size_t count);
+
+static inline size_t ksbonjson_maxEncodedSize_boolArray(size_t count)
+{
+    // Regular array: array_start(1) + count * bool(1) + array_end(1)
+    return 2 + count;
+}
+
 KSBONJSON_PUBLIC ssize_t ksbonjson_encodeToBuffer_stringArray(
     KSBONJSONBufferEncodeContext* ctx,
     const char* const* strings,
