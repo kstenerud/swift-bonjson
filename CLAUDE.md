@@ -69,44 +69,47 @@ The C `KSBONJSONMapEntry` stores decoded values inline:
 ## Type Codes
 
 Key type code ranges (defined in `KSBONJSONCommon.h`):
-- `0x00-0xC8`: Small integers (-100 to 100), value = type_code - 100
-- `0xC9`: Reserved
-- `0xCA`: Big number (zigzag LEB128 exponent + zigzag LEB128 signed_length + LE magnitude bytes)
-- `0xCB`: Float32
-- `0xCC`: Float64
-- `0xCD`: Null
-- `0xCE`: False
-- `0xCF`: True
-- `0xD0-0xDF`: Short strings (0-15 bytes, length = type_code - 0xD0)
-- `0xE0-0xE3`: Unsigned integers (CPU-native sizes: 1, 2, 4, 8 bytes)
-- `0xE4-0xE7`: Signed integers (CPU-native sizes: 1, 2, 4, 8 bytes)
-- `0xE8-0xFB`: Reserved
-- `0xFC`: Array start (delimiter-terminated with 0xFE)
-- `0xFD`: Object start (delimiter-terminated with 0xFE)
-- `0xFE`: Container end marker
+- `0x00-0x64`: Small integers (0 to 100), value = type_code directly
+- `0x65-0xA7`: Short strings (0-66 bytes, length = type_code - 0x65)
+- `0xA8-0xAB`: Unsigned integers (CPU-native sizes: 1, 2, 4, 8 bytes)
+- `0xAC-0xAF`: Signed integers (CPU-native sizes: 1, 2, 4, 8 bytes)
+- `0xB0`: Float32
+- `0xB1`: Float64
+- `0xB2`: Big number (zigzag LEB128 exponent + zigzag LEB128 signed_length + LE magnitude bytes)
+- `0xB3`: Null
+- `0xB4`: False
+- `0xB5`: True
+- `0xB6`: Container end marker
+- `0xB7`: Array start (delimiter-terminated with 0xB6)
+- `0xB8`: Object start (delimiter-terminated with 0xB6)
+- `0xB9`: Record definition (key strings terminated with 0xB6)
+- `0xBA`: Record instance (ULEB128 def_index + values terminated with 0xB6)
+- `0xBB-0xF4`: Reserved
+- `0xF5-0xFE`: Typed arrays (element type + ULEB128 count + raw LE data)
 - `0xFF`: Long string (FF-terminated: 0xFF + data + 0xFF)
 
 Type detection ranges:
-- Small integers: `type_code < 0xC9`
-- Short strings: `type_code >= 0xD0 && type_code <= 0xDF`
+- Small integers: `type_code <= 0x64`
+- Short strings: `type_code >= 0x65 && type_code <= 0xA7`
+- Typed arrays: `type_code >= 0xF5 && type_code <= 0xFE`
 
 ## Container Encoding (Delimiter-Terminated)
 
 Containers (arrays and objects) use a start marker and end delimiter:
-- Format: `[type_code] [elements...] [0xFE]`
-- Arrays: `0xFC` + values + `0xFE`
-- Objects: `0xFD` + key-value pairs + `0xFE`
+- Format: `[type_code] [elements...] [0xB6]`
+- Arrays: `0xB7` + values + `0xB6`
+- Objects: `0xB8` + key-value pairs + `0xB6`
 
 There is no length prefix or chunking; the decoder scans until it encounters the end marker.
 
 ## Integer Encoding
 
 Integers are encoded using the smallest representation:
-1. Small int range (-100 to 100): Single byte type code, value = type_code - 100
-   - Type code 0x00 = -100, 0x64 = 0, 0xC8 = 100
+1. Small int range (0 to 100): Single byte type code, value = type_code directly
+   - Type code 0x00 = 0, 0x64 = 100
 2. Larger values: Type code indicates sign and byte count, followed by little-endian bytes
-   - Unsigned: 0xE0-0xE3 (CPU-native sizes: 1, 2, 4, 8 bytes)
-   - Signed: 0xE4-0xE7 (CPU-native sizes: 1, 2, 4, 8 bytes)
+   - Unsigned: 0xA8-0xAB (CPU-native sizes: 1, 2, 4, 8 bytes)
+   - Signed: 0xAC-0xAF (CPU-native sizes: 1, 2, 4, 8 bytes)
 3. Values are rounded up to the next CPU-native size (e.g. a 3-byte value uses 4 bytes)
 
 ## Float Encoding
@@ -120,13 +123,13 @@ Note: bfloat16 is no longer supported.
 
 ## String Encoding
 
-- Short strings (0-15 bytes): Type codes 0xD0-0xDF encode length (length = type_code - 0xD0), followed by UTF-8 bytes
+- Short strings (0-66 bytes): Type codes 0x65-0xA7 encode length (length = type_code - 0x65), followed by UTF-8 bytes
 - Long strings: 0xFF + UTF-8 data + 0xFF (FF-terminated, no chunking)
 
 ## Big Number Format
 
 Big numbers use zigzag LEB128 metadata and little-endian magnitude bytes:
-- Format: `0xCA` + zigzag_leb128(exponent) + zigzag_leb128(signed_length) + magnitude_bytes
+- Format: `0xB2` + zigzag_leb128(exponent) + zigzag_leb128(signed_length) + magnitude_bytes
 - The exponent is a zigzag LEB128 signed integer (base-10 exponent)
 - The signed_length is a zigzag LEB128 signed integer encoding both sign and byte count:
   positive N = positive significand with N magnitude bytes, negative -N = negative significand
@@ -153,6 +156,30 @@ implementation limits.
 
 Values exceeding these limits can be decoded to Double (with precision loss), or presented as
 strings using the `outOfRangeBigNumberDecodingStrategy = .stringify` option.
+
+## Typed Arrays
+
+Typed arrays encode homogeneous numeric arrays more compactly:
+- Format: `type_code` + ULEB128(element_count) + raw LE element data
+- Element types: uint8-64 (0xFE-0xFB), sint8-64 (0xFA-0xF7), float32 (0xF6), float64 (0xF5)
+- No per-element type codes; all elements share the same type
+- The decoder expands typed arrays into regular array entries in the position map, so the
+  Swift Codable layer requires no changes
+
+The Swift encoder automatically uses typed arrays for `[Int]` and `[Double]` batch encoding
+via `ksbonjson_encodeToBuffer_int64Array` and `ksbonjson_encodeToBuffer_doubleArray`.
+
+## Records
+
+Records provide compact encoding for repeated object schemas:
+- Record definition: `0xB9` + key strings + `0xB6` (stored before root value)
+- Record instance: `0xBA` + ULEB128(def_index) + values + `0xB6`
+- The decoder expands record instances into regular object entries in the position map,
+  so the Swift Codable layer requires no changes
+- Maximum 256 record definitions per document
+
+Note: Swift Codable-level record encoding (auto-detecting shared schemas) is not yet implemented.
+The C API is available for direct use.
 
 ## Security Features
 
@@ -339,16 +366,14 @@ swift test --filter Conformance
 **Supported capabilities:**
 - `int64`, `encode_nul_rejection`, `nan_infinity_stringify`
 - `bignumber_resource_limits`, `out_of_range_stringify`, `unicode_normalization`
+- `typed_arrays`, `records`
 
-**Skipped tests (27 total):**
+**Skipped tests (29 total):**
 - 15 `arbitrary_precision_bignumber` tests (C layer stores UInt64 significand)
 - 2 `signaling_nan` tests (Swift doesn't distinguish sNaN vs qNaN)
 - 2 `raw_string_bytes` tests (Swift String requires valid UTF-8)
 - 8 BigNumber exponent tests outside -128 to 127 (exceeds Swift Decimal range)
-
-**Known failures (1):**
-- `unicode_normalization_none_different_keys`: Swift's String type normalizes Unicode internally,
-  so differently-encoded forms of the same character are equal at the String level
+- 2 chunked string tests (chunking removed in new wire format)
 
 ## Build Commands
 

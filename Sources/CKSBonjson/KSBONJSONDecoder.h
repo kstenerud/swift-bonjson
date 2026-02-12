@@ -25,7 +25,7 @@
 //
 
 // ABOUTME: Public API for position-map and callback-based BONJSON decoding.
-// ABOUTME: Phase 2 delimiter-terminated format.
+// ABOUTME: Phase 3 format with typed arrays and records.
 
 #ifndef KSBONJSONDecoder_h
 #define KSBONJSONDecoder_h
@@ -202,6 +202,13 @@ typedef struct {
     } data;
 } KSBONJSONMapEntry;
 
+#define KSBONJSON_MAX_RECORD_DEFS 256
+
+typedef struct {
+    size_t firstKeyIndex;
+    uint32_t keyCount;
+} KSBONJSONRecordDef;
+
 typedef struct {
     const uint8_t* input;
     size_t inputLength;
@@ -213,6 +220,8 @@ typedef struct {
     int containerDepth;
     size_t containerStack[KSBONJSON_MAX_CONTAINER_DEPTH];
     KSBONJSONDecodeFlags flags;
+    KSBONJSONRecordDef recordDefs[KSBONJSON_MAX_RECORD_DEFS];
+    size_t recordDefCount;
 } KSBONJSONMapContext;
 
 KSBONJSON_PUBLIC void ksbonjson_map_beginWithFlags(

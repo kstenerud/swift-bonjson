@@ -25,7 +25,7 @@
 //
 
 // ABOUTME: Shared constants, macros, and type codes for BONJSON codec.
-// ABOUTME: Phase 2 type codes with delimiter-terminated format.
+// ABOUTME: Phase 3 type codes with typed arrays and records.
 
 #ifndef KSBONJSONCommon_h
 #define KSBONJSONCommon_h
@@ -83,83 +83,96 @@ extern "C" {
 
 
 // ============================================================================
-// Type codes (Phase 2: delimiter-terminated format)
+// Type codes (Phase 3: typed arrays and records)
 // ============================================================================
 //
 // Layout:
-//   0x00-0xC8: Small integers (-100 to 100), value = type_code - 100
-//   0xC9:      RESERVED
-//   0xCA:      BigNumber (zigzag LEB128 exponent + significand)
-//   0xCB:      float32 (IEEE 754 binary32, little-endian)
-//   0xCC:      float64 (IEEE 754 binary64, little-endian)
-//   0xCD:      null
-//   0xCE:      false
-//   0xCF:      true
-//   0xD0-0xDF: Short strings (0-15 bytes, length = type_code & 0x0F)
-//   0xE0-0xE3: Unsigned integers (1, 2, 4, 8 bytes)
-//   0xE4-0xE7: Signed integers (1, 2, 4, 8 bytes)
-//   0xE8-0xFB: RESERVED
-//   0xFC:      Array start
-//   0xFD:      Object start
-//   0xFE:      Container end
+//   0x00-0x64: Small integers (0 to 100), value = type_code
+//   0x65-0xA7: Short strings (0-66 bytes, length = type_code - 0x65)
+//   0xA8-0xAB: Unsigned integers (1, 2, 4, 8 bytes)
+//   0xAC-0xAF: Signed integers (1, 2, 4, 8 bytes)
+//   0xB0:      float32 (IEEE 754 binary32, little-endian)
+//   0xB1:      float64 (IEEE 754 binary64, little-endian)
+//   0xB2:      BigNumber (zigzag LEB128 exponent + significand)
+//   0xB3:      null
+//   0xB4:      false
+//   0xB5:      true
+//   0xB6:      Container end
+//   0xB7:      Array start
+//   0xB8:      Object start
+//   0xB9:      Record definition
+//   0xBA:      Record instance
+//   0xBB-0xF4: RESERVED
+//   0xF5:      Typed array float64
+//   0xF6:      Typed array float32
+//   0xF7:      Typed array sint64
+//   0xF8:      Typed array sint32
+//   0xF9:      Typed array sint16
+//   0xFA:      Typed array sint8
+//   0xFB:      Typed array uint64
+//   0xFC:      Typed array uint32
+//   0xFD:      Typed array uint16
+//   0xFE:      Typed array uint8
 //   0xFF:      Long string start / string terminator
 
 enum
 {
-    // Small integers: 0x00-0xC8 encode values -100 to 100
-    // value = type_code - 100, so type_code = value + 100
-    TYPE_SMALLINT_MIN  = 0x00,  // -100
-    TYPE_SMALLINT_ZERO = 0x64,  // 0
-    TYPE_SMALLINT_MAX  = 0xC8,  // 100
+    // Small integers: 0x00-0x64 encode values 0 to 100
+    // value = type_code directly (no bias)
+    TYPE_SMALLINT_MAX  = 0x64,  // 100
 
-    // Big number (zigzag LEB128 exponent + zigzag LEB128 signed_length + LE magnitude)
-    TYPE_BIG_NUMBER = 0xCA,
-
-    // Floats (float32 and float64 only)
-    TYPE_FLOAT32 = 0xCB,
-    TYPE_FLOAT64 = 0xCC,
-
-    // Null
-    TYPE_NULL = 0xCD,
-
-    // Booleans
-    TYPE_FALSE = 0xCE,
-    TYPE_TRUE  = 0xCF,
-
-    // Short strings (0-15 bytes), lower nibble = length
-    TYPE_STRING0  = 0xD0,
-    TYPE_STRING1  = 0xD1,
-    TYPE_STRING2  = 0xD2,
-    TYPE_STRING3  = 0xD3,
-    TYPE_STRING4  = 0xD4,
-    TYPE_STRING5  = 0xD5,
-    TYPE_STRING6  = 0xD6,
-    TYPE_STRING7  = 0xD7,
-    TYPE_STRING8  = 0xD8,
-    TYPE_STRING9  = 0xD9,
-    TYPE_STRING10 = 0xDA,
-    TYPE_STRING11 = 0xDB,
-    TYPE_STRING12 = 0xDC,
-    TYPE_STRING13 = 0xDD,
-    TYPE_STRING14 = 0xDE,
-    TYPE_STRING15 = 0xDF,
+    // Short strings (0-66 bytes), length = type_code - TYPE_STRING0
+    TYPE_STRING0         = 0x65,
+    TYPE_SHORT_STRING_MAX = 0xA7,
 
     // Unsigned integers: CPU-native sizes (1, 2, 4, 8 bytes)
-    TYPE_UINT8  = 0xE0,
-    TYPE_UINT16 = 0xE1,
-    TYPE_UINT32 = 0xE2,
-    TYPE_UINT64 = 0xE3,
+    TYPE_UINT8  = 0xA8,
+    TYPE_UINT16 = 0xA9,
+    TYPE_UINT32 = 0xAA,
+    TYPE_UINT64 = 0xAB,
 
     // Signed integers: CPU-native sizes (1, 2, 4, 8 bytes)
-    TYPE_SINT8  = 0xE4,
-    TYPE_SINT16 = 0xE5,
-    TYPE_SINT32 = 0xE6,
-    TYPE_SINT64 = 0xE7,
+    TYPE_SINT8  = 0xAC,
+    TYPE_SINT16 = 0xAD,
+    TYPE_SINT32 = 0xAE,
+    TYPE_SINT64 = 0xAF,
+
+    // Floats (float32 and float64 only)
+    TYPE_FLOAT32 = 0xB0,
+    TYPE_FLOAT64 = 0xB1,
+
+    // Big number (zigzag LEB128 exponent + zigzag LEB128 signed_length + LE magnitude)
+    TYPE_BIG_NUMBER = 0xB2,
+
+    // Null
+    TYPE_NULL = 0xB3,
+
+    // Booleans
+    TYPE_FALSE = 0xB4,
+    TYPE_TRUE  = 0xB5,
+
+    // Container end marker
+    TYPE_END = 0xB6,
 
     // Containers (delimiter-terminated with TYPE_END)
-    TYPE_ARRAY  = 0xFC,
-    TYPE_OBJECT = 0xFD,
-    TYPE_END    = 0xFE,
+    TYPE_ARRAY  = 0xB7,
+    TYPE_OBJECT = 0xB8,
+
+    // Records
+    TYPE_RECORD_DEF      = 0xB9,
+    TYPE_RECORD_INSTANCE = 0xBA,
+
+    // Typed arrays: type_code + ULEB128(count) + raw LE element data
+    TYPE_TYPED_FLOAT64 = 0xF5,
+    TYPE_TYPED_FLOAT32 = 0xF6,
+    TYPE_TYPED_SINT64  = 0xF7,
+    TYPE_TYPED_SINT32  = 0xF8,
+    TYPE_TYPED_SINT16  = 0xF9,
+    TYPE_TYPED_SINT8   = 0xFA,
+    TYPE_TYPED_UINT64  = 0xFB,
+    TYPE_TYPED_UINT32  = 0xFC,
+    TYPE_TYPED_UINT16  = 0xFD,
+    TYPE_TYPED_UINT8   = 0xFE,
 
     // Long string: FF + data + FF (0xFF is both start and terminator)
     TYPE_STRING_LONG = 0xFF,
@@ -167,25 +180,20 @@ enum
 
 enum
 {
-    SMALLINT_MIN = -100,
+    SMALLINT_MIN = 0,
     SMALLINT_MAX = 100,
-    SMALLINT_BIAS = 100,  // type_code = value + SMALLINT_BIAS
 };
 
 // Masks and bases for efficient type detection
 enum
 {
-    // Short strings: 0xD0-0xDF (lower nibble = length)
-    TYPE_MASK_SHORT_STRING = 0xF0,
-    TYPE_SHORT_STRING_BASE = 0xD0,
-
-    // Unsigned integers: 0xE0-0xE3
+    // Unsigned integers: 0xA8-0xAB
     TYPE_MASK_UINT = 0xFC,
-    TYPE_UINT_BASE = 0xE0,
+    TYPE_UINT_BASE = 0xA8,
 
-    // Signed integers: 0xE4-0xE7
+    // Signed integers: 0xAC-0xAF
     TYPE_MASK_SINT = 0xFC,
-    TYPE_SINT_BASE = 0xE4,
+    TYPE_SINT_BASE = 0xAC,
 };
 
 
@@ -314,6 +322,40 @@ static inline size_t ksbonjson_readZigzagLEB128(const uint8_t *buf, size_t avail
         i++;
         if (!(byte & 0x80)) {
             *out = ksbonjson_zigzagDecode(result);
+            return i;
+        }
+    } while (shift < 64);
+    return 0; // overflow
+}
+
+// Write unsigned LEB128 to buffer. Returns number of bytes written.
+// Caller must ensure buf has at least 10 bytes available.
+static inline size_t ksbonjson_writeULEB128(uint8_t *buf, uint64_t value)
+{
+    size_t i = 0;
+    do {
+        uint8_t byte = (uint8_t)(value & 0x7F);
+        value >>= 7;
+        if (value != 0) byte |= 0x80;
+        buf[i++] = byte;
+    } while (value != 0);
+    return i;
+}
+
+// Read unsigned LEB128 from buffer. Returns number of bytes consumed, or 0 on error.
+static inline size_t ksbonjson_readULEB128(const uint8_t *buf, size_t available, uint64_t *out)
+{
+    uint64_t result = 0;
+    size_t shift = 0;
+    size_t i = 0;
+    do {
+        if (i >= available) return 0;
+        uint8_t byte = buf[i];
+        result |= (uint64_t)(byte & 0x7F) << shift;
+        shift += 7;
+        i++;
+        if (!(byte & 0x80)) {
+            *out = result;
             return i;
         }
     } while (shift < 64);

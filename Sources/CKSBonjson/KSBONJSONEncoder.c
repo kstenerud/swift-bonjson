@@ -25,7 +25,7 @@
 //
 
 // ABOUTME: BONJSON encoder implementation for both buffer-based and
-// ABOUTME: callback-based APIs. Phase 2 delimiter-terminated format.
+// ABOUTME: callback-based APIs. Phase 3 delimiter-terminated format.
 
 #include "KSBONJSONEncoder.h"
 #include "KSBONJSONCommon.h"
@@ -206,9 +206,9 @@ ssize_t ksbonjson_encodeToBuffer_int(KSBONJSONBufferEncodeContext* ctx, int64_t 
     container->isExpectingName = true;
     incrementContainerCount(ctx);
 
-    if (value >= SMALLINT_MIN && value <= SMALLINT_MAX)
+    if (value >= 0 && value <= SMALLINT_MAX)
     {
-        bufferWriteByte(ctx, (uint8_t)(value + SMALLINT_BIAS));
+        bufferWriteByte(ctx, (uint8_t)value);
         return 1;
     }
 
@@ -261,7 +261,7 @@ ssize_t ksbonjson_encodeToBuffer_uint(KSBONJSONBufferEncodeContext* ctx, uint64_
 
     if (value <= (uint64_t)SMALLINT_MAX)
     {
-        bufferWriteByte(ctx, (uint8_t)(value + SMALLINT_BIAS));
+        bufferWriteByte(ctx, (uint8_t)value);
         return 1;
     }
 
@@ -402,7 +402,7 @@ ssize_t ksbonjson_encodeToBuffer_string(KSBONJSONBufferEncodeContext* ctx,
         return -KSBONJSON_ENCODE_MAX_STRING_LENGTH_EXCEEDED;
     }
 
-    size_t maxEncodedSize = length <= 15 ? (1 + length) : (2 + length);
+    size_t maxEncodedSize = length <= 66 ? (1 + length) : (2 + length);
     unlikely_if(bufferWouldExceedDocumentSize(ctx, maxEncodedSize))
     {
         return -KSBONJSON_ENCODE_MAX_DOCUMENT_SIZE_EXCEEDED;
@@ -422,7 +422,7 @@ ssize_t ksbonjson_encodeToBuffer_string(KSBONJSONBufferEncodeContext* ctx,
         incrementContainerCount(ctx);
     }
 
-    if (length <= 15)
+    if (length <= 66)
     {
         bufferWriteByte(ctx, (uint8_t)(TYPE_STRING0 + length));
         bufferWriteBytes(ctx, (const uint8_t*)value, length);
@@ -542,9 +542,9 @@ ssize_t ksbonjson_encodeToBuffer_endAllContainers(KSBONJSONBufferEncodeContext* 
 // Internal: encode a single int64 without container state checks (for batch use)
 static inline size_t encodeInt64Fast(KSBONJSONBufferEncodeContext* ctx, int64_t value)
 {
-    if (value >= SMALLINT_MIN && value <= SMALLINT_MAX)
+    if (value >= 0 && value <= SMALLINT_MAX)
     {
-        bufferWriteByte(ctx, (uint8_t)(value + SMALLINT_BIAS));
+        bufferWriteByte(ctx, (uint8_t)value);
         return 1;
     }
 
@@ -613,21 +613,19 @@ ssize_t ksbonjson_encodeToBuffer_int64Array(
     container->isExpectingName = true;
     incrementContainerCount(ctx);
 
-    size_t totalBytes = 0;
+    // Typed array: TYPE_TYPED_SINT64 + ULEB128(count) + raw 8-byte LE values
+    bufferWriteByte(ctx, TYPE_TYPED_SINT64);
+    uint8_t countBuf[10];
+    size_t countBytes = ksbonjson_writeULEB128(countBuf, (uint64_t)count);
+    bufferWriteBytes(ctx, countBuf, countBytes);
+    size_t totalBytes = 1 + countBytes;
 
-    // Begin array
-    bufferWriteByte(ctx, TYPE_ARRAY);
-    totalBytes++;
-
-    // Encode all values
     for (size_t i = 0; i < count; i++)
     {
-        totalBytes += encodeInt64Fast(ctx, values[i]);
+        uint64_t le = ksbonjson_toLittleEndian((uint64_t)values[i]);
+        bufferWriteBytes(ctx, (const uint8_t*)&le, 8);
     }
-
-    // End array
-    bufferWriteByte(ctx, TYPE_END);
-    totalBytes++;
+    totalBytes += count * 8;
 
     return (ssize_t)totalBytes;
 }
@@ -645,18 +643,20 @@ ssize_t ksbonjson_encodeToBuffer_doubleArray(
     container->isExpectingName = true;
     incrementContainerCount(ctx);
 
-    size_t totalBytes = 0;
-
-    bufferWriteByte(ctx, TYPE_ARRAY);
-    totalBytes++;
+    // Typed array: TYPE_TYPED_FLOAT64 + ULEB128(count) + raw 8-byte LE values
+    bufferWriteByte(ctx, TYPE_TYPED_FLOAT64);
+    uint8_t countBuf[10];
+    size_t countBytes = ksbonjson_writeULEB128(countBuf, (uint64_t)count);
+    bufferWriteBytes(ctx, countBuf, countBytes);
+    size_t totalBytes = 1 + countBytes;
 
     for (size_t i = 0; i < count; i++)
     {
-        totalBytes += encodeDoubleFast(ctx, values[i]);
+        union num64_bits bits = {.f64 = values[i]};
+        bits.u64 = ksbonjson_toLittleEndian(bits.u64);
+        bufferWriteBytes(ctx, bits.b, 8);
     }
-
-    bufferWriteByte(ctx, TYPE_END);
-    totalBytes++;
+    totalBytes += count * 8;
 
     return (ssize_t)totalBytes;
 }
@@ -666,7 +666,7 @@ static inline size_t encodeStringFast(KSBONJSONBufferEncodeContext* ctx,
                                       const char* value,
                                       size_t length)
 {
-    if (length <= 15)
+    if (length <= 66)
     {
         bufferWriteByte(ctx, (uint8_t)(TYPE_STRING0 + length));
         bufferWriteBytes(ctx, (const uint8_t*)value, length);
@@ -719,6 +719,66 @@ ssize_t ksbonjson_encodeToBuffer_stringArray(
     totalBytes++;
 
     return (ssize_t)totalBytes;
+}
+
+
+// ============================================================================
+// Record Encoding
+// ============================================================================
+
+ssize_t ksbonjson_encodeToBuffer_beginRecordDef(KSBONJSONBufferEncodeContext* ctx)
+{
+    unlikely_if(bufferWouldExceedDocumentSize(ctx, 1))
+    {
+        return -KSBONJSON_ENCODE_MAX_DOCUMENT_SIZE_EXCEEDED;
+    }
+
+    bufferWriteByte(ctx, TYPE_RECORD_DEF);
+    return 1;
+}
+
+ssize_t ksbonjson_encodeToBuffer_endRecordDef(KSBONJSONBufferEncodeContext* ctx)
+{
+    unlikely_if(bufferWouldExceedDocumentSize(ctx, 1))
+    {
+        return -KSBONJSON_ENCODE_MAX_DOCUMENT_SIZE_EXCEEDED;
+    }
+
+    bufferWriteByte(ctx, TYPE_END);
+    return 1;
+}
+
+ssize_t ksbonjson_encodeToBuffer_beginRecordInstance(KSBONJSONBufferEncodeContext* ctx, uint64_t defIndex)
+{
+    KSBONJSONContainerState* const container = getBufferContainer(ctx);
+    unlikely_if(container->isObject & container->isExpectingName)
+    {
+        return -KSBONJSON_ENCODE_EXPECTED_OBJECT_NAME;
+    }
+    unlikely_if(bufferWouldExceedDocumentSize(ctx, 11)) // 1 + up to 10 ULEB128
+    {
+        return -KSBONJSON_ENCODE_MAX_DOCUMENT_SIZE_EXCEEDED;
+    }
+
+    size_t maxDepth = ctx->flags.maxDepth < SIZE_MAX ? ctx->flags.maxDepth : KSBONJSON_MAX_CONTAINER_DEPTH;
+    unlikely_if((size_t)(ctx->containerDepth + 1) > maxDepth)
+    {
+        return -KSBONJSON_ENCODE_MAX_DEPTH_EXCEEDED;
+    }
+
+    container->isExpectingName = true;
+    incrementContainerCount(ctx);
+
+    ctx->containerDepth++;
+    ctx->containers[ctx->containerDepth] = (KSBONJSONContainerState){0};
+    ctx->containerElementCounts[ctx->containerDepth] = 0;
+
+    bufferWriteByte(ctx, TYPE_RECORD_INSTANCE);
+    uint8_t indexBuf[10];
+    size_t indexBytes = ksbonjson_writeULEB128(indexBuf, defIndex);
+    bufferWriteBytes(ctx, indexBuf, indexBytes);
+
+    return (ssize_t)(1 + indexBytes);
 }
 
 
@@ -779,7 +839,7 @@ static ksbonjson_encodeStatus encodePrimitiveNumeric(KSBONJSONEncodeContext* con
 
 static ksbonjson_encodeStatus encodeSmallInt(KSBONJSONEncodeContext* const ctx, int64_t value)
 {
-    return addEncodedByte(ctx, (uint8_t)(value + SMALLINT_BIAS));
+    return addEncodedByte(ctx, (uint8_t)value);
 }
 
 static ksbonjson_encodeStatus beginContainer(KSBONJSONEncodeContext* const ctx,
@@ -857,7 +917,7 @@ ksbonjson_encodeStatus ksbonjson_addSignedInteger(KSBONJSONEncodeContext* const 
     SHOULD_NOT_BE_EXPECTING_OBJECT_NAME(container);
     container->isExpectingName = true;
 
-    if(value >= SMALLINT_MIN && value <= SMALLINT_MAX)
+    if(value >= 0 && value <= SMALLINT_MAX)
     {
         return encodeSmallInt(ctx, value);
     }
@@ -990,9 +1050,9 @@ ksbonjson_encodeStatus ksbonjson_addString(KSBONJSONEncodeContext* const ctx,
 
     container->isExpectingName = !container->isExpectingName;
 
-    if(valueLength <= 15)
+    if(valueLength <= 66)
     {
-        uint8_t buffer[16];
+        uint8_t buffer[68];
         buffer[0] = (uint8_t)(TYPE_STRING0 + valueLength);
         memcpy(buffer+1, (const uint8_t*)value, valueLength);
         return addEncodedBytes(ctx, buffer, valueLength+1);

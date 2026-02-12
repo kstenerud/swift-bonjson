@@ -7,28 +7,29 @@ import XCTest
 // MARK: - BONJSON Type Codes for Testing
 // These match the BONJSON specification for verifying encoded output.
 private enum TestTypeCode {
-    static let null: UInt8 = 0xcd
-    static let `false`: UInt8 = 0xce
-    static let `true`: UInt8 = 0xcf
+    static let null: UInt8 = 0xb3
+    static let `false`: UInt8 = 0xb4
+    static let `true`: UInt8 = 0xb5
 
-    static let bigNumber: UInt8 = 0xca
-    static let float32: UInt8 = 0xcb
-    static let float64: UInt8 = 0xcc
+    static let bigNumber: UInt8 = 0xb2
+    static let float32: UInt8 = 0xb0
+    static let float64: UInt8 = 0xb1
     static let stringLong: UInt8 = 0xff
 
-    static let arrayStart: UInt8 = 0xfc
-    static let objectStart: UInt8 = 0xfd
-    static let containerEnd: UInt8 = 0xfe
+    static let arrayStart: UInt8 = 0xb7
+    static let objectStart: UInt8 = 0xb8
+    static let containerEnd: UInt8 = 0xb6
 
-    /// Small integers -100 to 100 encode as type_code = value + 100
-    /// e.g., -100 -> 0x00, 0 -> 0x64, 100 -> 0xc8
+    /// Small integers 0 to 100 encode as type_code = value directly
+    /// e.g., 0 -> 0x00, 50 -> 0x32, 100 -> 0x64
     static func smallInt(_ value: Int8) -> UInt8 {
-        return UInt8(Int(value) + 100)
+        precondition(value >= 0 && value <= 100, "Small int range is 0-100")
+        return UInt8(value)
     }
 
-    /// Short string type code for given length (0-15)
+    /// Short string type code for given length (0-66)
     static func stringShort(length: Int) -> UInt8 {
-        return 0xd0 + UInt8(length)
+        return 0x65 + UInt8(length)
     }
 }
 
@@ -61,11 +62,9 @@ final class BONJSONEncoderTests: XCTestCase {
             XCTAssertEqual(data, Data([TestTypeCode.smallInt(i)]), "Failed for \(i)")
         }
 
-        // Test small negative integers (-1 to -100)
-        for i: Int8 in -100...(-1) {
-            let data = try encoder.encode(i)
-            XCTAssertEqual(data, Data([TestTypeCode.smallInt(i)]), "Failed for \(i)")
-        }
+        // Negative integers are no longer small ints - they use signed int encoding
+        let dataNeg1 = try encoder.encode(Int8(-1))
+        XCTAssertEqual(dataNeg1.count, 2) // type byte + 1 data byte
     }
 
     func testEncodeLargerIntegers() throws {
@@ -175,8 +174,8 @@ final class BONJSONEncoderTests: XCTestCase {
     func testEncodeLongString() throws {
         let encoder = BONJSONEncoder()
 
-        // String longer than 15 bytes
-        let longString = String(repeating: "a", count: 20)
+        // String longer than 66 bytes
+        let longString = String(repeating: "a", count: 70)
         let data = try encoder.encode(longString)
         XCTAssertEqual(data[0], TestTypeCode.stringLong)
     }
@@ -186,20 +185,23 @@ final class BONJSONEncoderTests: XCTestCase {
     func testEncodeEmptyArray() throws {
         let encoder = BONJSONEncoder()
         let data = try encoder.encode([Int]())
-        // Delimiter-terminated: arrayStart + containerEnd
-        XCTAssertEqual(data, Data([TestTypeCode.arrayStart, TestTypeCode.containerEnd]))
+        // Typed array format: TYPE_TYPED_SINT64 + ULEB128(count=0)
+        XCTAssertEqual(data, Data([0xf7, 0x00]))
     }
+
 
     func testEncodeIntArray() throws {
         let encoder = BONJSONEncoder()
         let data = try encoder.encode([1, 2, 3])
 
-        // Delimiter-terminated: arrayStart + elements + containerEnd
-        XCTAssertEqual(data[0], TestTypeCode.arrayStart)
-        XCTAssertEqual(data[1], TestTypeCode.smallInt(1))
-        XCTAssertEqual(data[2], TestTypeCode.smallInt(2))
-        XCTAssertEqual(data[3], TestTypeCode.smallInt(3))
-        XCTAssertEqual(data[4], TestTypeCode.containerEnd)
+        // Typed array format: TYPE_TYPED_SINT64 + ULEB128(count=3) + 3x8-byte LE int64
+        XCTAssertEqual(data[0], 0xf7 as UInt8)  // TYPE_TYPED_SINT64
+        XCTAssertEqual(data[1], 0x03 as UInt8)  // count = 3
+        XCTAssertEqual(data.count, 2 + 3 * 8)   // header + 3 int64 values
+        // Verify values: 1, 2, 3 as little-endian int64
+        XCTAssertEqual(data[2], 1)  // first byte of 1 as LE int64
+        XCTAssertEqual(data[10], 2) // first byte of 2 as LE int64
+        XCTAssertEqual(data[18], 3) // first byte of 3 as LE int64
     }
 
     func testEncodeNestedArray() throws {
@@ -352,7 +354,7 @@ final class BONJSONDecoderTests: XCTestCase {
     func testDecodeSmallIntegers() throws {
         let decoder = BONJSONDecoder()
 
-        for i: Int8 in -100...100 {
+        for i: Int8 in 0...100 {
             let data = Data([TestTypeCode.smallInt(i)])
             let decoded = try decoder.decode(Int8.self, from: data)
             XCTAssertEqual(decoded, i, "Failed for \(i)")
@@ -1930,13 +1932,13 @@ final class BONJSONRoundTripTests: XCTestCase {
     func testLongStringEncoding() throws {
         let encoder = BONJSONEncoder()
 
-        // Test 20-character string: FF-terminated format
-        let str20 = String(repeating: "a", count: 20)
-        let data20 = try encoder.encode(str20)
-        XCTAssertEqual(data20[0], TestTypeCode.stringLong, "First byte should be long string type (0xFF)")
-        XCTAssertEqual(data20[1], UInt8(ascii: "a"), "String content should follow immediately")
-        XCTAssertEqual(data20[21], TestTypeCode.stringLong, "Last byte should be terminator (0xFF)")
-        XCTAssertEqual(data20.count, 22, "Should be 1 + 20 + 1 bytes")
+        // Test 70-character string: FF-terminated format (threshold is now 66)
+        let str70 = String(repeating: "a", count: 70)
+        let data70 = try encoder.encode(str70)
+        XCTAssertEqual(data70[0], TestTypeCode.stringLong, "First byte should be long string type (0xFF)")
+        XCTAssertEqual(data70[1], UInt8(ascii: "a"), "String content should follow immediately")
+        XCTAssertEqual(data70[71], TestTypeCode.stringLong, "Last byte should be terminator (0xFF)")
+        XCTAssertEqual(data70.count, 72, "Should be 1 + 70 + 1 bytes")
     }
 
     func testLongStringDecodeSpecificBytes() throws {
@@ -2935,18 +2937,18 @@ final class BONJSONBigNumberTests: XCTestCase {
     // Test big number decoding as Double in keyed container
     func testBigNumberAsDoubleInKeyedContainer() throws {
         // Create raw BONJSON: { "value": <big number 12345> }
-        // BigNumber format: TYPE_BIG_NUMBER (0xCA) + zigzag LEB128 exponent + zigzag LEB128 signed_length + LE magnitude
+        // BigNumber format: TYPE_BIG_NUMBER (0xB2) + zigzag LEB128 exponent + zigzag LEB128 signed_length + LE magnitude
         // Exponent 0: zigzag(0)=0x00
         // 12345 = 0x3039, LE bytes: [0x39, 0x30], signed_length=+2, zigzag(2)=0x04
 
         let bonjsonData = Data([
-            0xfd,                           // Object start
-            0xd5, 0x76, 0x61, 0x6c, 0x75, 0x65, // Key "value" (short string, 5 bytes: 0xd0 + 5)
-            0xca,                           // Big number type
+            0xb8,                           // Object start
+            0x6a, 0x76, 0x61, 0x6c, 0x75, 0x65, // Key "value" (short string, 5 bytes: 0x65 + 5)
+            0xb2,                           // Big number type
             0x00,                           // Exponent: 0
             0x04,                           // signed_length: +2 (zigzag=4)
             0x39, 0x30,                     // Magnitude: 12345 LE
-            0xfe                            // Container end
+            0xb6                            // Container end
         ])
 
         struct DoubleHolder: Decodable {
@@ -2962,12 +2964,12 @@ final class BONJSONBigNumberTests: XCTestCase {
     func testBigNumberAsDoubleInUnkeyedContainer() throws {
         // Create raw BONJSON: [<big number 12345>]
         let bonjsonData = Data([
-            0xfc,                           // Array start
-            0xca,                           // Big number type
+            0xb7,                           // Array start
+            0xb2,                           // Big number type
             0x00,                           // Exponent: 0
             0x04,                           // signed_length: +2 (zigzag=4)
             0x39, 0x30,                     // Magnitude: 12345 LE
-            0xfe                            // Container end
+            0xb6                            // Container end
         ])
 
         struct ManualDecoder: Decodable {
@@ -2988,7 +2990,7 @@ final class BONJSONBigNumberTests: XCTestCase {
     func testBigNumberAsDoubleInSingleValueContainer() throws {
         // Create raw BONJSON: <big number 12345>
         let bonjsonData = Data([
-            0xca,                           // Big number type
+            0xb2,                           // Big number type
             0x00,                           // Exponent: 0
             0x04,                           // signed_length: +2 (zigzag=4)
             0x39, 0x30                      // Magnitude: 12345 LE
@@ -3003,7 +3005,7 @@ final class BONJSONBigNumberTests: XCTestCase {
     func testNegativeBigNumber() throws {
         // Big number -12345: signed_length=-2 (zigzag=3), magnitude=12345 LE
         let bonjsonData = Data([
-            0xca,                           // Big number type
+            0xb2,                           // Big number type
             0x00,                           // Exponent: 0
             0x03,                           // signed_length: -2 (zigzag=3, negative)
             0x39, 0x30                      // Magnitude: 12345 LE
@@ -3020,7 +3022,7 @@ final class BONJSONBigNumberTests: XCTestCase {
         // Exponent -2: zigzag(-2)=3 → 0x03
         // 12345 = 0x3039, LE bytes: [0x39, 0x30], signed_length=+2, zigzag(2)=0x04
         let bonjsonData = Data([
-            0xca,                           // Big number type
+            0xb2,                           // Big number type
             0x03,                           // Exponent: -2 (zigzag=3)
             0x04,                           // signed_length: +2 (zigzag=4)
             0x39, 0x30                      // Magnitude: 12345 LE
@@ -3036,7 +3038,7 @@ final class BONJSONBigNumberTests: XCTestCase {
         // Big number representing timestamp 1000000 seconds since 1970
         // 1000000 = 0x0F4240, LE bytes: [0x40, 0x42, 0x0F], signed_length=+3, zigzag(3)=0x06
         let bonjsonData = Data([
-            0xca,                           // Big number type
+            0xb2,                           // Big number type
             0x00,                           // Exponent: 0
             0x06,                           // signed_length: +3 (zigzag=6)
             0x40, 0x42, 0x0f               // Magnitude: 1000000 LE
@@ -3058,7 +3060,7 @@ final class BONJSONSecurityTests: XCTestCase {
     func testDecoderRejectsNULByDefault() throws {
         // String "a\0b" with NUL character
         let bonjsonData = Data([
-            0xd3,                           // Short string, length 3
+            0x68,                           // Short string, length 3  (0x65 + 3)
             0x61, 0x00, 0x62                // "a\0b"
         ])
 
@@ -3076,7 +3078,7 @@ final class BONJSONSecurityTests: XCTestCase {
     func testDecoderAllowsNULWhenConfigured() throws {
         // String "a\0b" with NUL character
         let bonjsonData = Data([
-            0xd3,                           // Short string, length 3
+            0x68,                           // Short string, length 3  (0x65 + 3)
             0x61, 0x00, 0x62                // "a\0b"
         ])
 
@@ -3120,7 +3122,7 @@ final class BONJSONSecurityTests: XCTestCase {
     func testDecoderRejectsInvalidUTF8ByDefault() throws {
         // String with invalid UTF-8: 0x80 is a continuation byte without a leading byte
         let bonjsonData = Data([
-            0xd3,                           // Short string, length 3
+            0x68,                           // Short string, length 3  (0x65 + 3)
             0x61, 0x80, 0x62                // "a" + invalid + "b"
         ])
 
@@ -3138,7 +3140,7 @@ final class BONJSONSecurityTests: XCTestCase {
     func testDecoderRejectsSurrogates() throws {
         // Surrogate encoded as UTF-8: U+D800 = 0xED 0xA0 0x80
         let bonjsonData = Data([
-            0xd3,                           // Short string, length 3
+            0x68,                           // Short string, length 3  (0x65 + 3)
             0xED, 0xA0, 0x80                // Invalid: surrogate U+D800
         ])
 
@@ -3155,7 +3157,7 @@ final class BONJSONSecurityTests: XCTestCase {
     func testDecoderRejectsOverlongEncoding() throws {
         // Overlong encoding of 'a' (0x61): 0xC1 0xA1 instead of just 0x61
         let bonjsonData = Data([
-            0xd2,                           // Short string, length 2 (0xd0 + 2)
+            0x67,                           // Short string, length 2 (0x65 + 2)
             0xC1, 0xA1                      // Invalid: overlong encoding
         ])
 
@@ -3172,7 +3174,7 @@ final class BONJSONSecurityTests: XCTestCase {
     func testDecoderReplacesInvalidUTF8WhenConfigured() throws {
         // String with invalid UTF-8: 0x80 is a continuation byte without a leading byte
         let bonjsonData = Data([
-            0xd3,                           // Short string, length 3
+            0x68,                           // Short string, length 3  (0x65 + 3)
             0x61, 0x80, 0x62                // "a" + invalid + "b"
         ])
 
@@ -3186,7 +3188,7 @@ final class BONJSONSecurityTests: XCTestCase {
     func testDecoderDeletesInvalidUTF8WhenConfigured() throws {
         // String with invalid UTF-8: 0x80 is a continuation byte without a leading byte
         let bonjsonData = Data([
-            0xd3,                           // Short string, length 3
+            0x68,                           // Short string, length 3  (0x65 + 3)
             0x61, 0x80, 0x62                // "a" + invalid + "b"
         ])
 
@@ -3202,12 +3204,12 @@ final class BONJSONSecurityTests: XCTestCase {
     func testDecoderRejectsDuplicateKeysByDefault() throws {
         // Object with duplicate "a" key: {"a": 1, "a": 2}
         let bonjsonData = Data([
-            0xfd,                           // Object start
-            0xd1, 0x61,                     // Key "a" (short string length 1: 0xd0 + 1)
-            0x65,                           // Value 1 (small int: 1 + 100 = 101)
-            0xd1, 0x61,                     // Key "a" again
-            0x66,                           // Value 2 (small int: 2 + 100 = 102)
-            0xfe                            // Container end
+            0xb8,                           // Object start
+            0x66, 0x61,                     // Key "a" (short string length 1: 0x65 + 1)
+            0x01,                           // Value 1 (small int: 0x01)
+            0x66, 0x61,                     // Key "a" again
+            0x02,                           // Value 2 (small int: 0x02)
+            0xb6                            // Container end
         ])
 
         let decoder = BONJSONDecoder()
@@ -3223,12 +3225,12 @@ final class BONJSONSecurityTests: XCTestCase {
     func testDecoderKeepsFirstDuplicateKeyWhenConfigured() throws {
         // Object with duplicate "a" key: {"a": 1, "a": 2}
         let bonjsonData = Data([
-            0xfd,                           // Object start
-            0xd1, 0x61,                     // Key "a" (short string length 1: 0xd0 + 1)
-            0x65,                           // Value 1 (small int: 1 + 100 = 101)
-            0xd1, 0x61,                     // Key "a" again
-            0x66,                           // Value 2 (small int: 2 + 100 = 102)
-            0xfe                            // Container end
+            0xb8,                           // Object start
+            0x66, 0x61,                     // Key "a" (short string length 1: 0x65 + 1)
+            0x01,                           // Value 1 (small int: 0x01)
+            0x66, 0x61,                     // Key "a" again
+            0x02,                           // Value 2 (small int: 0x02)
+            0xb6                            // Container end
         ])
 
         let decoder = BONJSONDecoder()
@@ -3240,12 +3242,12 @@ final class BONJSONSecurityTests: XCTestCase {
     func testDecoderKeepsLastDuplicateKeyWhenConfigured() throws {
         // Object with duplicate "a" key: {"a": 1, "a": 2}
         let bonjsonData = Data([
-            0xfd,                           // Object start
-            0xd1, 0x61,                     // Key "a" (short string length 1: 0xd0 + 1)
-            0x65,                           // Value 1 (small int: 1 + 100 = 101)
-            0xd1, 0x61,                     // Key "a" again
-            0x66,                           // Value 2 (small int: 2 + 100 = 102)
-            0xfe                            // Container end
+            0xb8,                           // Object start
+            0x66, 0x61,                     // Key "a" (short string length 1: 0x65 + 1)
+            0x01,                           // Value 1 (small int: 0x01)
+            0x66, 0x61,                     // Key "a" again
+            0x02,                           // Value 2 (small int: 0x02)
+            0xb6                            // Container end
         ])
 
         let decoder = BONJSONDecoder()

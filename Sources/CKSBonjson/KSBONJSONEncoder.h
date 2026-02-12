@@ -25,7 +25,7 @@
 //
 
 // ABOUTME: Public API for buffer-based and callback-based BONJSON encoding.
-// ABOUTME: Phase 2 delimiter-terminated format.
+// ABOUTME: Phase 3 delimiter-terminated format.
 
 #ifndef KSBONJSONEncoder_h
 #define KSBONJSONEncoder_h
@@ -198,7 +198,7 @@ KSBONJSON_PUBLIC ssize_t ksbonjson_encodeToBuffer_end(KSBONJSONBufferEncodeConte
 
 static inline size_t ksbonjson_maxEncodedSize_string(size_t stringLength)
 {
-    if (stringLength <= 15) return 1 + stringLength;
+    if (stringLength <= 66) return 1 + stringLength;
     // Long string: FF + data + FF
     return 2 + stringLength;
 }
@@ -234,13 +234,14 @@ KSBONJSON_PUBLIC ssize_t ksbonjson_encodeToBuffer_doubleArray(
 
 static inline size_t ksbonjson_maxEncodedSize_int64Array(size_t count)
 {
-    // Array begin (1) + count * max int size (9) + array end (1)
-    return 2 + count * KSBONJSON_MAX_ENCODED_SIZE_INT;
+    // Typed array: type(1) + ULEB128 count(10 max) + count * 8 bytes
+    return 11 + count * 8;
 }
 
 static inline size_t ksbonjson_maxEncodedSize_doubleArray(size_t count)
 {
-    return 2 + count * KSBONJSON_MAX_ENCODED_SIZE_FLOAT;
+    // Typed array: type(1) + ULEB128 count(10 max) + count * 8 bytes
+    return 11 + count * 8;
 }
 
 KSBONJSON_PUBLIC ssize_t ksbonjson_encodeToBuffer_stringArray(
@@ -254,6 +255,11 @@ static inline size_t ksbonjson_maxEncodedSize_stringArray(size_t count, size_t t
     // Array begin (1) + count * max string header (2 per string for FF+FF) + total string bytes + array end (1)
     return 2 + count * 2 + totalStringLength;
 }
+
+// Record encoding functions
+KSBONJSON_PUBLIC ssize_t ksbonjson_encodeToBuffer_beginRecordDef(KSBONJSONBufferEncodeContext* ctx);
+KSBONJSON_PUBLIC ssize_t ksbonjson_encodeToBuffer_endRecordDef(KSBONJSONBufferEncodeContext* ctx);
+KSBONJSON_PUBLIC ssize_t ksbonjson_encodeToBuffer_beginRecordInstance(KSBONJSONBufferEncodeContext* ctx, uint64_t defIndex);
 
 
 // ============================================================================

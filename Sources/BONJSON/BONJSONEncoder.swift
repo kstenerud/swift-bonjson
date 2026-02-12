@@ -683,7 +683,7 @@ final class _BufferEncoder: Encoder {
         // Build the complete BigNumber encoding
         var encoded = [UInt8]()
         encoded.reserveCapacity(1 + expBytes.count + lenBytes.count + magnitudeBytes.count)
-        encoded.append(0xCA)  // TYPE_BIG_NUMBER
+        encoded.append(0xB2)  // TYPE_BIG_NUMBER
         encoded.append(contentsOf: expBytes)
         encoded.append(contentsOf: lenBytes)
         encoded.append(contentsOf: magnitudeBytes)

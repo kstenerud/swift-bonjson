@@ -24,7 +24,7 @@
 // THE SOFTWARE.
 //
 
-// ABOUTME: BONJSON decoder implementation (Phase 2: delimiter-terminated format).
+// ABOUTME: BONJSON decoder implementation (Phase 3: delimiter-terminated format).
 // ABOUTME: Provides callback-based decoder, position-map scanner, and batch decode.
 
 #include "KSBONJSONDecoder.h"
@@ -414,7 +414,7 @@ static ksbonjson_decodeStatus decodeAndReportBigNumber(DecodeContext* const ctx)
 static ksbonjson_decodeStatus decodeAndReportShortString(DecodeContext* const ctx, const uint8_t typeCode)
 {
     // Short string length is in the lower nibble (0xD0-0xDF -> length 0-15)
-    const size_t length = (size_t)(typeCode & 0x0f);
+    const size_t length = (size_t)(typeCode - TYPE_STRING0);
     SHOULD_HAVE_ROOM_FOR_BYTES(length);
     const uint8_t* const begin = ctx->bufferCurrent;
     ctx->bufferCurrent += length;
@@ -495,8 +495,8 @@ static ksbonjson_decodeStatus endContainer(DecodeContext* const ctx)
 
 static ksbonjson_decodeStatus decodeObjectName(DecodeContext* const ctx, const uint8_t typeCode)
 {
-    // Short string: 0xD0-0xDF (mask-based detection)
-    if ((typeCode & TYPE_MASK_SHORT_STRING) == TYPE_SHORT_STRING_BASE)
+    // Short string: 0x65-0xA7 (range-based detection)
+    if (typeCode >= TYPE_STRING0 && typeCode <= TYPE_SHORT_STRING_MAX)
     {
         return decodeAndReportShortString(ctx, typeCode);
     }
@@ -508,30 +508,104 @@ static ksbonjson_decodeStatus decodeObjectName(DecodeContext* const ctx, const u
     return KSBONJSON_DECODE_EXPECTED_OBJECT_NAME;
 }
 
-static ksbonjson_decodeStatus decodeValue(DecodeContext* const ctx, const uint8_t typeCode)
+// Decode a typed array and report as regular array with individual elements
+static ksbonjson_decodeStatus decodeAndReportTypedArray(DecodeContext* const ctx, const uint8_t typeCode)
 {
-    // Small integers: 0x00-0xC8 (most common case)
-    if (typeCode <= TYPE_SMALLINT_MAX)
+    size_t tableIndex = (size_t)(TYPE_TYPED_UINT8 - typeCode);
+    size_t elementSize = (size_t[]){1, 2, 4, 8, 1, 2, 4, 8, 4, 8}[tableIndex];
+    int elementKind = (int[]){0, 0, 0, 0, 1, 1, 1, 1, 2, 2}[tableIndex];
+
+    // Read ULEB128 element count
+    size_t available = (size_t)(ctx->bufferEnd - ctx->bufferCurrent);
+    uint64_t count64;
+    size_t bytesRead = ksbonjson_readULEB128(ctx->bufferCurrent, available, &count64);
+    unlikely_if(bytesRead == 0)
     {
-        return ctx->callbacks->onSignedInteger((int64_t)typeCode - SMALLINT_BIAS, ctx->userData);
+        return KSBONJSON_DECODE_INCOMPLETE;
+    }
+    ctx->bufferCurrent += bytesRead;
+
+    uint32_t count = (uint32_t)count64;
+    size_t dataBytes = (size_t)count * elementSize;
+    SHOULD_HAVE_ROOM_FOR_BYTES(dataBytes);
+
+    // Report as begin array
+    PROPAGATE_ERROR(ctx, ctx->callbacks->onBeginArray(ctx->userData));
+
+    // Report individual elements
+    for (uint32_t i = 0; i < count; i++)
+    {
+        union number_bits bits = {.u64 = 0};
+        memcpy(bits.b, ctx->bufferCurrent, elementSize);
+        ctx->bufferCurrent += elementSize;
+        bits.u64 = fromLittleEndian(bits.u64);
+
+        switch (elementKind)
+        {
+            case 0: // unsigned
+            {
+                uint64_t mask = elementSize < 8 ? ((uint64_t)1 << (elementSize * 8)) - 1 : UINT64_MAX;
+                PROPAGATE_ERROR(ctx, ctx->callbacks->onUnsignedInteger(bits.u64 & mask, ctx->userData));
+                break;
+            }
+            case 1: // signed
+            {
+                // Re-read with sign extension
+                const uint8_t* elemStart = ctx->bufferCurrent - elementSize;
+                int8_t signFill = (int8_t)elemStart[elementSize - 1] >> 7;
+                union number_bits sbits = {.u64 = (uint64_t)(int64_t)signFill};
+                memcpy(sbits.b, elemStart, elementSize);
+                sbits.u64 = fromLittleEndian(sbits.u64);
+                PROPAGATE_ERROR(ctx, ctx->callbacks->onSignedInteger(sbits.i64, ctx->userData));
+                break;
+            }
+            case 2: // float
+            {
+                double value;
+                if (elementSize == 4)
+                    value = (double)bits.f32;
+                else
+                    value = bits.f64;
+                PROPAGATE_ERROR(ctx, reportFloat(ctx, value));
+                break;
+            }
+        }
     }
 
-    // Short strings: 0xD0-0xDF (mask-based detection)
-    if ((typeCode & TYPE_MASK_SHORT_STRING) == TYPE_SHORT_STRING_BASE)
+    // Report end container
+    return ctx->callbacks->onEndContainer(ctx->userData);
+}
+
+static ksbonjson_decodeStatus decodeValue(DecodeContext* const ctx, const uint8_t typeCode)
+{
+    // Small integers: 0x00-0x64 (most common case)
+    if (typeCode <= TYPE_SMALLINT_MAX)
+    {
+        return ctx->callbacks->onSignedInteger((int64_t)typeCode, ctx->userData);
+    }
+
+    // Short strings: 0x65-0xA7 (range-based detection)
+    if (typeCode >= TYPE_STRING0 && typeCode <= TYPE_SHORT_STRING_MAX)
     {
         return decodeAndReportShortString(ctx, typeCode);
     }
 
-    // Unsigned integers: 0xE0-0xE3 (mask-based detection)
+    // Unsigned integers: 0xA8-0xAB (mask-based detection)
     if ((typeCode & TYPE_MASK_UINT) == TYPE_UINT_BASE)
     {
         return decodeAndReportUnsignedInteger(ctx, typeCode);
     }
 
-    // Signed integers: 0xE4-0xE7 (mask-based detection)
+    // Signed integers: 0xAC-0xAF (mask-based detection)
     if ((typeCode & TYPE_MASK_SINT) == TYPE_SINT_BASE)
     {
         return decodeAndReportSignedInteger(ctx, typeCode);
+    }
+
+    // Typed arrays: 0xF5-0xFE
+    if (typeCode >= TYPE_TYPED_FLOAT64 && typeCode <= TYPE_TYPED_UINT8)
+    {
+        return decodeAndReportTypedArray(ctx, typeCode);
     }
 
     // Remaining types (individual checks)
@@ -754,16 +828,18 @@ static double mapDecodeFloat64(KSBONJSONMapContext* ctx)
     return bits.f64;
 }
 
-// Forward declaration for recursive scanning
+// Forward declarations for recursive scanning
 static ksbonjson_decodeStatus mapScanValue(KSBONJSONMapContext* ctx, size_t* outIndex);
+static ksbonjson_decodeStatus mapScanTypedArray(KSBONJSONMapContext* ctx, uint8_t typeCode, size_t* outIndex);
+static ksbonjson_decodeStatus mapScanRecordInstance(KSBONJSONMapContext* ctx, size_t* outIndex);
 
 // Scan a short string (length encoded in type code)
 static ksbonjson_decodeStatus mapScanShortString(KSBONJSONMapContext* ctx, uint8_t typeCode, size_t* outIndex)
 {
     MAP_SHOULD_HAVE_ENTRY_SPACE();
 
-    // Short string length is in the lower nibble (0xD0-0xDF -> length 0-15)
-    size_t length = (size_t)(typeCode & 0x0f);
+    // Short string length = typeCode - TYPE_STRING0 (0x65-0xA7 -> length 0-66)
+    size_t length = (size_t)(typeCode - TYPE_STRING0);
     size_t offset = ctx->position;
 
     // Check max string length (SIZE_MAX means use spec default)
@@ -1054,8 +1130,8 @@ static ksbonjson_decodeStatus mapScanObjectName(KSBONJSONMapContext* ctx, size_t
     MAP_SHOULD_HAVE_ROOM_FOR_BYTES(1);
     uint8_t typeCode = ctx->input[ctx->position++];
 
-    // Short string: 0xD0-0xDF (mask-based detection)
-    if ((typeCode & TYPE_MASK_SHORT_STRING) == TYPE_SHORT_STRING_BASE)
+    // Short string: 0x65-0xA7 (range-based detection)
+    if (typeCode >= TYPE_STRING0 && typeCode <= TYPE_SHORT_STRING_MAX)
     {
         return mapScanShortString(ctx, typeCode, outIndex);
     }
@@ -1188,40 +1264,339 @@ static ksbonjson_decodeStatus mapScanObject(KSBONJSONMapContext* ctx, size_t* ou
     return KSBONJSON_DECODE_OK;
 }
 
+// Element size lookup for typed arrays, indexed by (TYPE_TYPED_UINT8 - typeCode)
+static const size_t typedArrayElementSizes[] = {
+    1, 2, 4, 8, 1, 2, 4, 8, 4, 8
+    // uint8, uint16, uint32, uint64, sint8, sint16, sint32, sint64, float32, float64
+};
+
+// Whether element is signed, indexed by (TYPE_TYPED_UINT8 - typeCode)
+// 0=unsigned, 1=signed, 2=float
+static const int typedArrayElementKinds[] = {
+    0, 0, 0, 0, 1, 1, 1, 1, 2, 2
+    // uint8, uint16, uint32, uint64, sint8, sint16, sint32, sint64, float32, float64
+};
+
+// Scan a typed array (0xF5-0xFE): expands to regular ARRAY + element entries
+static ksbonjson_decodeStatus mapScanTypedArray(KSBONJSONMapContext* ctx, uint8_t typeCode, size_t* outIndex)
+{
+    MAP_SHOULD_HAVE_ENTRY_SPACE();
+
+    size_t tableIndex = (size_t)(TYPE_TYPED_UINT8 - typeCode);
+    size_t elementSize = typedArrayElementSizes[tableIndex];
+    int elementKind = typedArrayElementKinds[tableIndex];
+
+    // Read ULEB128 element count
+    size_t available = ctx->inputLength - ctx->position;
+    uint64_t count64;
+    size_t bytesRead = ksbonjson_readULEB128(ctx->input + ctx->position, available, &count64);
+    unlikely_if(bytesRead == 0)
+    {
+        return KSBONJSON_DECODE_INCOMPLETE;
+    }
+    ctx->position += bytesRead;
+
+    // Check container size limit
+    size_t maxContSize = ctx->flags.maxContainerSize < SIZE_MAX ? ctx->flags.maxContainerSize : KSBONJSON_DEFAULT_MAX_CONTAINER_SIZE;
+    unlikely_if(count64 > maxContSize)
+    {
+        return KSBONJSON_DECODE_MAX_CONTAINER_SIZE_EXCEEDED;
+    }
+    uint32_t count = (uint32_t)count64;
+
+    // Validate that we have enough bytes
+    size_t dataBytes = (size_t)count * elementSize;
+    MAP_SHOULD_HAVE_ROOM_FOR_BYTES(dataBytes);
+
+    // Check that we have enough entry space (1 for array + count for elements)
+    unlikely_if(ctx->entriesCount + 1 + count > ctx->entriesCapacity)
+    {
+        return KSBONJSON_DECODE_MAP_FULL;
+    }
+
+    // Reserve slot for array entry
+    size_t arrayIndex = ctx->entriesCount;
+    ctx->entries[arrayIndex] = (KSBONJSONMapEntry){
+        .type = KSBONJSON_TYPE_ARRAY,
+        .data.container = { .firstChild = 0, .count = 0 }
+    };
+    ctx->entriesCount++;
+
+    size_t firstChild = ctx->entriesCount;
+
+    // Read elements and create individual entries
+    for (uint32_t i = 0; i < count; i++)
+    {
+        KSBONJSONMapEntry entry;
+        union number_bits bits = {.u64 = 0};
+        memcpy(bits.b, ctx->input + ctx->position, elementSize);
+        ctx->position += elementSize;
+        bits.u64 = fromLittleEndian(bits.u64);
+
+        switch (elementKind)
+        {
+            case 0: // unsigned
+            {
+                // Mask to element size
+                uint64_t mask = elementSize < 8 ? ((uint64_t)1 << (elementSize * 8)) - 1 : UINT64_MAX;
+                entry.type = KSBONJSON_TYPE_UINT;
+                entry.data.uintValue = bits.u64 & mask;
+                break;
+            }
+            case 1: // signed
+            {
+                // Sign-extend from element size
+                int64_t signFill = (int64_t)((int8_t)(ctx->input[ctx->position - 1])) >> 7;
+                union number_bits sbits = {.u64 = (uint64_t)signFill};
+                memcpy(sbits.b, ctx->input + ctx->position - elementSize, elementSize);
+                sbits.u64 = fromLittleEndian(sbits.u64);
+                entry.type = KSBONJSON_TYPE_INT;
+                entry.data.intValue = sbits.i64;
+                break;
+            }
+            case 2: // float
+            {
+                entry.type = KSBONJSON_TYPE_FLOAT;
+                if (elementSize == 4)
+                {
+                    entry.data.floatValue = (double)bits.f32;
+                }
+                else
+                {
+                    entry.data.floatValue = bits.f64;
+                }
+                break;
+            }
+        }
+
+        entry.subtreeSize = 1;
+        ctx->entries[ctx->entriesCount] = entry;
+        ctx->entriesCount++;
+    }
+
+    // Update array entry
+    ctx->entries[arrayIndex].data.container.firstChild = (uint32_t)firstChild;
+    ctx->entries[arrayIndex].data.container.count = count;
+    ctx->entries[arrayIndex].subtreeSize = (uint32_t)(ctx->entriesCount - arrayIndex);
+
+    *outIndex = arrayIndex;
+    return KSBONJSON_DECODE_OK;
+}
+
+// Scan a record definition (0xB9): store key strings for later use by record instances
+static ksbonjson_decodeStatus mapScanRecordDef(KSBONJSONMapContext* ctx)
+{
+    unlikely_if(ctx->recordDefCount >= KSBONJSON_MAX_RECORD_DEFS)
+    {
+        return KSBONJSON_DECODE_INVALID_DATA;
+    }
+
+    size_t firstKeyIndex = ctx->entriesCount;
+    uint32_t keyCount = 0;
+    bool checkDuplicates = ctx->flags.rejectDuplicateKeys;
+    size_t maxContSize = ctx->flags.maxContainerSize < SIZE_MAX ? ctx->flags.maxContainerSize : KSBONJSON_DEFAULT_MAX_CONTAINER_SIZE;
+
+    // Track key indices for duplicate detection within this definition
+    size_t keyIndices[MAX_TRACKED_KEYS];
+
+    // Read key strings until TYPE_END
+    while (true)
+    {
+        MAP_SHOULD_HAVE_ROOM_FOR_BYTES(1);
+        if (ctx->input[ctx->position] == TYPE_END)
+        {
+            ctx->position++; // consume end marker
+            break;
+        }
+
+        size_t keyIndex;
+        ksbonjson_decodeStatus status = mapScanObjectName(ctx, &keyIndex);
+        unlikely_if(status != KSBONJSON_DECODE_OK) return status;
+
+        if (checkDuplicates)
+        {
+            unlikely_if(keyCount >= MAX_TRACKED_KEYS)
+            {
+                return KSBONJSON_DECODE_TOO_MANY_KEYS;
+            }
+            const KSBONJSONMapEntry* newKey = &ctx->entries[keyIndex];
+            for (size_t j = 0; j < keyCount; j++)
+            {
+                const KSBONJSONMapEntry* existingKey = &ctx->entries[keyIndices[j]];
+                unlikely_if(stringsEqual(ctx, newKey, existingKey))
+                {
+                    return KSBONJSON_DECODE_DUPLICATE_OBJECT_NAME;
+                }
+            }
+            keyIndices[keyCount] = keyIndex;
+        }
+
+        keyCount++;
+        unlikely_if(keyCount > maxContSize)
+        {
+            return KSBONJSON_DECODE_MAX_CONTAINER_SIZE_EXCEEDED;
+        }
+    }
+
+    // Store definition
+    ctx->recordDefs[ctx->recordDefCount].firstKeyIndex = firstKeyIndex;
+    ctx->recordDefs[ctx->recordDefCount].keyCount = keyCount;
+    ctx->recordDefCount++;
+
+    return KSBONJSON_DECODE_OK;
+}
+
+// Scan a record instance (0xBA): expands to regular OBJECT entry
+static ksbonjson_decodeStatus mapScanRecordInstance(KSBONJSONMapContext* ctx, size_t* outIndex)
+{
+    MAP_SHOULD_HAVE_ENTRY_SPACE();
+
+    // Read ULEB128 definition index
+    size_t available = ctx->inputLength - ctx->position;
+    uint64_t defIndex64;
+    size_t bytesRead = ksbonjson_readULEB128(ctx->input + ctx->position, available, &defIndex64);
+    unlikely_if(bytesRead == 0)
+    {
+        return KSBONJSON_DECODE_INCOMPLETE;
+    }
+    ctx->position += bytesRead;
+
+    // Validate definition index
+    unlikely_if(defIndex64 >= ctx->recordDefCount)
+    {
+        return KSBONJSON_DECODE_INVALID_DATA;
+    }
+    size_t defIndex = (size_t)defIndex64;
+    KSBONJSONRecordDef* def = &ctx->recordDefs[defIndex];
+
+    // Check max depth
+    size_t maxDepth = ctx->flags.maxDepth < SIZE_MAX ? ctx->flags.maxDepth : KSBONJSON_MAX_CONTAINER_DEPTH;
+    unlikely_if((size_t)ctx->containerDepth >= maxDepth)
+    {
+        return KSBONJSON_DECODE_MAX_DEPTH_EXCEEDED;
+    }
+
+    // Reserve slot for object entry
+    size_t objectIndex = ctx->entriesCount;
+    ctx->entries[objectIndex] = (KSBONJSONMapEntry){
+        .type = KSBONJSON_TYPE_OBJECT,
+        .data.container = { .firstChild = 0, .count = 0 }
+    };
+    ctx->entriesCount++;
+
+    size_t firstChild = ctx->entriesCount;
+    uint32_t valueCount = 0;
+
+    // Read values until TYPE_END, interleaving with keys from definition
+    while (true)
+    {
+        MAP_SHOULD_HAVE_ROOM_FOR_BYTES(1);
+        if (ctx->input[ctx->position] == TYPE_END)
+        {
+            ctx->position++; // consume end marker
+            break;
+        }
+
+        // Cannot have more values than keys
+        unlikely_if(valueCount >= def->keyCount)
+        {
+            return KSBONJSON_DECODE_INVALID_DATA;
+        }
+
+        // Check entry space for key + value
+        unlikely_if(ctx->entriesCount + 2 > ctx->entriesCapacity)
+        {
+            return KSBONJSON_DECODE_MAP_FULL;
+        }
+
+        // Re-add key from definition (copy the STRING entry)
+        size_t defKeyIndex = def->firstKeyIndex + valueCount;
+        KSBONJSONMapEntry keyEntry = ctx->entries[defKeyIndex];
+        keyEntry.subtreeSize = 1;
+        ctx->entries[ctx->entriesCount] = keyEntry;
+        ctx->entriesCount++;
+
+        // Scan value
+        size_t valueIndex;
+        ksbonjson_decodeStatus status = mapScanValue(ctx, &valueIndex);
+        unlikely_if(status != KSBONJSON_DECODE_OK) return status;
+
+        valueCount++;
+    }
+
+    // Pad remaining keys with NULL values
+    for (uint32_t i = valueCount; i < def->keyCount; i++)
+    {
+        unlikely_if(ctx->entriesCount + 2 > ctx->entriesCapacity)
+        {
+            return KSBONJSON_DECODE_MAP_FULL;
+        }
+
+        // Re-add key from definition
+        size_t defKeyIndex = def->firstKeyIndex + i;
+        KSBONJSONMapEntry keyEntry = ctx->entries[defKeyIndex];
+        keyEntry.subtreeSize = 1;
+        ctx->entries[ctx->entriesCount] = keyEntry;
+        ctx->entriesCount++;
+
+        // Add NULL value
+        KSBONJSONMapEntry nullEntry = { .type = KSBONJSON_TYPE_NULL, .subtreeSize = 1 };
+        ctx->entries[ctx->entriesCount] = nullEntry;
+        ctx->entriesCount++;
+    }
+
+    // entryCount = keys + values = 2 * def->keyCount
+    uint32_t entryCount = 2 * def->keyCount;
+
+    // Update the object entry
+    ctx->entries[objectIndex].data.container.firstChild = (uint32_t)firstChild;
+    ctx->entries[objectIndex].data.container.count = entryCount;
+    ctx->entries[objectIndex].subtreeSize = (uint32_t)(ctx->entriesCount - objectIndex);
+
+    *outIndex = objectIndex;
+    return KSBONJSON_DECODE_OK;
+}
+
 // Main value scanner
 static ksbonjson_decodeStatus mapScanValue(KSBONJSONMapContext* ctx, size_t* outIndex)
 {
     MAP_SHOULD_HAVE_ROOM_FOR_BYTES(1);
     uint8_t typeCode = ctx->input[ctx->position++];
 
-    // Small integers: 0x00-0xC8 (most common case)
+    // Small integers: 0x00-0x64 (most common case)
     if (typeCode <= TYPE_SMALLINT_MAX)
     {
         MAP_SHOULD_HAVE_ENTRY_SPACE();
         KSBONJSONMapEntry entry = {
             .type = KSBONJSON_TYPE_INT,
-            .data.intValue = (int64_t)typeCode - SMALLINT_BIAS
+            .data.intValue = (int64_t)typeCode
         };
         *outIndex = mapAddEntry(ctx, entry);
         return KSBONJSON_DECODE_OK;
     }
 
-    // Short strings: 0xD0-0xDF (mask-based detection)
-    if ((typeCode & TYPE_MASK_SHORT_STRING) == TYPE_SHORT_STRING_BASE)
+    // Short strings: 0x65-0xA7 (range-based detection)
+    if (typeCode >= TYPE_STRING0 && typeCode <= TYPE_SHORT_STRING_MAX)
     {
         return mapScanShortString(ctx, typeCode, outIndex);
     }
 
-    // Unsigned integers: 0xE0-0xE3 (mask-based detection)
+    // Unsigned integers: 0xA8-0xAB (mask-based detection)
     if ((typeCode & TYPE_MASK_UINT) == TYPE_UINT_BASE)
     {
         return mapScanUnsignedInt(ctx, typeCode, outIndex);
     }
 
-    // Signed integers: 0xE4-0xE7 (mask-based detection)
+    // Signed integers: 0xAC-0xAF (mask-based detection)
     if ((typeCode & TYPE_MASK_SINT) == TYPE_SINT_BASE)
     {
         return mapScanSignedInt(ctx, typeCode, outIndex);
+    }
+
+    // Typed arrays: 0xF5-0xFE
+    if (typeCode >= TYPE_TYPED_FLOAT64 && typeCode <= TYPE_TYPED_UINT8)
+    {
+        return mapScanTypedArray(ctx, typeCode, outIndex);
     }
 
     // Remaining types (individual checks)
@@ -1260,6 +1635,8 @@ static ksbonjson_decodeStatus mapScanValue(KSBONJSONMapContext* ctx, size_t* out
             return mapScanArray(ctx, outIndex);
         case TYPE_OBJECT:
             return mapScanObject(ctx, outIndex);
+        case TYPE_RECORD_INSTANCE:
+            return mapScanRecordInstance(ctx, outIndex);
         default:
             return KSBONJSON_DECODE_INVALID_DATA;
     }
@@ -1287,6 +1664,7 @@ void ksbonjson_map_beginWithFlags(
     ctx->position = 0;
     ctx->containerDepth = 0;
     ctx->flags = flags;
+    ctx->recordDefCount = 0;
 }
 
 void ksbonjson_map_begin(
@@ -1312,6 +1690,17 @@ ksbonjson_decodeStatus ksbonjson_map_scan(KSBONJSONMapContext* ctx)
     unlikely_if(ctx->inputLength > maxDocSize)
     {
         return KSBONJSON_DECODE_MAX_DOCUMENT_SIZE_EXCEEDED;
+    }
+
+    // Scan record definitions (must appear before root value)
+    while (ctx->position < ctx->inputLength && ctx->input[ctx->position] == TYPE_RECORD_DEF)
+    {
+        ctx->position++; // consume TYPE_RECORD_DEF
+        ksbonjson_decodeStatus status = mapScanRecordDef(ctx);
+        if (status != KSBONJSON_DECODE_OK)
+        {
+            return status;
+        }
     }
 
     // Scan the root value
