@@ -153,13 +153,11 @@ enum TestType: String, Decodable {
 
 struct TestOptions: Decodable {
     let allowNul: Bool?
-    let allowNanInfinity: Bool?
     let allowTrailingBytes: Bool?
     let maxDepth: Int?
     let maxContainerSize: Int?
     let maxStringLength: Int?
     let maxDocumentSize: Int?
-    // New string-based options per spec
     let nanInfinityBehavior: String?  // "allow", "stringify"
     let duplicateKey: String?         // "keep_first", "keep_last"
     let invalidUtf8: String?          // "replace", "delete"
@@ -173,7 +171,6 @@ struct TestOptions: Decodable {
 
     enum CodingKeys: String, CodingKey {
         case allowNul = "allow_nul"
-        case allowNanInfinity = "allow_nan_infinity"
         case allowTrailingBytes = "allow_trailing_bytes"
         case maxDepth = "max_depth"
         case maxContainerSize = "max_container_size"
@@ -191,7 +188,6 @@ struct TestOptions: Decodable {
     init(from decoder: Decoder) throws {
         let container = try decoder.container(keyedBy: CodingKeys.self)
         allowNul = try container.decodeIfPresent(Bool.self, forKey: .allowNul)
-        allowNanInfinity = try container.decodeIfPresent(Bool.self, forKey: .allowNanInfinity)
         allowTrailingBytes = try container.decodeIfPresent(Bool.self, forKey: .allowTrailingBytes)
         maxDepth = try container.decodeIfPresent(Int.self, forKey: .maxDepth)
         maxContainerSize = try container.decodeIfPresent(Int.self, forKey: .maxContainerSize)
@@ -564,31 +560,52 @@ enum ConformanceTestError: Error {
     case skipped(String)
 }
 
-/// Standardized error type identifiers from the BONJSON test spec.
+/// Error types recognized by this test runner for internal error mapping.
+/// Includes both spec-defined types and internal subtypes for finer-grained matching.
 enum StandardErrorType: String {
+    // Spec-defined error types
     case truncated
     case trailingBytes = "trailing_bytes"
     case invalidTypeCode = "invalid_type_code"
     case invalidUtf8 = "invalid_utf8"
     case nulCharacter = "nul_character"
-    case nulInString = "nul_in_string"
     case duplicateKey = "duplicate_key"
     case unclosedContainer = "unclosed_container"
     case invalidData = "invalid_data"
     case valueOutOfRange = "value_out_of_range"
-    case nonCanonicalLength = "non_canonical_length"
-    case tooManyChunks = "too_many_chunks"
-    case emptyChunkContinuation = "empty_chunk_continuation"
     case maxDepthExceeded = "max_depth_exceeded"
     case maxStringLengthExceeded = "max_string_length_exceeded"
     case maxContainerSizeExceeded = "max_container_size_exceeded"
     case maxDocumentSizeExceeded = "max_document_size_exceeded"
-    case nanNotAllowed = "nan_not_allowed"
-    case infinityNotAllowed = "infinity_not_allowed"
     case invalidObjectKey = "invalid_object_key"
     case maxBigNumberExponentExceeded = "max_bignumber_exponent_exceeded"
     case maxBigNumberMagnitudeExceeded = "max_bignumber_magnitude_exceeded"
+
+    // Internal subtypes (not in spec, used for finer-grained error mapping)
+    case nanNotAllowed = "nan_not_allowed"
+    case infinityNotAllowed = "infinity_not_allowed"
 }
+
+/// Error type strings defined in the test specification.
+/// Tests with expected_error values not in this set are skipped per spec.
+private let specDefinedErrorTypes: Set<String> = [
+    "truncated",
+    "trailing_bytes",
+    "invalid_type_code",
+    "invalid_utf8",
+    "nul_character",
+    "duplicate_key",
+    "unclosed_container",
+    "invalid_data",
+    "value_out_of_range",
+    "max_depth_exceeded",
+    "max_string_length_exceeded",
+    "max_container_size_exceeded",
+    "max_document_size_exceeded",
+    "invalid_object_key",
+    "max_bignumber_exponent_exceeded",
+    "max_bignumber_magnitude_exceeded",
+]
 
 // MARK: - Hex String Parsing
 
@@ -642,9 +659,8 @@ func mapErrorToStandardType(_ error: Error) -> StandardErrorType? {
     if desc.contains("utf-8") || desc.contains("utf8") || desc.contains("unicode") || desc.contains("invalid byte sequence") {
         return .invalidUtf8
     }
-    // NUL character - map to nul_in_string (the newer test spec name)
     if desc.contains("nul") || desc.contains("null character") || desc.contains("\\u{0}") {
-        return .nulInString
+        return .nulCharacter
     }
     if desc.contains("duplicate key") || desc.contains("duplicate") {
         return .duplicateKey
@@ -664,13 +680,13 @@ func mapErrorToStandardType(_ error: Error) -> StandardErrorType? {
         return .valueOutOfRange
     }
     if desc.contains("non-canonical") || desc.contains("overlong") {
-        return .nonCanonicalLength
+        return .invalidData
     }
     if desc.contains("too many chunk") {
-        return .tooManyChunks
+        return .invalidData
     }
     if desc.contains("empty chunk") && desc.contains("continuation") {
-        return .emptyChunkContinuation
+        return .invalidData
     }
     if desc.contains("depth") || desc.contains("nesting") {
         return .maxDepthExceeded
@@ -719,14 +735,6 @@ func errorTypesMatch(_ actual: StandardErrorType, expected: String) -> Bool {
         }
     }
 
-    // nul_in_string is equivalent to nul_character
-    if expected == "nul_character" && actual == .nulInString {
-        return true
-    }
-    if expected == "nul_in_string" && actual == .nulCharacter {
-        return true
-    }
-
     // Some error types may be detected differently depending on implementation.
     // For truncated data, C decoder may report value_out_of_range, invalid_utf8,
     // or invalid_object_key before detecting the truncation itself.
@@ -741,11 +749,6 @@ func errorTypesMatch(_ actual: StandardErrorType, expected: String) -> Bool {
         default:
             break
         }
-    }
-
-    // empty_chunk_continuation may be detected as truncated in some implementations
-    if expected == "empty_chunk_continuation" && actual == .truncated {
-        return true
     }
 
     return false
@@ -1151,13 +1154,10 @@ final class ConformanceTests: XCTestCase {
     /// Tests with `requires` containing capabilities not in this set will be skipped.
     private static let supportedCapabilities: Set<String> = [
         "int64",
-        "encode_nul_rejection",
+        "uint64",
+        "negative_zero",
         "nan_infinity_stringify",
-        "bignumber_resource_limits",
         "out_of_range_stringify",
-        "unicode_normalization",
-        "typed_arrays",
-        "records",
         "arbitrary_precision_bignumber",
     ]
 
@@ -1191,11 +1191,6 @@ final class ConformanceTests: XCTestCase {
             encoder.nulEncodingStrategy = .allow
         }
 
-        if options.allowNanInfinity == true {
-            encoder.nonConformingFloatEncodingStrategy = .allow
-        }
-
-        // Apply string-based options
         if let nanInfinityBehavior = options.nanInfinityBehavior {
             switch nanInfinityBehavior {
             case "allow":
@@ -1231,10 +1226,6 @@ final class ConformanceTests: XCTestCase {
 
         if options.allowNul == true {
             decoder.nulDecodingStrategy = .allow
-        }
-
-        if options.allowNanInfinity == true {
-            decoder.nonConformingFloatDecodingStrategy = .allow
         }
 
         if options.allowTrailingBytes == true {
@@ -1406,7 +1397,7 @@ final class ConformanceTests: XCTestCase {
         }
 
         // Check if this is a recognized error type
-        guard StandardErrorType(rawValue: expectedError) != nil else {
+        guard specDefinedErrorTypes.contains(expectedError) else {
             throw ConformanceTestError.skipped("unrecognized error type: \(expectedError)")
         }
 
@@ -1444,7 +1435,7 @@ final class ConformanceTests: XCTestCase {
         }
 
         // Check if this is a recognized error type
-        guard StandardErrorType(rawValue: expectedError) != nil else {
+        guard specDefinedErrorTypes.contains(expectedError) else {
             throw ConformanceTestError.skipped("unrecognized error type: \(expectedError)")
         }
 
