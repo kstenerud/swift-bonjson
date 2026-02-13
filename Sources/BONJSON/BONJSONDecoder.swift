@@ -1228,16 +1228,71 @@ final class _MapDecoderState {
         }
 
         // Large case: > 8 bytes (9-16 bytes)
-        // Build the mantissa from bytes using powers of 256
-        var mantissa = Decimal(0)
-        var power256 = Decimal(1)
+        // Convert bytes to decimal string for maximum precision
+        // This avoids precision loss from large Decimal arithmetic
 
-        for byte in sigBytes.prefix(byteCount) {
-            mantissa = mantissa + Decimal(byte) * power256
-            power256 = power256 * Decimal(256)
+        // Build decimal string from little-endian bytes via repeated division
+        var decimalDigits = [UInt8]()
+        var remainingBytes = Array(sigBytes.prefix(byteCount))
+
+        // Convert bytes to decimal digits using repeated division by 10
+        while remainingBytes.count > 0 && !(remainingBytes.count == 1 && remainingBytes[0] == 0) {
+            // Perform division by 10 across all bytes
+            var carry: UInt16 = 0
+            for i in (0..<remainingBytes.count).reversed() {
+                let dividend = UInt16(carry) << 8 | UInt16(remainingBytes[i])
+                remainingBytes[i] = UInt8(dividend / 10)
+                carry = dividend % 10
+            }
+
+            // Remove leading zero bytes
+            while remainingBytes.count > 0 && remainingBytes.last == 0 {
+                remainingBytes.removeLast()
+            }
+
+            // Prepend remainder digit
+            decimalDigits.insert(UInt8(carry), at: 0)
         }
 
-        return Decimal(sign: sign, exponent: Int(bn.exponent), significand: mantissa)
+        // Convert digits to string
+        var mantissaStr = decimalDigits.isEmpty ? "0" : String(decimalDigits.map { String($0) }.joined())
+
+        // Apply exponent
+        let exponent = Int(bn.exponent)
+        let digitCount = mantissaStr.count
+
+        // Insert decimal point based on exponent
+        var resultStr: String
+        if exponent >= 0 {
+            // Positive exponent: add zeros on right
+            resultStr = mantissaStr + String(repeating: "0", count: exponent)
+        } else if exponent + digitCount <= 0 {
+            // Negative exponent with all digits after decimal: "0.00...XXX"
+            resultStr = "0." + String(repeating: "0", count: -exponent - digitCount) + mantissaStr
+        } else {
+            // Decimal point in the middle
+            let dotPosition = digitCount + exponent
+            let idx = mantissaStr.index(mantissaStr.startIndex, offsetBy: dotPosition)
+            resultStr = String(mantissaStr[..<idx]) + "." + String(mantissaStr[idx...])
+        }
+
+        if sign == .minus {
+            resultStr = "-" + resultStr
+        }
+
+        // Parse the resulting string as Decimal for maximum precision
+        guard let result = Decimal(string: resultStr) else {
+            // Fallback to base-256 arithmetic if string parsing fails (shouldn't happen)
+            var mantissa = Decimal(0)
+            var power256 = Decimal(1)
+            for byte in sigBytes.prefix(byteCount) {
+                mantissa = mantissa + Decimal(byte) * power256
+                power256 = power256 * Decimal(256)
+            }
+            return Decimal(sign: sign, exponent: Int(bn.exponent), significand: mantissa)
+        }
+
+        return result
     }
 
     /// Validate BigNumber against configured resource limits.
