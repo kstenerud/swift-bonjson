@@ -301,7 +301,10 @@ extension AnyJSON: Decodable {
         if let decimal = try? container.decode(Decimal.self) {
             // Check if this is a simple Decimal that should be a Double
             let doubleValue = Double(truncating: decimal as NSDecimalNumber)
-            if Decimal(doubleValue) == decimal {
+            let decimalFromDouble = Decimal(doubleValue)
+
+            // Only treat as float if roundtrip conversion is exact (no precision loss)
+            if decimal == decimalFromDouble {
                 // Decimal is exactly representable as Double
                 self = .float(doubleValue)
             } else {
