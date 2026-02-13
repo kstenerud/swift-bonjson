@@ -1118,10 +1118,63 @@ final class _MapDecoderState {
         }
     }
 
+    /// Convert a 16-byte tuple from C to a Swift array of bytes.
+    @inline(__always)
+    private func significandToArray(_ sig: (UInt8, UInt8, UInt8, UInt8, UInt8, UInt8, UInt8, UInt8,
+                                             UInt8, UInt8, UInt8, UInt8, UInt8, UInt8, UInt8, UInt8)) -> [UInt8] {
+        return [sig.0, sig.1, sig.2, sig.3, sig.4, sig.5, sig.6, sig.7,
+                sig.8, sig.9, sig.10, sig.11, sig.12, sig.13, sig.14, sig.15]
+    }
+
+    /// Convert little-endian byte array to UInt64 (for values ≤ 8 bytes).
+    @inline(__always)
+    private func bytesToUInt64(_ bytes: [UInt8]) -> UInt64 {
+        var result: UInt64 = 0
+        for (i, byte) in bytes.enumerated() {
+            result |= UInt64(byte) << (i * 8)
+        }
+        return result
+    }
+
+    /// Convert 16-byte little-endian magnitude to Double with maximum precision.
+    /// Handles values up to 128 bits by using high and low 64-bit parts.
+    @inline(__always)
+    private func bytesToDouble(_ bytes: [UInt8]) -> Double {
+        if bytes.isEmpty {
+            return 0.0
+        }
+
+        // Find actual byte count (skip trailing zeros)
+        var byteCount = bytes.count
+        while byteCount > 0 && bytes[byteCount - 1] == 0 {
+            byteCount -= 1
+        }
+
+        if byteCount == 0 {
+            return 0.0
+        }
+
+        if byteCount <= 8 {
+            // Simple case: fits in UInt64
+            return Double(bytesToUInt64(Array(bytes.prefix(byteCount))))
+        }
+
+        // Large case: > 8 bytes. Use high and low 64-bit parts.
+        let low = bytesToUInt64(Array(bytes.prefix(8)))
+        let highBytes = Array(bytes.dropFirst(8).prefix(min(byteCount - 8, 8)))
+        let high = bytesToUInt64(highBytes)
+
+        // Combine: value = high * 2^64 + low
+        // For precision, compute high * 2^64 as Double, then add low
+        let highPart = Double(high) * pow(2.0, 64.0)
+        let lowPart = Double(low)
+        return highPart + lowPart
+    }
+
     /// Decode a BigNumber entry to a Double value.
     /// Checks resource limits and throws or stringifies as configured.
     @inline(__always)
-    func decodeBigNumber(_ bn: (significand: UInt64, exponent: Int32, sign: Int32)) throws -> Double {
+    func decodeBigNumber(_ bn: (significand: (UInt8, UInt8, UInt8, UInt8, UInt8, UInt8, UInt8, UInt8, UInt8, UInt8, UInt8, UInt8, UInt8, UInt8, UInt8, UInt8), exponent: Int32, sign: Int32)) throws -> Double {
         if let violation = validateBigNumberLimits(bn) {
             switch violation {
             case .exponent(let exp):
@@ -1130,7 +1183,8 @@ final class _MapDecoderState {
                 throw BONJSONDecodingError.bigNumberMagnitudeExceeded(bytes)
             }
         }
-        let significand = Double(bn.significand)
+        let sigBytes = significandToArray(bn.significand)
+        let significand = bytesToDouble(sigBytes)
         let result = significand * pow(10.0, Double(bn.exponent))
         return bn.sign < 0 ? -result : result
     }
@@ -1138,7 +1192,7 @@ final class _MapDecoderState {
     /// Decode a BigNumber entry to a Decimal value.
     /// Throws if the exponent is outside Decimal's supported range (-128 to 127).
     @inline(__always)
-    func decodeBigNumberAsDecimal(_ bn: (significand: UInt64, exponent: Int32, sign: Int32)) throws -> Decimal {
+    func decodeBigNumberAsDecimal(_ bn: (significand: (UInt8, UInt8, UInt8, UInt8, UInt8, UInt8, UInt8, UInt8, UInt8, UInt8, UInt8, UInt8, UInt8, UInt8, UInt8, UInt8), exponent: Int32, sign: Int32)) throws -> Decimal {
         if let violation = validateBigNumberLimits(bn) {
             switch violation {
             case .exponent(let exp):
@@ -1152,23 +1206,56 @@ final class _MapDecoderState {
             throw BONJSONDecodingError.bigNumberExponentOutOfRange(bn.exponent)
         }
 
-        // Build Decimal from components
+        let sigBytes = significandToArray(bn.significand)
         let sign: FloatingPointSign = bn.sign < 0 ? .minus : .plus
-        let significandDecimal = Decimal(bn.significand)
-        return Decimal(sign: sign, exponent: Int(bn.exponent), significand: significandDecimal)
+
+        // Find the actual byte count by searching from the end
+        var byteCount = sigBytes.count
+        while byteCount > 0 && sigBytes[byteCount - 1] == 0 {
+            byteCount -= 1
+        }
+
+        if byteCount == 0 {
+            // Zero value
+            return Decimal(sign: sign, exponent: 0, significand: 0)
+        }
+
+        if byteCount <= 8 {
+            // Simple case: ≤ 8 bytes fits in UInt64
+            let significand = bytesToUInt64(Array(sigBytes.prefix(byteCount)))
+            let significandDecimal = Decimal(significand)
+            return Decimal(sign: sign, exponent: Int(bn.exponent), significand: significandDecimal)
+        }
+
+        // Large case: > 8 bytes (9-16 bytes)
+        // Build the mantissa from bytes using powers of 256
+        var mantissa = Decimal(0)
+        var power256 = Decimal(1)
+
+        for byte in sigBytes.prefix(byteCount) {
+            mantissa = mantissa + Decimal(byte) * power256
+            power256 = power256 * Decimal(256)
+        }
+
+        return Decimal(sign: sign, exponent: Int(bn.exponent), significand: mantissa)
     }
 
     /// Validate BigNumber against configured resource limits.
     /// Returns nil if within limits, or a BigNumberLimitViolation if exceeded.
     @inline(__always)
-    func validateBigNumberLimits(_ bn: (significand: UInt64, exponent: Int32, sign: Int32)) -> BigNumberLimitViolation? {
+    func validateBigNumberLimits(_ bn: (significand: (UInt8, UInt8, UInt8, UInt8, UInt8, UInt8, UInt8, UInt8, UInt8, UInt8, UInt8, UInt8, UInt8, UInt8, UInt8, UInt8), exponent: Int32, sign: Int32)) -> BigNumberLimitViolation? {
         if let maxExp = maxBigNumberExponent {
             if abs(Int(bn.exponent)) > maxExp {
                 return .exponent(bn.exponent)
             }
         }
         if let maxMag = maxBigNumberMagnitude {
-            let magBytes = bn.significand == 0 ? 0 : (64 - bn.significand.leadingZeroBitCount + 7) / 8
+            // Find actual byte count
+            let sigBytes = significandToArray(bn.significand)
+            var magBytes = sigBytes.count
+            while magBytes > 0 && sigBytes[magBytes - 1] == 0 {
+                magBytes -= 1
+            }
             if magBytes > maxMag {
                 return .magnitude(magBytes)
             }
@@ -1177,12 +1264,32 @@ final class _MapDecoderState {
     }
 
     /// Stringify a BigNumber value for out-of-range presentation.
-    func stringifyBigNumber(_ bn: (significand: UInt64, exponent: Int32, sign: Int32)) -> String {
+    func stringifyBigNumber(_ bn: (significand: (UInt8, UInt8, UInt8, UInt8, UInt8, UInt8, UInt8, UInt8, UInt8, UInt8, UInt8, UInt8, UInt8, UInt8, UInt8, UInt8), exponent: Int32, sign: Int32)) -> String {
+        let sigBytes = significandToArray(bn.significand)
         let signStr = bn.sign < 0 ? "-" : ""
-        if bn.exponent == 0 {
-            return "\(signStr)\(bn.significand)"
+
+        // Find actual byte count
+        var byteCount = sigBytes.count
+        while byteCount > 0 && sigBytes[byteCount - 1] == 0 {
+            byteCount -= 1
         }
-        return "\(signStr)\(bn.significand)e\(bn.exponent)"
+
+        if byteCount == 0 {
+            return "0"
+        }
+
+        // Convert bytes to decimal string using repeated division by 10
+        let significand = bytesToUInt64(Array(sigBytes.prefix(min(byteCount, 8))))
+        if byteCount <= 8 {
+            if bn.exponent == 0 {
+                return "\(signStr)\(significand)"
+            }
+            return "\(signStr)\(significand)e\(bn.exponent)"
+        }
+
+        // For values > 8 bytes, format as hex representation for simplicity
+        let hexStr = sigBytes.prefix(byteCount).map { String(format: "%02x", $0) }.joined()
+        return "\(signStr)0x\(hexStr)e\(bn.exponent)"
     }
 
     enum BigNumberLimitViolation {

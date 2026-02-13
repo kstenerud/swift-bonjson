@@ -1019,7 +1019,7 @@ static ksbonjson_decodeStatus mapScanBigNumber(KSBONJSONMapContext* ctx, size_t*
     available -= bytesRead;
 
     int32_t sign = 0;
-    uint64_t significand = 0;
+    uint8_t significand[16] = {0};
 
     if (signedLength != 0)
     {
@@ -1031,7 +1031,7 @@ static ksbonjson_decodeStatus mapScanBigNumber(KSBONJSONMapContext* ctx, size_t*
             return KSBONJSON_DECODE_INCOMPLETE;
         }
 
-        unlikely_if(byteCount > 8)
+        unlikely_if(byteCount > 16)
         {
             return KSBONJSON_DECODE_VALUE_OUT_OF_RANGE;
         }
@@ -1042,18 +1042,18 @@ static ksbonjson_decodeStatus mapScanBigNumber(KSBONJSONMapContext* ctx, size_t*
             return KSBONJSON_DECODE_INVALID_DATA;
         }
 
-        // Read LE magnitude bytes into uint64_t
-        for (size_t i = 0; i < byteCount; i++)
-        {
-            significand |= (uint64_t)ctx->input[ctx->position + i] << (i * 8);
-        }
+        // Copy LE magnitude bytes directly to the array
+        memcpy(significand, ctx->input + ctx->position, byteCount);
         ctx->position += byteCount;
     }
 
     KSBONJSONMapEntry entry = {
         .type = KSBONJSON_TYPE_BIGNUMBER,
         .data.bigNumber = {
-            .significand = significand,
+            .significand = {significand[0], significand[1], significand[2], significand[3],
+                           significand[4], significand[5], significand[6], significand[7],
+                           significand[8], significand[9], significand[10], significand[11],
+                           significand[12], significand[13], significand[14], significand[15]},
             .exponent = (int32_t)exponent,
             .sign = sign
         }
@@ -1937,8 +1937,13 @@ static inline double entryToDouble(const KSBONJSONMapEntry* entry)
             return (double)entry->data.uintValue;
         case KSBONJSON_TYPE_BIGNUMBER:
         {
-            double significand = (double)entry->data.bigNumber.significand;
-            double result = significand * pow(10.0, (double)entry->data.bigNumber.exponent);
+            // Convert little-endian bytes to uint64 (using first 8 bytes)
+            uint64_t significand = 0;
+            for (size_t i = 0; i < 8 && i < KSBONJSON_MAX_BIGNUMBER_MAGNITUDE_BYTES; i++)
+            {
+                significand |= (uint64_t)entry->data.bigNumber.significand[i] << (i * 8);
+            }
+            double result = (double)significand * pow(10.0, (double)entry->data.bigNumber.exponent);
             return entry->data.bigNumber.sign < 0 ? -result : result;
         }
         case KSBONJSON_TYPE_TRUE:

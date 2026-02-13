@@ -298,6 +298,19 @@ extension AnyJSON: Decodable {
             return
         }
 
+        if let decimal = try? container.decode(Decimal.self) {
+            // Check if this is a simple Decimal that should be a Double
+            let doubleValue = Double(truncating: decimal as NSDecimalNumber)
+            if Decimal(doubleValue) == decimal {
+                // Decimal is exactly representable as Double
+                self = .float(doubleValue)
+            } else {
+                // Decimal requires BigNumber precision
+                self = .specialNumber(.bigNumber(decimal.description))
+            }
+            return
+        }
+
         if let double = try? container.decode(Double.self) {
             self = .float(double)
             return
@@ -1142,6 +1155,7 @@ final class ConformanceTests: XCTestCase {
         "unicode_normalization",
         "typed_arrays",
         "records",
+        "arbitrary_precision_bignumber",
     ]
 
     private func runTest(_ test: TestCase, testId: String) throws {

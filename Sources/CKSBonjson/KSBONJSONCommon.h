@@ -196,6 +196,7 @@ enum
     TYPE_SINT_BASE = 0xAC,
 };
 
+#define KSBONJSON_MAX_BIGNUMBER_MAGNITUDE_BYTES 16
 
 // ============================================================================
 // Endianness helpers

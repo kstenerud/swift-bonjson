@@ -195,9 +195,9 @@ typedef struct {
             uint32_t count;
         } container;
         struct {
-            uint64_t significand;
+            uint8_t significand[16];  // Little-endian magnitude bytes
             int32_t exponent;
-            int32_t sign;
+            int32_t sign;            // -1 for negative, 0 for positive/zero
         } bigNumber;
     } data;
 } KSBONJSONMapEntry;
